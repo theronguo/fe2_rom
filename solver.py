@@ -1,3 +1,8 @@
+import os
+nthreads = 1
+os.environ["OMP_NUM_THREADS"] = str(nthreads) 
+os.environ["OPENBLAS_NUM_THREADS"] = str(nthreads) 
+os.environ["MKL_NUM_THREADS"] = str(nthreads)
 from dolfinx import fem, io
 from ufl import grad, Identity, variable, det, tr, ln, inner
 from petsc4py import PETSc
@@ -6,6 +11,7 @@ import ufl
 from dolfinx.fem import petsc
 import numpy as np
 from slepc4py import SLEPc
+import sys
 
 comm = MPI.COMM_WORLD
 mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("mesh_with_holes.msh", comm, 0, gdim=2)
@@ -21,6 +27,7 @@ V1 = fem.FunctionSpace(mesh, ("Lagrange", 1, (space_dims, )))
 u = fem.Function(V)
 u_last = fem.Function(V)
 du = fem.Function(V)
+eigenfunction = fem.Function(V)
 
 # Deformation gradient
 F = variable(Identity(space_dims) + grad(u))
@@ -91,7 +98,9 @@ timestep = 0
 
 while t_current_converged < t_end:
     trial_time = np.round(t_current_converged + dt_current, 5)
-    print(f"Time: {trial_time}")
+    if comm.rank == 0:
+        print(f"Time: {trial_time}")
+        sys.stdout.flush()
     const_1.value = trial_time * max_amplitude
     stable_configuration = False
     pert_amplitude = 1e1
@@ -107,7 +116,9 @@ while t_current_converged < t_end:
             abs_b_norm = residual.norm()
             if iter_newton == 0:
                 abs_b_norm_init = abs_b_norm
-            print(f"Newton iteration {iter_newton}, relative residual: {abs_b_norm / abs_b_norm_init}, absolute residual: {abs_b_norm}")
+            if comm.rank == 0:
+                print(f"Newton iteration {iter_newton}, relative residual: {abs_b_norm / abs_b_norm_init}, absolute residual: {abs_b_norm}")
+                sys.stdout.flush()
             if abs_b_norm / abs_b_norm_init < rel_tol_newton or abs_b_norm < abs_tol_newton:
                 is_converged = True
                 break
@@ -121,18 +132,19 @@ while t_current_converged < t_end:
             solver = PETSc.KSP().create(comm)
             solver.setOperators(K)
             solver.setType(PETSc.KSP.Type.PREONLY)
-            solver.getPC().setType(PETSc.PC.Type.LU)
+            solver.getPC().setType(PETSc.PC.Type.CHOLESKY)
 
             # solve linear system of equations
             solver.solve(-residual, du.vector)
 
             # Step 1: Create full-sized du vector
             u.vector.axpy(1.0, du.vector)
+            u.x.scatter_forward()
             iter_newton += 1
 
         if is_converged:
             # check eigenvalues
-            eigensolver = SLEPc.EPS().create()
+            eigensolver = SLEPc.EPS().create(comm)
             eigensolver.setOperators(K)
             eigensolver.setProblemType(SLEPc.EPS.ProblemType.HEP)
             st = eigensolver.getST()
@@ -146,15 +158,18 @@ while t_current_converged < t_end:
 
             # Get the number of converged eigenvalues
             n_conv = eigensolver.getConverged()
-            eigenvalues = np.array([eigensolver.getEigenvalue(i) for i in range(min(n_conv, 5))])
+            eigenvalues = np.array([eigensolver.getEigenvalue(i).real for i in range(min(n_conv, 5))])
 
             if np.any(eigenvalues < 1e-12):
                 target_indices = np.where(eigenvalues < 1e-12)[0]
-                eigenvector = PETSc.Vec().createSeq(K.getSize()[0])  # Create an empty vector
-                eigensolver.getEigenvector(target_indices[0], eigenvector)
-                u.vector.axpy(pert_amplitude, eigenvector)
+                eigensolver.getEigenvector(target_indices[0], eigenfunction.vector)
+                eigenfunction.x.scatter_forward()
+                u.vector.axpy(pert_amplitude, eigenfunction.vector)
+                u.x.scatter_forward()
                 pert_amplitude *= 2
-                print(f"Instable solution with eigenvalue {eigenvalues[target_indices[0]]}! Perturbing solution with eigenvectors. Perturbation amplitude: {pert_amplitude}")
+                if comm.rank == 0:
+                    print(f"Instable solution with eigenvalue {eigenvalues[target_indices[0]]}! Perturbing solution with eigenvectors. Perturbation amplitude: {pert_amplitude}")
+                    sys.stdout.flush()
             else:
                 stable_configuration = True
                 t_current_converged = trial_time
@@ -164,7 +179,9 @@ while t_current_converged < t_end:
                 u_last.x.array[:] = u.x.array[:]
         else:
             dt_current /= 2
-            print(f"Newton's method did not converge. Halving time step size to {dt_current}.")
+            if comm.rank == 0:
+                print(f"Newton's method did not converge. Halving time step size to {dt_current}.")
+                sys.stdout.flush()
             u.x.array[:] = u_last.x.array[:]
             break
 
