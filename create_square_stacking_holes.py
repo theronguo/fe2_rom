@@ -83,7 +83,6 @@ def create_mesh_with_holes(H, L, num_holes_height, num_holes_length, hole_radius
     # Tag and assign mesh size to points
     gmsh.model.mesh.setSize(gmsh.model.getEntities(0), mesh_size)
 
-
     # Generate the mesh
     gmsh.model.mesh.generate(2)
 

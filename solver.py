@@ -14,7 +14,7 @@ from slepc4py import SLEPc
 import sys
 
 comm = MPI.COMM_WORLD
-mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("mesh_with_holes.msh", comm, 0, gdim=2)
+mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("box_without_spheres_3d_2.msh", comm, 0, gdim=3)
 space_dims = mesh.geometry.dim
 dx = ufl.Measure("dx", domain=mesh, subdomain_data=cell_tags)
 ds = ufl.Measure("ds", domain=mesh, subdomain_data=facet_tags)
@@ -52,7 +52,7 @@ P = ufl.diff(W, F)
 v = ufl.TestFunction(V)
 
 # Define body force (e.g., gravity)
-body_force = fem.Constant(mesh, (0.0, 0.0))
+body_force = fem.Constant(mesh, (0.0, 0.0, 0.0))
 
 # Residual weak form
 R = inner(grad(v), P) * dx - inner(v, body_force) * dx
@@ -65,6 +65,7 @@ J_nonlinear_form = fem.form(J_nonlinear)
 # BCs
 V_x = V.sub(0)
 V_y = V.sub(1)
+V_z = V.sub(2)
 const_0 = fem.Constant(mesh, PETSc.ScalarType(0))
 const_1 = fem.Constant(mesh, PETSc.ScalarType(0))
 
@@ -72,15 +73,19 @@ left_dofs_x = fem.locate_dofs_topological(V_x, mesh.topology.dim - 1, facet_tags
 bc_left_x = fem.dirichletbc(const_0, left_dofs_x, V_x)
 left_dofs_y = fem.locate_dofs_topological(V_y, mesh.topology.dim - 1, facet_tags.indices[facet_tags.values == 3])
 bc_left_y = fem.dirichletbc(const_0, left_dofs_y, V_y)
+left_dofs_z = fem.locate_dofs_topological(V_z, mesh.topology.dim - 1, facet_tags.indices[facet_tags.values == 3])
+bc_left_z = fem.dirichletbc(const_0, left_dofs_z, V_z)
 
 right_dofs_x = fem.locate_dofs_topological(V_x, mesh.topology.dim - 1, facet_tags.indices[facet_tags.values == 4])
 bc_right_x = fem.dirichletbc(const_1, right_dofs_x, V_x)
 right_dofs_y = fem.locate_dofs_topological(V_y, mesh.topology.dim - 1, facet_tags.indices[facet_tags.values == 4])
 bc_right_y = fem.dirichletbc(const_0, right_dofs_y, V_y)
-bcs = [bc_left_x, bc_left_y, bc_right_x, bc_right_y]
+right_dofs_z = fem.locate_dofs_topological(V_z, mesh.topology.dim - 1, facet_tags.indices[facet_tags.values == 4])
+bc_right_z = fem.dirichletbc(const_0, right_dofs_z, V_z)
+bcs = [bc_left_x, bc_left_y, bc_right_x, bc_right_y, bc_left_z, bc_right_z]
 
 max_iter_newton = 30
-max_amplitude = -1
+max_amplitude = -3
 rel_tol_newton = 1e-12
 abs_tol_newton = 1e-8
 
@@ -120,10 +125,12 @@ while t_current_converged < t_end:
                 print(f"Newton iteration {iter_newton}, relative residual: {abs_b_norm / abs_b_norm_init}, absolute residual: {abs_b_norm}")
                 sys.stdout.flush()
             if abs_b_norm / abs_b_norm_init < rel_tol_newton or abs_b_norm < abs_tol_newton:
+                PETSc.Vec.destroy(residual)  # do not destroy matrix because needed for eigenvalue computation
                 is_converged = True
                 break
 
             if abs_b_norm / abs_b_norm_init > 10 or np.isnan(abs_b_norm):  # will not converge
+                PETSc.Vec.destroy(residual)
                 break
 
             #### assemble stiffness matrix ####
@@ -136,13 +143,20 @@ while t_current_converged < t_end:
 
             # solve linear system of equations
             solver.solve(-residual, du.vector)
+            solver.destroy()
 
             # Step 1: Create full-sized du vector
             u.vector.axpy(1.0, du.vector)
             u.x.scatter_forward()
             iter_newton += 1
 
+            # Destroy PETSc matrix and vector
+            PETSc.Vec.destroy(residual)
+            PETSc.Mat.destroy(K)
+
         if is_converged:
+            K = fem.petsc.assemble_matrix(J_nonlinear_form, bcs=bcs)
+            K.assemble()
             # check eigenvalues
             eigensolver = SLEPc.EPS().create(comm)
             eigensolver.setOperators(K)
@@ -155,12 +169,13 @@ while t_current_converged < t_end:
             eigensolver.setDimensions(nev=5)  # Compute 5 eigenvalues near the target
             eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)  # Target real eigenvalues
             eigensolver.solve()
+            PETSc.Mat.destroy(K)
 
             # Get the number of converged eigenvalues
             n_conv = eigensolver.getConverged()
             eigenvalues = np.array([eigensolver.getEigenvalue(i).real for i in range(min(n_conv, 5))])
-
-            if np.any(eigenvalues < 1e-12):
+            
+            if np.any(eigenvalues < -1e-12):
                 target_indices = np.where(eigenvalues < 1e-12)[0]
                 eigensolver.getEigenvector(target_indices[0], eigenfunction.vector)
                 eigenfunction.x.scatter_forward()
@@ -177,6 +192,9 @@ while t_current_converged < t_end:
                 dt_current = min(dt_current, t_end - t_current_converged)
                 timestep += 1
                 u_last.x.array[:] = u.x.array[:]
+            
+            # destroy eigensolver
+            eigensolver.destroy()
         else:
             dt_current /= 2
             if comm.rank == 0:
