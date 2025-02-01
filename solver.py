@@ -21,8 +21,8 @@ def main():
     ds = ufl.Measure("ds", domain=mesh, subdomain_data=facet_tags)
 
     # Displacement function space
-    V = fem.FunctionSpace(mesh, ("Lagrange", 2, (space_dims, )))
-    V1 = fem.FunctionSpace(mesh, ("Lagrange", 1, (space_dims, )))
+    V = fem.functionspace(mesh, ("Lagrange", 2, (space_dims, )))
+    V1 = fem.functionspace(mesh, ("Lagrange", 1, (space_dims, )))
 
     # Displacement field (Function)
     u = fem.Function(V)
@@ -116,9 +116,9 @@ def main():
             while iter_newton < max_iter_newton:
                 is_converged = False
                 residual = fem.petsc.assemble_vector(R_form)
-                fem.apply_lifting(residual, [J_nonlinear_form], [bcs], x0=[u.vector], scale=-1.0)
+                fem.apply_lifting(residual, [J_nonlinear_form], [bcs], x0=[u.x.petsc_vec], alpha=-1.0)
                 residual.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-                fem.set_bc(residual, bcs, x0=u.vector, scale=-1.0)
+                fem.set_bc(residual, bcs, x0=u.x.petsc_vec, scale=-1.0)
 
                 abs_b_norm = residual.norm()
                 if iter_newton == 0:
@@ -144,7 +144,7 @@ def main():
                 solver.getPC().setType(PETSc.PC.Type.GAMG)
 
                 # solve linear system of equations
-                solver.solve(-residual, du.vector)
+                solver.solve(-residual, du.x.petsc_vec)
 
                 # check convergence of solver
                 if solver.getConvergedReason() < 0:
@@ -159,7 +159,7 @@ def main():
                     solver.destroy()
 
                 # Step 1: Create full-sized du vector
-                u.vector.axpy(1.0, du.vector)
+                u.x.petsc_vec.axpy(1.0, du.x.petsc_vec)
                 u.x.scatter_forward()
                 iter_newton += 1
 
@@ -190,9 +190,9 @@ def main():
                 
                 if np.any(eigenvalues < -1e-12):
                     target_indices = np.where(eigenvalues < 1e-12)[0]
-                    eigensolver.getEigenvector(target_indices[0], eigenfunction.vector)
+                    eigensolver.getEigenvector(target_indices[0], eigenfunction.x.petsc_vec)
                     eigenfunction.x.scatter_forward()
-                    u.vector.axpy(pert_amplitude, eigenfunction.vector)
+                    u.x.petsc_vec.axpy(pert_amplitude, eigenfunction.x.petsc_vec)
                     u.x.scatter_forward()
                     pert_amplitude *= 2
                     if comm.rank == 0:
@@ -205,6 +205,7 @@ def main():
                     dt_current = min(dt_current, t_end - t_current_converged)
                     timestep += 1
                     u_last.x.array[:] = u.x.array[:]
+                    u_last.x.scatter_forward()
                 
                 # destroy eigensolver
                 eigensolver.destroy()
@@ -214,6 +215,7 @@ def main():
                     print(f"Newton's method did not converge. Halving time step size to {dt_current}.")
                     sys.stdout.flush()
                 u.x.array[:] = u_last.x.array[:]
+                u.x.scatter_forward()
                 break
 
         with io.XDMFFile(comm, f"output/solution_{timestep}.xdmf", "w") as xdmf:
