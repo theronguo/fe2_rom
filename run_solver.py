@@ -5,7 +5,9 @@ Run:
 """
 import logging
 import os
-
+os.environ["OPENBLAS_NUM_THREADS"] = "1"  # avoid OpenBLAS oversubscription
+os.environ["OMP_NUM_THREADS"] = "1"      # avoid OpenMP oversubscription
+os.environ["MKL_NUM_THREADS"] = "1"      # avoid MKL oversubscription
 import numpy as np
 from dolfinx import fem, io
 from mpi4py import MPI
@@ -23,7 +25,7 @@ from hyperelastic_solver import (
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 
-mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("model.msh", comm, 0, gdim=3)
+mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("mesh.msh", comm, 0, gdim=3)
 
 material = NeoHookean(mu=1000.0, lmbda=2000.0)
 solver = HyperelasticStabilitySolver(
@@ -35,14 +37,14 @@ const_0 = fem.Constant(mesh, PETSc.ScalarType(0.0))
 const_1 = fem.Constant(mesh, PETSc.ScalarType(0.0))
 
 # z_min: fully clamped
-solver.add_bc(0, lambda x: x[2] < 0, const_0)
-solver.add_bc(1, lambda x: x[2] < 0, const_0)
-solver.add_bc(2, lambda x: x[2] < 0, const_0)
+solver.add_bc(0, lambda x: x[2] < 0+1e-8, const_0)
+solver.add_bc(1, lambda x: x[2] < 0+1e-8, const_0)
+solver.add_bc(2, lambda x: x[2] < 0+1e-8, const_0)
 
 # z_max: lateral fixed, prescribed vertical displacement + reaction force probe
-solver.add_bc(0, lambda x: x[2] > 1, const_0)
-solver.add_bc(1, lambda x: x[2] > 1, const_0)
-solver.add_bc(2, lambda x: x[2] > 1, const_1,
+# solver.add_bc(0, lambda x: x[2] > 1-1e-8, const_0)
+# solver.add_bc(1, lambda x: x[2] > 1-1e-8, const_0)
+solver.add_bc(2, lambda x: x[2] > 1-1e-8, const_1,
               measure_reaction=True, reaction_direction=(0.0, 0.0, 1.0))
 
 solver.setup()
@@ -51,7 +53,7 @@ solver.setup()
 z_local = mesh.geometry.x[:, 2]
 z_min = comm.allreduce(float(np.min(z_local)), op=MPI.MIN)
 z_max = comm.allreduce(float(np.max(z_local)), op=MPI.MAX)
-max_amplitude = 0.2
+max_amplitude = -0.2
 
 
 def load_schedule(t: float) -> None:
