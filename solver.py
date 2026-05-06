@@ -1,8 +1,8 @@
 import os
-nthreads = 1
-os.environ["OMP_NUM_THREADS"] = str(nthreads) 
-os.environ["OPENBLAS_NUM_THREADS"] = str(nthreads) 
-os.environ["MKL_NUM_THREADS"] = str(nthreads)
+# nthreads = 1
+# os.environ["OMP_NUM_THREADS"] = str(nthreads) 
+# os.environ["OPENBLAS_NUM_THREADS"] = str(nthreads) 
+# os.environ["MKL_NUM_THREADS"] = str(nthreads)
 from dolfinx import fem, io, mesh as dmesh
 from ufl import grad, Identity, variable, det, tr, ln, inner
 from petsc4py import PETSc
@@ -86,6 +86,9 @@ def main():
     facets_zmin = dmesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[2], z_min, atol=z_tol))
     facets_zmax = dmesh.locate_entities_boundary(mesh, fdim, lambda x: np.isclose(x[2], z_max, atol=z_tol))
 
+    facets_zmin = dmesh.locate_entities_boundary(mesh, fdim, lambda x: x[2] < 0)
+    facets_zmax = dmesh.locate_entities_boundary(mesh, fdim, lambda x: x[2] > 1)
+
     # z = z_min fixed in all directions.
     zmin_dofs_x = fem.locate_dofs_topological(V_x, fdim, facets_zmin)
     zmin_dofs_y = fem.locate_dofs_topological(V_y, fdim, facets_zmin)
@@ -105,6 +108,7 @@ def main():
     bcs = [bc_zmin_x, bc_zmin_y, bc_zmin_z, bc_zmax_x, bc_zmax_y, bc_zmax_z]
 
     max_iter_newton = 10
+    max_iter_instab = 30
     max_amplitude = -(z_max-z_min)*0.2
     rel_tol_newton = 1e-8
     abs_tol_newton = 1e-6
@@ -134,8 +138,9 @@ def main():
         stable_configuration = False
         pert_amplitude = 1e1
         iter_newton = 0
+        max_iter = max_iter_newton
         while not stable_configuration:
-            while iter_newton < max_iter_newton:
+            while iter_newton < max_iter:
                 is_converged = False
                 residual = fem.petsc.assemble_vector(R_form)
                 fem.apply_lifting(residual, [J_nonlinear_form], [bcs], x0=[u.x.petsc_vec], alpha=-1.0)
@@ -171,14 +176,19 @@ def main():
                 # check convergence of solver
                 if solver.getConvergedReason() < 0 and solver_type == PETSc.KSP.Type.CG:
                     # solver did not converge
-                    print(f"Linear solver did not converge. Reason: {solver.getConvergedReason()}. Switch to MINRES solver.")
+                    if comm.rank == 0:
+                        print(f"CG solver did not converge. Reason: {solver.getConvergedReason()}. Switch to MINRES solver.")
+                        sys.stdout.flush()
                     solver_type = PETSc.KSP.Type.MINRES
                     solver.destroy()
                     PETSc.Vec.destroy(residual)
                     PETSc.Mat.destroy(K)
+                    max_iter = max_iter_instab  # allow more iterations for MINRES
                     continue
                 elif solver.getConvergedReason() < 0 and solver_type == PETSc.KSP.Type.MINRES:
-                    print(f"MINRES solver did not converge. Reason: {solver.getConvergedReason()}. Reduce time step size.")
+                    if comm.rank == 0:
+                        print(f"MINRES solver did not converge. Reason: {solver.getConvergedReason()}. Reduce time step size.")
+                        sys.stdout.flush()
                     solver.destroy()
                     PETSc.Vec.destroy(residual)
                     PETSc.Mat.destroy(K)
@@ -196,9 +206,13 @@ def main():
                 PETSc.Mat.destroy(K)
 
             if is_converged:
+                # check eigenvalues
+                if comm.rank == 0:
+                    print("Checking eigenvalues for stability analysis...")
+                    sys.stdout.flush()
                 K = fem.petsc.assemble_matrix(J_nonlinear_form, bcs=bcs)
                 K.assemble()
-                # check eigenvalues
+                
                 eigensolver = SLEPc.EPS().create(comm)
                 eigensolver.setOperators(K)
                 eigensolver.setProblemType(SLEPc.EPS.ProblemType.HEP)
@@ -215,7 +229,10 @@ def main():
                 # Get the number of converged eigenvalues
                 n_conv = eigensolver.getConverged()
                 eigenvalues = np.array([eigensolver.getEigenvalue(i).real for i in range(min(n_conv, 5))])
-                
+                if comm.rank == 0:
+                    print("Smallest eigenvalues:", eigenvalues)
+                    sys.stdout.flush()
+
                 if np.any(eigenvalues < -1e-12):
                     target_indices = np.where(eigenvalues < 1e-12)[0]
                     eigensolver.getEigenvector(target_indices[0], eigenfunction.x.petsc_vec)
