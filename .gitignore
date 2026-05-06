@@ -1,0 +1,10 @@
+*.vtu
+*.stl
+*.msh
+*.vtk
+*.pyc
+
+.vscode/
+.claude/
+__pycache__/
+.DS_Store
