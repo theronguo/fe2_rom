@@ -12,6 +12,9 @@ from dolfinx.fem import petsc
 import numpy as np
 from slepc4py import SLEPc
 import sys
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 def main():
     comm = MPI.COMM_WORLD
@@ -23,7 +26,7 @@ def main():
 
     # Displacement function space
     V = fem.functionspace(mesh, ("Lagrange", 1, (space_dims, )))
-    V1 = fem.functionspace(mesh, ("Lagrange", 1, (space_dims, )))
+    V1 = fem.functionspace(mesh, ("DG", 1, (space_dims, )))
 
     n_dofs_global = V.dofmap.index_map.size_global * V.dofmap.index_map_bs
     if comm.rank == 0:
@@ -54,6 +57,19 @@ def main():
 
     # First Piola-Kirchhoff stress
     P = ufl.diff(W, F)
+
+    # --- DG0 spaces for field visualization (one value per element) ---
+    TT = fem.functionspace(mesh, ("DG", 1, (space_dims, space_dims)))
+    SS = fem.functionspace(mesh, ("DG", 1))
+
+    F_func = fem.Function(TT, name="DeformationGradient")
+    P_func = fem.Function(TT, name="Stress1PK")
+    J_func = fem.Function(SS, name="JacobianDet")
+    u_int  = fem.Function(V1, name="u")
+
+    F_expr = fem.Expression(F, TT.element.interpolation_points())
+    P_expr = fem.Expression(P, TT.element.interpolation_points())
+    J_expr = fem.Expression(J, SS.element.interpolation_points())
 
     # Define test function
     v = ufl.TestFunction(V)
@@ -107,18 +123,26 @@ def main():
 
     bcs = [bc_zmin_x, bc_zmin_y, bc_zmin_z, bc_zmax_x, bc_zmax_y, bc_zmax_z]
 
+    # Reaction force via boundary traction integral: ∫ (P·n)·e_z ds over z_max.
+    # Tag z_max facets so we can restrict the ds measure to that surface only.
+    _zmax_sorted = np.sort(facets_zmax)
+    _zmax_tags = np.full(len(_zmax_sorted), 1, dtype=np.int32)
+    facet_tag_rf = dmesh.meshtags(mesh, fdim, _zmax_sorted, _zmax_tags)
+    ds_zmax = ufl.Measure("ds", domain=mesh, subdomain_data=facet_tag_rf)(1)
+    n_ref = ufl.FacetNormal(mesh)
+    e_z = ufl.as_vector([0.0, 0.0, 1.0])
+    # P·n gives the reference-config traction; project onto e_z for z-component
+    reaction_form = fem.form(ufl.inner(ufl.dot(P, n_ref), e_z) * ds_zmax)
+
+    applied_displacements = []
+    reaction_forces = []
+
     max_iter_newton = 10
     max_iter_instab = 30
     max_amplitude = -(z_max-z_min)*0.2
     rel_tol_newton = 1e-8
     abs_tol_newton = 1e-6
     good_newton_steps = 7
-
-    with io.XDMFFile(comm, f"output/solution_0.xdmf", "w") as xdmf:
-        u_int = fem.Function(V1, name="u")
-        u_int.interpolate(u)
-        xdmf.write_mesh(mesh)
-        xdmf.write_function(u_int, 0.0)
 
     t_end = 1.0
     dt_init = 1e-1
@@ -128,6 +152,22 @@ def main():
     t_current_converged = 0.0
     timestep = 0
 
+    # Single BP file for all output fields, appended every converged step.
+    vtx = io.VTXWriter(comm, "output/solution.bp", [u_int, F_func, P_func, J_func], engine="BP4")
+
+    def write_fields(t):
+        u_int.interpolate(u)
+        F_func.interpolate(F_expr)
+        P_func.interpolate(P_expr)
+        J_func.interpolate(J_expr)
+        vtx.write(t)
+
+    # Write initial (undeformed) state
+    write_fields(0.0)
+    applied_displacements.append(0.0)
+    reaction_forces.append(0.0)
+
+    simulation_finished = False
     while t_current_converged < t_end:
         solver_type = PETSc.KSP.Type.CG
         trial_time = np.round(t_current_converged + dt_current, 5)
@@ -212,7 +252,7 @@ def main():
                     sys.stdout.flush()
                 K = fem.petsc.assemble_matrix(J_nonlinear_form, bcs=bcs)
                 K.assemble()
-                
+
                 eigensolver = SLEPc.EPS().create(comm)
                 eigensolver.setOperators(K)
                 eigensolver.setProblemType(SLEPc.EPS.ProblemType.HEP)
@@ -252,16 +292,29 @@ def main():
                     timestep += 1
                     u_last.x.array[:] = u.x.array[:]
                     u_last.x.scatter_forward()
-                
+
+                    # --- Write fields to BP file ---
+                    write_fields(t_current_converged)
+
+                    # --- Reaction force: ∫ (P·n)·e_z ds over z_max ---
+                    rf_local = fem.assemble_scalar(reaction_form)
+                    rf_total = comm.allreduce(rf_local, op=MPI.SUM)
+                    applied_displacements.append(float(const_1.value))
+                    reaction_forces.append(float(rf_total))
+                    if comm.rank == 0:
+                        print(f"Applied displacement: {const_1.value:.6f}, Reaction force z: {rf_total:.6f}")
+                        sys.stdout.flush()
+
                 # destroy eigensolver
                 eigensolver.destroy()
             else:
                 dt_current /= 2
                 if dt_current < dt_min:
-                     if comm.rank == 0:
+                    if comm.rank == 0:
                         print(f"Minimum time step size {dt_min} reached. Stopping simulation.")
                         sys.stdout.flush()
-                     return
+                    simulation_finished = True
+                    break
                 if comm.rank == 0:
                     print(f"Newton's method did not converge. Halving time step size to {dt_current}.")
                     sys.stdout.flush()
@@ -269,11 +322,30 @@ def main():
                 u.x.scatter_forward()
                 break
 
-        with io.XDMFFile(comm, f"output/solution_{timestep}.xdmf", "w") as xdmf:
-            u_int = fem.Function(V1, name="u")
-            u_int.interpolate(u)
-            xdmf.write_mesh(mesh)
-            xdmf.write_function(u_int, t_current_converged)
+        if simulation_finished:
+            break
+
+    vtx.close()
+
+    # --- Reaction force plot (rank 0 only) ---
+    if comm.rank == 0 and len(applied_displacements) > 1:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.plot(applied_displacements, reaction_forces, "b-o", markersize=4, linewidth=1.5)
+        ax.set_xlabel("Applied displacement (m)")
+        ax.set_ylabel("Reaction force z (N)")
+        ax.set_title("Reaction force vs applied displacement")
+        ax.grid(True)
+        fig.tight_layout()
+        fig.savefig("output/reaction_force.png", dpi=150)
+        plt.close(fig)
+        np.savetxt(
+            "output/reaction_force.csv",
+            np.column_stack([applied_displacements, reaction_forces]),
+            delimiter=",",
+            header="applied_displacement,reaction_force_z",
+            comments="",
+        )
+        print("Saved output/reaction_force.png and output/reaction_force.csv")
 
 
 if __name__ == "__main__":
