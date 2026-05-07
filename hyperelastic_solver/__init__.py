@@ -5,7 +5,7 @@ from .solvers import NewtonSolver, ArcLengthSolver, CylindricalArcLength
 from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 from .output import VTXManager, ReactionForceLogger
-from .solver import HyperelasticStabilitySolver
+from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
 from .logging_utils import setup_logging
 
 __all__ = [
@@ -16,6 +16,6 @@ __all__ = [
     "StabilityAnalyzer",
     "TimeStepper",
     "VTXManager", "ReactionForceLogger",
-    "HyperelasticStabilitySolver",
+    "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
     "setup_logging",
 ]

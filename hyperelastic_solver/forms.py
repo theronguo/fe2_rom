@@ -32,3 +32,28 @@ def build_weak_forms(mesh, V, u, material: MaterialModel, body_force=None, dx=No
     J_nonlinear = ufl.derivative(R, u)
 
     return fem.form(R), fem.form(J_nonlinear), F_var, P_ufl, J_ufl
+
+
+def build_homogenization_weak_form(mesh, V, u, Fbar, material: MaterialModel, dx=None):
+    """Compile residual and tangent stiffness forms for the periodic homogenization problem.
+
+    Returns (R_form, J_form, F_var, P_ufl, J_ufl) where F_var is the variable-
+    wrapped deformation gradient, P_ufl is the first PK stress, and J_ufl is det(F).
+    F_var and P_ufl share the same UFL graph as R_form, so they reflect the
+    current u without any extra interpolation step.
+
+    fem.form() calls are collective — must be called on all MPI ranks.
+    """
+    if dx is None:
+        dx = ufl.Measure("dx", domain=mesh)
+
+    F_var = ufl.variable(Fbar + ufl.grad(u))
+    P_ufl = material.first_pk_stress(F_var)
+    J_ufl = ufl.det(F_var)
+    u_total = (Fbar - ufl.Identity(mesh.geometry.dim)) * ufl.SpatialCoordinate(mesh) + u
+
+    v = ufl.TestFunction(V)
+    R = ufl.inner(ufl.grad(v), P_ufl) * dx
+    J_nonlinear = ufl.derivative(R, u)
+
+    return fem.form(R), fem.form(J_nonlinear), F_var, P_ufl, J_ufl, u_total
