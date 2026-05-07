@@ -73,15 +73,7 @@ os.makedirs("output", exist_ok=True)
 vtx = VTXManager(comm, "output/solution.bp",
                  [solver.u_int, solver.F_func, solver.P_func, solver.J_func, solver.u_total])
 
-solver.run(
-    load_schedule,
-    timestepper=TimeStepper(
-        t_end=1.0,
-        dt_init=0.2,
-        dt_min=1e-5,
-        dt_max=0.1,
-        good_newton_steps=7,
-    ),
+solver(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1+max_amplitude]]),
     output_manager=vtx,
     pert_amplitude_init=1e1,
 )

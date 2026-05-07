@@ -511,10 +511,8 @@ class PeriodicHyperelasticHomogenizationSolver:
         if output_manager is not None:
             output_manager.write(t)
 
-    def run(self, load_schedule: Callable[[float], None], *,
-            timestepper: TimeStepper | None = None,
+    def __call__(self, Fbar: np.array,
             output_manager: VTXManager | None = None,
-            reaction_logger: ReactionForceLogger | None = None,
             pert_amplitude_init: float = 1e1) -> None:
         """Main time-stepping loop.
 
@@ -526,16 +524,21 @@ class PeriodicHyperelasticHomogenizationSolver:
         TODO: improve by normalising eigenvector relative to mesh size h.
         """
         assert self._newton is not None, "Call setup() before run()"
-
-        if timestepper is None:
-            timestepper = TimeStepper()
+        
+        timestepper = TimeStepper(t_end=1.0, dt_init=1.0)  # Single step
+        
+        Fbar_prev = self.F_bar.value.copy()  # Store initial F_bar for ramping
+        def load_schedule(t: float) -> None:
+            for i in range(Fbar.shape[0]):
+                for j in range(Fbar.shape[1]):
+                    self.F_bar.value[i, j] = t * (Fbar[i, j] - Fbar_prev[i, j])  + Fbar_prev[i, j]  # Linear ramp from 0 to Fbar
 
         comm = self.comm
         u = self.u
 
-        self._write_fields(output_manager, 0.0)
-        if reaction_logger is not None:
-            reaction_logger.record(0.0, 0.0)
+        if output_manager is not None:
+            self._write_fields(output_manager, 0.0)
+
 
         simulation_finished = False
         while not timestepper.finished:
@@ -575,16 +578,8 @@ class PeriodicHyperelasticHomogenizationSolver:
                         self._u_last.x.array[:] = u.x.array[:]
                         self._u_last.x.scatter_forward()
 
-                        self._write_fields(output_manager, timestepper.t_current)
-
-                        for probe in self._reaction_probes:
-                            rf = probe.assemble(comm)
-                            if reaction_logger is not None:
-                                reaction_logger.record(probe.displacement, rf)
-                            logger.info(
-                                "   disp=% .6f  reaction_z=% .6f",
-                                probe.displacement, rf,
-                            )
+                        if output_manager is not None:
+                            self._write_fields(output_manager, timestepper.t_current)
 
                 else:
                     ok = timestepper.reject()
