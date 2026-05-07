@@ -511,9 +511,32 @@ class PeriodicHyperelasticHomogenizationSolver:
         if output_manager is not None:
             output_manager.write(t)
 
+    def compute_average_first_pk_stress(self) -> np.ndarray:
+        """Compute domain-average first Piola-Kirchhoff stress tensor from the current converged state."""
+        assert self._P_ufl is not None
+        import ufl
+        from mpi4py import MPI
+
+        dim = self._mesh.geometry.dim
+        dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
+        vol_local = fem.assemble_scalar(fem.form(1.0 * dx))
+        vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
+
+        if vol_global <= 0.0:
+            raise RuntimeError("Domain volume is non-positive; cannot average stress.")
+
+        P_avg = np.zeros((dim, dim), dtype=float)
+        for i in range(dim):
+            for j in range(dim):
+                P_ij_local = fem.assemble_scalar(fem.form(self._P_ufl[i, j] * dx))
+                P_ij_global = self.comm.allreduce(P_ij_local, op=MPI.SUM)
+                P_avg[i, j] = P_ij_global / vol_global
+
+        return P_avg
+
     def __call__(self, Fbar: np.array,
             output_manager: VTXManager | None = None,
-            pert_amplitude_init: float = 1e1) -> None:
+            pert_amplitude_init: float = 1e1) -> tuple[np.ndarray, np.ndarray]:
         """Main time-stepping loop.
 
         load_schedule(t) is called once per trial time step to update any
@@ -539,7 +562,8 @@ class PeriodicHyperelasticHomogenizationSolver:
         if output_manager is not None:
             self._write_fields(output_manager, 0.0)
 
-
+        Fbar_conv = []
+        Pbar_conv = []
         simulation_finished = False
         while not timestepper.finished:
             trial_time = timestepper.step_forward()
@@ -578,6 +602,10 @@ class PeriodicHyperelasticHomogenizationSolver:
                         self._u_last.x.array[:] = u.x.array[:]
                         self._u_last.x.scatter_forward()
 
+                        Peff = self.compute_average_first_pk_stress()
+                        Fbar_conv.append(self.F_bar.value.copy())
+                        Pbar_conv.append(Peff.copy())
+
                         if output_manager is not None:
                             self._write_fields(output_manager, timestepper.t_current)
 
@@ -598,3 +626,5 @@ class PeriodicHyperelasticHomogenizationSolver:
 
             if simulation_finished:
                 break
+
+        return np.array(Fbar_conv), np.array(Pbar_conv)

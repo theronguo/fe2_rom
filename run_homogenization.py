@@ -73,9 +73,14 @@ os.makedirs("output", exist_ok=True)
 vtx = VTXManager(comm, "output/solution.bp",
                  [solver.u_int, solver.F_func, solver.P_func, solver.J_func, solver.u_total])
 
-solver(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1+max_amplitude]]),
+res = solver(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1+max_amplitude]]),
     output_manager=vtx,
     pert_amplitude_init=1e1,
 )
 
+Fbar_conv, Pbar_conv = res
+print("Fbar convergence history:")
+print(Fbar_conv)
+print("Pbar convergence history:")
+print(Pbar_conv)
 vtx.close()
