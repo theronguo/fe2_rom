@@ -6,6 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Callable
 
+import dolfinx_mpc
 import numpy as np
 from dolfinx import fem
 from dolfinx.fem import petsc as fem_petsc
@@ -25,7 +26,7 @@ class NewtonSolver:
     solver_type, effective_max_iter, and the stored initial residual norm.
     """
 
-    def __init__(self, comm, R_form, J_form, u, du, bcs, *,
+    def __init__(self, comm, R_form, J_form, u, du, bcs, mpc=None, *,
                  rel_tol=1e-8, abs_tol=1e-6, max_iter=10, max_iter_instab=30,
                  switch_to_minres=False
                  ):
@@ -40,6 +41,10 @@ class NewtonSolver:
         self._max_iter = max_iter
         self._max_iter_instab = max_iter_instab
         self._switch_to_minres = switch_to_minres
+        self.mpc = mpc
+
+        if mpc is not None:
+            self._du = fem.Function(mpc.function_space, name="du")  # shadow du with MPC-aware version
 
         self._solver_type = PETSc.KSP.Type.CG
         self.effective_max_iter = max_iter
@@ -69,10 +74,15 @@ class NewtonSolver:
         while iter_newton < self.effective_max_iter:
             is_converged = False
 
-            residual = fem_petsc.assemble_vector(self._R_form)
-            fem.apply_lifting(residual, [self._J_form], [self._bcs],
-                              x0=[self._u.x.petsc_vec], alpha=-1.0)
-            self._scatter_update(residual)
+            if self.mpc is not None:
+                residual = dolfinx_mpc.assemble_vector(self._R_form, self.mpc)
+                dolfinx_mpc.apply_lifting(residual, [self._J_form], [self._bcs], self.mpc,
+                                          x0=[self._u.x.petsc_vec], scale=-1.0)
+            else:
+                residual = fem_petsc.assemble_vector(self._R_form)
+                fem.apply_lifting(residual, [self._J_form], [self._bcs],
+                                  x0=[self._u.x.petsc_vec], alpha=-1.0)
+            residual.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
             fem.set_bc(residual, self._bcs, x0=self._u.x.petsc_vec, scale=-1.0)
 
             abs_b_norm = residual.norm()
@@ -94,14 +104,19 @@ class NewtonSolver:
             if rel > 10 or np.isnan(abs_b_norm):
                 PETSc.Vec.destroy(residual)
                 break
-
-            K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
+            
+            if self.mpc is not None:
+                K = dolfinx_mpc.assemble_matrix(self._J_form, self.mpc, bcs=self._bcs)
+            else:
+                K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
             K.assemble()
             ksp = PETSc.KSP().create(self._comm)
             ksp.setOperators(K)
             ksp.setType(self._solver_type)
             ksp.getPC().setType(PETSc.PC.Type.GAMG)
             ksp.solve(-residual, self._du.x.petsc_vec)
+
+            logger.debug("du norm: %.3e", self._du.x.petsc_vec.norm())
 
             reason = ksp.getConvergedReason()
             if reason < 0 and self._solver_type == PETSc.KSP.Type.CG:
@@ -128,6 +143,12 @@ class NewtonSolver:
             else:
                 ksp.destroy()
 
+            self._du.x.petsc_vec.ghostUpdate(
+                addv=PETSc.InsertMode.INSERT,  # type: ignore
+                mode=PETSc.ScatterMode.FORWARD,  # type: ignore
+            )
+            if self.mpc is not None:
+                self.mpc.backsubstitution(self._du.x.petsc_vec)
             self._u.x.petsc_vec.axpy(1.0, self._du.x.petsc_vec)
             self._u.x.scatter_forward()
             iter_newton += 1
@@ -142,7 +163,10 @@ class NewtonSolver:
 
     def assemble_stiffness(self) -> PETSc.Mat:
         """Assemble and return tangent stiffness K. Caller is responsible for destroying it."""
-        K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
+        if self.mpc is not None:
+            K = dolfinx_mpc.assemble_matrix(self._J_form, self.mpc, bcs=self._bcs)
+        else:
+            K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
         K.assemble()
         return K
 

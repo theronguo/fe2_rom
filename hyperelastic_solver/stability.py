@@ -56,7 +56,7 @@ class StabilityAnalyzer:
 
         is_stable = True
         if np.any(eigenvalues < self._neg_tol):
-            target_indices = np.where(eigenvalues < 1e-12)[0]
+            target_indices = np.where(eigenvalues < self._neg_tol)[0]
             eigensolver.getEigenvector(target_indices[0], eigenfunction.x.petsc_vec)
             eigenfunction.x.scatter_forward()
             is_stable = False

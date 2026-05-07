@@ -8,6 +8,7 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"  # avoid OpenBLAS oversubscription
 os.environ["OMP_NUM_THREADS"] = "1"      # avoid OpenMP oversubscription
 os.environ["MKL_NUM_THREADS"] = "1"      # avoid MKL oversubscription
+import matplotlib.pyplot as plt
 import numpy as np
 from dolfinx import fem, io
 from mpi4py import MPI
@@ -73,7 +74,7 @@ os.makedirs("output", exist_ok=True)
 vtx = VTXManager(comm, "output/solution.bp",
                  [solver.u_int, solver.F_func, solver.P_func, solver.J_func, solver.u_total])
 
-res = solver(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1+max_amplitude]]),
+res = solver(np.array([[1.0, 0.03, 0.05], [-0.1, 0.95, 0.0], [0.0, 0.0, 1+max_amplitude]]),
     output_manager=vtx,
     pert_amplitude_init=1e1,
 )
@@ -83,4 +84,16 @@ print("Fbar convergence history:")
 print(Fbar_conv)
 print("Pbar convergence history:")
 print(Pbar_conv)
+
+if comm.rank == 0 and Fbar_conv.size and Pbar_conv.size:
+    fig, ax = plt.subplots()
+    ax.plot(Fbar_conv[:, 2, 2], Pbar_conv[:, 2, 2], marker="o")
+    ax.set_xlabel("Fzz")
+    ax.set_ylabel("Pzz")
+    ax.set_title("Pzz over Fzz")
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig("output/pzz_over_fzz.png", dpi=150)
+    plt.close(fig)
+
 vtx.close()

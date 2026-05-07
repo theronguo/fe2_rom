@@ -4,6 +4,8 @@ from typing import Callable
 import numpy as np
 from dolfinx import fem, mesh as dmesh
 from petsc4py import PETSc
+from mpi4py import MPI
+import ufl
 
 from .boundary import ReactionProbe
 from .forms import build_homogenization_weak_form, build_weak_forms
@@ -94,7 +96,6 @@ class HyperelasticStabilitySolver:
         Collective: calls fem.form() on all MPI ranks.
         """
         newton_options = newton_options if newton_options is not None else {}
-        import ufl
 
         mesh = self._mesh
         fdim = mesh.topology.dim - 1
@@ -446,7 +447,6 @@ class PeriodicHyperelasticHomogenizationSolver:
         Collective: calls fem.form() on all MPI ranks.
         """
         newton_options = newton_options if newton_options is not None else {}
-        import ufl
 
         mesh = self._mesh
         fdim = mesh.topology.dim - 1
@@ -463,21 +463,114 @@ class PeriodicHyperelasticHomogenizationSolver:
         self._J_ufl = J_ufl
         self._u_total = u_total
 
-        bcs = []
-        probes = []
-        for subspace_index, locate_fn, value, measure_reaction, reaction_dir in self._bc_specs:
-            V_sub = V.sub(subspace_index)
-            facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
-            dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
-            bc = fem.dirichletbc(value, dofs, V_sub)
-            bcs.append(bc)
-            if measure_reaction:
-                probe = ReactionProbe(mesh, facets, P_ufl,
-                                      direction=reaction_dir, bc_value=value)
-                probes.append(probe)
+        # locate outer boundaries
+        x_local = mesh.geometry.x[:, 0]
+        y_local = mesh.geometry.x[:, 1]
+        z_local = mesh.geometry.x[:, 2]
+        x_min = self.comm.allreduce(float(np.min(x_local)), op=MPI.MIN)
+        x_max = self.comm.allreduce(float(np.max(x_local)), op=MPI.MAX)
+        y_min = self.comm.allreduce(float(np.min(y_local)), op=MPI.MIN)
+        y_max = self.comm.allreduce(float(np.max(y_local)), op=MPI.MAX)
+        z_min = self.comm.allreduce(float(np.min(z_local)), op=MPI.MIN)
+        z_max = self.comm.allreduce(float(np.max(z_local)), op=MPI.MAX)
+        
+        face_1 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[0], x_min))
+        face_2 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[0], x_max))
+        face_3 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[1], y_min))
+        face_4 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[1], y_max))
+        face_5 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[2], z_min))
+        face_6 = fem.locate_dofs_geometrical(V, lambda x: np.isclose(x[2], z_max))
+        
+        # 12 edges
+        edge_1 = np.intersect1d(face_1, face_3)
+        edge_2 = np.intersect1d(face_1, face_4)
+        edge_3 = np.intersect1d(face_2, face_3)
+        edge_4 = np.intersect1d(face_2, face_4)
+        edge_5 = np.intersect1d(face_1, face_5)
+        edge_6 = np.intersect1d(face_1, face_6)
+        edge_7 = np.intersect1d(face_2, face_5)
+        edge_8 = np.intersect1d(face_2, face_6)
+        edge_9 = np.intersect1d(face_3, face_5)
+        edge_10 = np.intersect1d(face_3, face_6)
+        edge_11 = np.intersect1d(face_4, face_5)
+        edge_12 = np.intersect1d(face_4, face_6)
+
+        # 8 corners
+        corner_1 = np.intersect1d(edge_1, face_5)
+        corner_2 = np.intersect1d(edge_2, face_5)
+        corner_3 = np.intersect1d(edge_3, face_5)
+        corner_4 = np.intersect1d(edge_4, face_5)
+        corner_5 = np.intersect1d(edge_1, face_6)
+        corner_6 = np.intersect1d(edge_2, face_6)
+        corner_7 = np.intersect1d(edge_3, face_6)
+        corner_8 = np.intersect1d(edge_4, face_6)
+
+        corner = np.unique(np.concatenate([corner_1, corner_2, corner_3, corner_4, corner_5, corner_6, corner_7, corner_8]))
+        logger.info("Corner DOFs:", corner)
+        # coordinates
+        logger.info("Corner coordinates:")
+        for i in corner:
+            logger.info(f"  DOF {i}: {mesh.geometry.x[i]}")
+
+        # 
+
+        # all corners are 0.
+        import dolfinx_mpc
+        mpc = dolfinx_mpc.MultiPointConstraint(V)
+
+        _u_zero_c = fem.Constant(mesh, np.zeros(mesh.geometry.dim, dtype=PETSc.ScalarType))
+        bcs = [fem.dirichletbc(_u_zero_c, corner, V)]
+
+        # all
+        def map_left_to_right(x):
+            y = x.copy(); y[0] = x_max; return y
+        def map_bottom_to_top(x):
+            y = x.copy(); y[1] = y_max; return y
+        def map_back_to_front(x):
+            y = x.copy(); y[2] = z_max; return y
+        def face_bot_top(x):
+            # Exclude edges shared with left/right faces to avoid duplicate constraints.
+            return (
+                np.isclose(x[1], y_min)
+                & (x[0] > x_min + 1e-8)
+                & (x[0] < x_max - 1e-8)
+            )
+        def face_back_front(x):
+            # Exclude edges shared with left/right/bottom/top faces.
+            return (
+                np.isclose(x[2], z_min)
+                & (x[0] > x_min + 1e-8)
+                & (x[0] < x_max - 1e-8)
+                & (x[1] > y_min + 1e-8)
+                & (x[1] < y_max - 1e-8)
+            )
+
+        mpc.create_periodic_constraint_geometrical(V, lambda x: np.isclose(x[0], x_min),
+                                                   map_left_to_right, bcs)
+        mpc.create_periodic_constraint_geometrical(V, face_bot_top,
+                                                   map_bottom_to_top, bcs)
+        mpc.create_periodic_constraint_geometrical(V, face_back_front,
+                                                   map_back_to_front, bcs)
+        mpc.finalize()
+        self.mpc = mpc
+        logger.info("PeriodicHomogenization ready. MPC slaves: %d",
+                 mpc.num_local_slaves)
+
+        # bcs = []
+        # probes = []
+        # for subspace_index, locate_fn, value, measure_reaction, reaction_dir in self._bc_specs:
+        #     V_sub = V.sub(subspace_index)
+        #     facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
+        #     dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
+        #     bc = fem.dirichletbc(value, dofs, V_sub)
+        #     bcs.append(bc)
+        #     if measure_reaction:
+        #         probe = ReactionProbe(mesh, facets, P_ufl,
+        #                               direction=reaction_dir, bc_value=value)
+        #         probes.append(probe)
 
         self._bcs = bcs
-        self._reaction_probes = probes
+        # self._reaction_probes = probes
 
         if self._enable_viz_fields:
             TT = self.F_func.function_space
@@ -495,11 +588,10 @@ class PeriodicHyperelasticHomogenizationSolver:
                     logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
             newton_options["switch_to_minres"] = True
         self._newton = NewtonSolver(
-            self.comm, R_form, J_form, self.u, self._du, bcs,
+            self.comm, R_form, J_form, self.u, self._du, bcs, self.mpc,
             **newton_options,
         )
-        logger.info("Setup complete — %d BCs, %d reaction probe(s)",
-                    len(bcs), len(probes))
+        logger.info("Setup complete")
 
     def _write_fields(self, output_manager: VTXManager | None, t: float) -> None:
         if self._enable_viz_fields:
@@ -514,8 +606,6 @@ class PeriodicHyperelasticHomogenizationSolver:
     def compute_average_first_pk_stress(self) -> np.ndarray:
         """Compute domain-average first Piola-Kirchhoff stress tensor from the current converged state."""
         assert self._P_ufl is not None
-        import ufl
-        from mpi4py import MPI
 
         dim = self._mesh.geometry.dim
         dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
@@ -587,7 +677,7 @@ class PeriodicHyperelasticHomogenizationSolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        target = np.where(eigenvalues < 1e-12)[0]
+                        target = np.where(eigenvalues < self._stability._neg_tol)[0]
                         u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
                         u.x.scatter_forward()
                         pert_amplitude *= 2

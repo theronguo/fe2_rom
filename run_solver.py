@@ -69,7 +69,7 @@ solver.run(
     load_schedule,
     timestepper=TimeStepper(
         t_end=1.0,
-        dt_init=0.2,
+        dt_init=0.1,
         dt_min=1e-5,
         dt_max=0.1,
         good_newton_steps=7,
