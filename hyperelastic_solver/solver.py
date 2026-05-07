@@ -9,7 +9,7 @@ from .boundary import ReactionProbe
 from .forms import build_weak_forms
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
-from .solvers import ArcLengthSolver, NewtonSolver
+from .solvers import CylindricalArcLength, NewtonSolver
 from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 
@@ -30,7 +30,8 @@ class HyperelasticStabilitySolver:
     """
 
     def __init__(self, mesh, cell_tags, facet_tags, material: MaterialModel, *,
-                 degree: int = 1, body_force=None, enable_viz_fields: bool = True):
+                 degree: int = 1, body_force=None, neumann_terms=None,
+                 enable_viz_fields: bool = True):
         self.comm = mesh.comm
         self._mesh = mesh
         self._cell_tags = cell_tags
@@ -38,6 +39,7 @@ class HyperelasticStabilitySolver:
         self._material = material
         self._degree = degree
         self._body_force = body_force
+        self._neumann_terms = neumann_terms
         self._enable_viz_fields = enable_viz_fields
 
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
@@ -84,12 +86,14 @@ class HyperelasticStabilitySolver:
         self._bc_specs.append((subspace_index, locate_fn, value,
                                 measure_reaction, reaction_direction))
 
-    def setup(self) -> None:
+    def setup(self, check_stability: bool = True,
+              newton_options: dict | None = None) -> None:
         """Freeze BCs, compile UFL forms, and instantiate sub-solvers.
 
         Must be called once after all add_bc() calls and before run().
         Collective: calls fem.form() on all MPI ranks.
         """
+        newton_options = newton_options if newton_options is not None else {}
         import ufl
 
         mesh = self._mesh
@@ -100,6 +104,7 @@ class HyperelasticStabilitySolver:
         R_form, J_form, F_var, P_ufl, J_ufl = build_weak_forms(
             mesh, V, self.u, self._material,
             body_force=self._body_force, dx=dx,
+            neumann_terms=self._neumann_terms,
         )
         self._R_form = R_form
         self._J_form = J_form
@@ -130,10 +135,16 @@ class HyperelasticStabilitySolver:
             self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points())
             self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points())
 
+        if check_stability:
+            self._stability = StabilityAnalyzer(self.comm)
+            if "switch_to_minres" in newton_options:
+                if newton_options["switch_to_minres"] is False:
+                    logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
+            newton_options["switch_to_minres"] = True
         self._newton = NewtonSolver(
             self.comm, R_form, J_form, self.u, self._du, bcs,
+            **newton_options,
         )
-        self._stability = StabilityAnalyzer(self.comm)
         logger.info("Setup complete — %d BCs, %d reaction probe(s)",
                     len(bcs), len(probes))
 
@@ -189,7 +200,10 @@ class HyperelasticStabilitySolver:
 
                 if converged:
                     K = self._newton.assemble_stiffness()
-                    is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                    if self._stability is not None:
+                        is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                    else:
+                        is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
                         target = np.where(eigenvalues < 1e-12)[0]
@@ -236,11 +250,119 @@ class HyperelasticStabilitySolver:
             if simulation_finished:
                 break
 
-    def run_arc_length(self, arc_length_solver: ArcLengthSolver, *,
-                       output_manager: VTXManager | None = None) -> None:
-        """Arc-length continuation loop. Not yet implemented."""
-        raise NotImplementedError(
-            "Arc-length solver is not yet implemented. "
-            "Implement CylindricalArcLength.predictor / constraint / corrector "
-            "in hyperelastic_solver/solvers.py and wire it here."
-        )
+    def run_arc_length(self, arc_solver: CylindricalArcLength,
+                       load_fn: Callable[[float], None], *,
+                       lambda_init: float = 0.0,
+                       lambda_max: float = 1.0,
+                       output_manager: VTXManager | None = None,
+                       reaction_logger: ReactionForceLogger | None = None,
+                       step_callback: "Callable[[float], None] | None" = None) -> None:
+        """Crisfield cylindrical arc-length continuation loop.
+
+        load_fn(lam) must update all load-controlling fem.Constants so that
+        the assembled forms reflect the load at multiplier lam.
+
+        lambda_init: starting load factor.
+        lambda_max:  loop stops when lam ≥ lambda_max.
+        step_callback(lam): called after every accepted step with the current
+            load factor.  Use it to record quantities from self.u without
+            modifying the solver (e.g. midspan displacement for snap-through).
+
+        On corrector failure the arc-length is halved and the step retried
+        (up to 4 times). If all retries fail the loop terminates early.
+        """
+        assert self._newton is not None, "Call setup() before run_arc_length()"
+
+        comm = self.comm
+        u = self.u
+        newton = self._newton
+
+        load_fn(lambda_init)
+        lam = lambda_init
+        ds = arc_solver.arc_length
+
+        du_prev: PETSc.Vec | None = None
+        dlambda_prev: float = 1.0
+
+        self._write_fields(output_manager, 0)
+        if reaction_logger is not None:
+            reaction_logger.record(lam, 0.0)
+
+        for step in range(arc_solver.max_arc_steps):
+            if lam >= lambda_max:
+                logger.info("Arc-length: reached λ_max=%.4f — done.", lambda_max)
+                break
+
+            logger.info("── Arc step %3d  λ=%.4f  Δs=%.3e", step, lam, ds)
+            u_base = u.x.array.copy()
+
+            # Predictor + corrector with up to 5 retries at halved arc-length.
+            # du_accepted is None if all retries fail, a live Vec otherwise.
+            du_accepted: PETSc.Vec | None = None
+            dlambda_accepted: float = 0.0
+            n_iter_accepted: int = 0
+
+            for retry in range(5):
+                if retry > 0:
+                    ds *= 0.5
+                    arc_solver.arc_length = ds
+                    logger.warning("  retry %d  Δs → %.3e", retry, ds)
+                    u.x.array[:] = u_base
+                    u.x.scatter_forward()
+                    load_fn(lam)
+
+                du_pred, dlambda_pred, f_ref = arc_solver.predictor(
+                    newton, load_fn, lam, du_prev, dlambda_prev
+                )
+                converged, n_iter, dlambda_final = arc_solver.corrector(
+                    newton, load_fn,
+                    lam_0=lam,
+                    u_base=u_base,
+                    du_total=du_pred,
+                    dlambda_total=dlambda_pred,
+                    f_ref=f_ref,
+                    ds=ds,
+                )
+                PETSc.Vec.destroy(f_ref)
+
+                if converged:
+                    du_accepted = du_pred        # ownership transfers here
+                    dlambda_accepted = dlambda_final
+                    n_iter_accepted = n_iter
+                    break
+
+                # Failed: release this step's Vec, restore base state
+                PETSc.Vec.destroy(du_pred)
+                u.x.array[:] = u_base
+                u.x.scatter_forward()
+                load_fn(lam)
+
+            if du_accepted is None:
+                logger.error("Arc step %d failed after all retries — stopping.", step)
+                break
+
+            lam += dlambda_accepted
+            logger.info("   converged in %d iter  λ=%.4f", n_iter_accepted, lam)
+
+            # u is already at u_base + ΔU (set by the last corrector iteration);
+            # just synchronise the load constant with the accepted λ
+            load_fn(lam)
+            self._write_fields(output_manager, step + 1)
+
+            for probe in self._reaction_probes:
+                rf = probe.assemble(comm)
+                if reaction_logger is not None:
+                    reaction_logger.record(lam, rf)
+                logger.info("   λ=% .4f  reaction=% .6f", lam, rf)
+
+            if step_callback is not None:
+                step_callback(lam)
+
+            if du_prev is not None:
+                PETSc.Vec.destroy(du_prev)
+            du_prev = du_accepted.copy()
+            dlambda_prev = dlambda_accepted
+            PETSc.Vec.destroy(du_accepted)
+
+        if du_prev is not None:
+            PETSc.Vec.destroy(du_prev)

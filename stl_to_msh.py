@@ -151,6 +151,10 @@ def stl_to_msh(
 
     meshio.write(str(msh_path), vol_mesh, file_format="gmsh22", binary=False)
     logger.info("Written '%s'", msh_path)
+
+    os.remove(clean_stl)
+    os.remove(remeshed_stl)
+    os.remove(vtu_path)
     return str(msh_path)
 
 

@@ -4,7 +4,8 @@ from dolfinx import fem
 from .material import MaterialModel
 
 
-def build_weak_forms(mesh, V, u, material: MaterialModel, body_force=None, dx=None):
+def build_weak_forms(mesh, V, u, material: MaterialModel, body_force=None, dx=None,
+                     neumann_terms=None):
     """Compile residual and tangent stiffness forms for a hyperelastic problem.
 
     Returns (R_form, J_form, F_var, P_ufl, J_ufl) where F_var is the variable-
@@ -26,6 +27,8 @@ def build_weak_forms(mesh, V, u, material: MaterialModel, body_force=None, dx=No
 
     v = ufl.TestFunction(V)
     R = ufl.inner(ufl.grad(v), P_ufl) * dx - ufl.inner(v, body_force) * dx
+    for traction, ds_measure in (neumann_terms or []):
+        R -= ufl.inner(v, traction) * ds_measure
     J_nonlinear = ufl.derivative(R, u)
 
     return fem.form(R), fem.form(J_nonlinear), F_var, P_ufl, J_ufl

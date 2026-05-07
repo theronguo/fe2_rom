@@ -47,13 +47,13 @@ solver.add_bc(2, lambda x: x[2] < 0+1e-8, const_0)
 solver.add_bc(2, lambda x: x[2] > 1-1e-8, const_1,
               measure_reaction=True, reaction_direction=(0.0, 0.0, 1.0))
 
-solver.setup()
+solver.setup(check_stability=True, newton_options={"switch_to_minres": True})
 
 # Compute max_amplitude using MPI-reduced z extents
 z_local = mesh.geometry.x[:, 2]
 z_min = comm.allreduce(float(np.min(z_local)), op=MPI.MIN)
 z_max = comm.allreduce(float(np.max(z_local)), op=MPI.MAX)
-max_amplitude = -0.2
+max_amplitude = -0.25
 
 
 def load_schedule(t: float) -> None:
@@ -78,6 +78,24 @@ solver.run(
     reaction_logger=rf_logger,
     pert_amplitude_init=1e1,
 )
+
+# from hyperelastic_solver.solvers import CylindricalArcLength
+# arc = CylindricalArcLength(
+#     arc_length=15,        # arc-length step in (U, λ) space; increase for larger λ steps
+#     max_arc_steps=800,
+#     max_newton_iter=15,
+#     abs_tol=1e-5,
+# )
+
+# solver.run_arc_length(
+#     arc,
+#     load_fn=load_schedule,
+#     lambda_init=0.0,
+#     lambda_max=1.0,
+#     output_manager=vtx,
+#     reaction_logger=rf_logger,
+# )
+
 
 vtx.close()
 rf_logger.save(comm, "output/reaction_force.png", "output/reaction_force.csv")
