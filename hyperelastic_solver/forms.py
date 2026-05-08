@@ -50,10 +50,11 @@ def build_homogenization_weak_form(mesh, V, u, Fbar, material: MaterialModel, dx
     F_var = ufl.variable(Fbar + ufl.grad(u))
     P_ufl = material.first_pk_stress(F_var)
     J_ufl = ufl.det(F_var)
+    W_ufl = material.strain_energy(F_var)
     u_total = (Fbar - ufl.Identity(mesh.geometry.dim)) * ufl.SpatialCoordinate(mesh) + u
 
     v = ufl.TestFunction(V)
     R = ufl.inner(ufl.grad(v), P_ufl) * dx
     J_nonlinear = ufl.derivative(R, u)
 
-    return fem.form(R), fem.form(J_nonlinear), F_var, P_ufl, J_ufl, u_total
+    return fem.form(R), fem.form(J_nonlinear), F_var, P_ufl, J_ufl, W_ufl, u_total

@@ -11,6 +11,7 @@ class TimeStepper:
         self.t_end = t_end
         self.dt_min = dt_min
         self.dt_max = dt_max
+        self.dt_init = dt_init
         self._good_newton_steps = good_newton_steps
         self.t_current = 0.0
         self.dt = dt_init
@@ -36,3 +37,8 @@ class TimeStepper:
     @property
     def finished(self) -> bool:
         return self.t_current >= self.t_end
+
+    def reset(self) -> None:
+        """Reset time stepper to initial state."""
+        self.t_current = 0.0
+        self.dt = self.dt_init
