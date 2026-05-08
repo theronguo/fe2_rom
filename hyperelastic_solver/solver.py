@@ -417,6 +417,18 @@ class PeriodicHyperelasticHomogenizationSolver:
         self._mesh.topology.create_connectivity(self._mesh.topology.dim - 1, self._mesh.topology.dim)
         self.dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
         self.gdim = gdim
+
+        self.mins, self.maxs = self._compute_domain_bounds()
+        self.length_scale = (self.maxs - self.mins).max()
+        logger.info("Mesh loaded: %d cells, %d facets, gdim=%d",
+                    self._mesh.topology.index_map(self._mesh.topology.dim).size_global,
+                    self._mesh.topology.index_map(self._mesh.topology.dim - 1).size_global,
+                    gdim,
+        )
+        logger.info("Domain bounds: x_min=%.3f  x_max=%.3f", self.mins[0], self.maxs[0])
+        logger.info("Domain bounds: y_min=%.3f  y_max=%.3f", self.mins[1], self.maxs[1])
+        if gdim == 3:
+            logger.info("Domain bounds: z_min=%.3f  z_max=%.3f", self.mins[2], self.maxs[2])
         
         ### Material model ###
         self._material = material
@@ -573,12 +585,10 @@ class PeriodicHyperelasticHomogenizationSolver:
             raise ValueError(
                 f"Periodic homogenization supports only 2D rectangle or 3D cuboid, got dim={self.gdim}."
             )
-
-        mins, maxs = self._compute_domain_bounds()
-        tol = 1e-8 * max(1.0, float(np.max(maxs - mins)))
+        tol = 1e-8 * max(1.0, float(np.max(self.maxs - self.mins)))
 
         # Fix all corner DOFs to remove rigid modes and avoid over-constraining periodic ties.
-        corner = self._locate_corner_dofs(V, mins, maxs, tol)
+        corner = self._locate_corner_dofs(V, self.mins, self.maxs, tol)
         u_zero = fem.Constant(mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
         bcs = [fem.dirichletbc(u_zero, corner, V)]
 
@@ -589,12 +599,12 @@ class PeriodicHyperelasticHomogenizationSolver:
         for axis in range(self.gdim):
             selector = self._make_periodic_slave_selector(
                 axis=axis,
-                mins=mins,
-                maxs=maxs,
+                mins=self.mins,
+                maxs=self.maxs,
                 tol=tol,
                 exclude_axes=tuple(range(axis)),
             )
-            axis_map = self._make_axis_map(axis, maxs[axis])
+            axis_map = self._make_axis_map(axis, self.maxs[axis])
             mpc.create_periodic_constraint_geometrical(V, selector, axis_map, bcs)
         mpc.finalize()
 
