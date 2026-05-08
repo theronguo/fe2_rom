@@ -12,6 +12,11 @@ class MaterialModel(ABC):
     def first_pk_stress(self, F) -> Any:
         """First Piola-Kirchhoff stress P = dW/dF. Requires F to be a ufl.variable."""
         return ufl.diff(self.strain_energy(F), F)
+    
+    def tangent_moduli(self, F) -> Any:
+        """Tangent moduli A = dP/dF. Requires F to be a ufl.variable."""
+        P = self.first_pk_stress(F)
+        return ufl.diff(P, F)
 
 
 class NeoHookean(MaterialModel):

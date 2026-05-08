@@ -42,23 +42,26 @@ os.makedirs(output_dir, exist_ok=True)
 vtx = VTXManager(comm, f"{output_dir}/solution.bp",
                  [solver.u_int, solver.F_func, solver.P_func, solver.J_func, solver.W_func, solver.u_total])
 
-res = solver(np.array([[1.0, 0.03, 0.05], [-0.1, 0.95, 0.0], [0.0, 0.0, 0.75]]),
+res = solver(np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.75]]),
     output_manager=vtx,
     pert_amplitude_init=1e1,
-    return_quantities=["F", "P", "W"],
+    return_quantities=["F", "P", "W", "A"],
 )
 vtx.close()
 
 Fbar_conv = []
 Pbar_conv = []
 Wbar_conv = []
+Abar_conv = []
 for q in res:
     Fbar_conv.append(q[0])
     Pbar_conv.append(q[1])
     Wbar_conv.append(q[2])
+    Abar_conv.append(q[3])
 Fbar_conv = np.array(Fbar_conv)
 Pbar_conv = np.array(Pbar_conv)
 Wbar_conv = np.array(Wbar_conv)
+Abar_conv = np.array(Abar_conv)
 
 if comm.rank == 0 and Fbar_conv.size and Pbar_conv.size:
     fig, ax = plt.subplots()
@@ -80,4 +83,15 @@ if comm.rank == 0 and Fbar_conv.size and Wbar_conv.size:
     ax.grid(True)
     fig.tight_layout()
     fig.savefig(f"{output_dir}/Wzz_over_Fzz.pdf", dpi=300)
+    plt.close(fig)
+
+if comm.rank == 0 and Fbar_conv.size and Abar_conv.size:
+    fig, ax = plt.subplots()
+    ax.plot(Fbar_conv[:, 2, 2], Abar_conv[:, 2, 2, 2, 2], marker="o")
+    ax.set_xlabel("Fzz")
+    ax.set_ylabel("Azzzz")
+    ax.set_title("Azzzz over Fzz")
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig(f"{output_dir}/Azzzz_over_Fzz.pdf", dpi=300)
     plt.close(fig)

@@ -1,7 +1,7 @@
 from .material import MaterialModel, NeoHookean, LambdaMaterial
 from .boundary import ReactionProbe
 from .forms import build_weak_forms
-from .solvers import NewtonSolver, ArcLengthSolver, CylindricalArcLength
+from .solvers import NewtonSolver, NewtonSolverFE2, ArcLengthSolver, CylindricalArcLength
 from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 from .output import VTXManager, ReactionForceLogger
@@ -12,7 +12,7 @@ __all__ = [
     "MaterialModel", "NeoHookean", "LambdaMaterial",
     "ReactionProbe",
     "build_weak_forms",
-    "NewtonSolver", "ArcLengthSolver", "CylindricalArcLength",
+    "NewtonSolver", "NewtonSolverFE2", "ArcLengthSolver", "CylindricalArcLength",
     "StabilityAnalyzer",
     "TimeStepper",
     "VTXManager", "ReactionForceLogger",

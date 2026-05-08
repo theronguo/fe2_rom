@@ -170,6 +170,55 @@ class NewtonSolver:
         K.assemble()
         return K
 
+class NewtonSolverFE2(NewtonSolver):
+    """Newton solver variant for FE2 homogenization with adjoint solves."""
+
+    def __init__(self, comm, R_form, J_form, Jij_forms, u, du, bcs, mpc=None, **kwargs):
+        super().__init__(comm, R_form, J_form, u, du, bcs, mpc=mpc, **kwargs)
+        self._Jij_forms = Jij_forms
+
+    def solve_adjoint(self):
+        """Solve K * p_ij = rhs_ij for all ij and return adjoint fields p_ij."""
+        if self.mpc is not None:
+            K = dolfinx_mpc.assemble_matrix(self._J_form, self.mpc, bcs=self._bcs)
+        else:
+            K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
+        K.assemble()
+
+        ksp = PETSc.KSP().create(self._comm)
+        ksp.setOperators(K)
+        ksp.setType(self._solver_type)
+        ksp.getPC().setType(PETSc.PC.Type.GAMG)
+
+        adjoints = []
+        for i in range(len(self._Jij_forms)):
+            adjoint = []
+            for j in range(len(self._Jij_forms)):
+                rhs_form = self._Jij_forms[i][j]
+                if self.mpc is not None:
+                    rhs = dolfinx_mpc.assemble_vector(rhs_form, self.mpc)
+                    dolfinx_mpc.apply_lifting(rhs, [self._J_form], [self._bcs], self.mpc)
+                else:
+                    rhs = fem_petsc.assemble_vector(rhs_form)
+                    fem.apply_lifting(rhs, [self._J_form], [self._bcs])
+                rhs.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+                fem.set_bc(rhs, self._bcs)
+
+                ksp.solve(rhs, self._du.x.petsc_vec)
+                self._du.x.petsc_vec.ghostUpdate(
+                    addv=PETSc.InsertMode.INSERT,  # type: ignore
+                    mode=PETSc.ScatterMode.FORWARD,  # type: ignore
+                )
+                if self.mpc is not None:
+                    self.mpc.backsubstitution(self._du.x.petsc_vec)
+
+                adjoint.append(self._du.copy())
+                PETSc.Vec.destroy(rhs)
+            adjoints.append(adjoint)
+
+        ksp.destroy()
+        PETSc.Mat.destroy(K)
+        return adjoints
 
 # ---------------------------------------------------------------------------
 # Arc-length solvers

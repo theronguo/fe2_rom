@@ -46,31 +46,38 @@ vtx = VTXManager(comm, f"{output_dir}/solution.bp",
 res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]),
     pert_amplitude_init=1e-1,
     output_manager=vtx,
-    return_quantities=["F", "P"],
+    return_quantities=["F", "P", "A"],
 )
-res = solver(np.array([[0.8, 0.0], [0.0, 0.8]]),
-    pert_amplitude_init=1e-1,
-    output_manager=vtx, plot_time_start=1.0,
-    return_quantities=["F", "P"],
-)
-vtx.close()
 
 Fbar_conv = []
 Pbar_conv = []
+Abar_conv = []
 for q in res:
     Fbar_conv.append(q[0])
     Pbar_conv.append(q[1])
+    Abar_conv.append(q[2])
 Fbar_conv = np.array(Fbar_conv)
 Pbar_conv = np.array(Pbar_conv)
+Abar_conv = np.array(Abar_conv)
 
 if comm.rank == 0 and Fbar_conv.size and Pbar_conv.size:
     fig, ax = plt.subplots()
-    ax.plot(Fbar_conv[:, 1, 1], Pbar_conv[:, 1, 1], marker="o")
-    ax.set_xlabel("Fyy")
-    ax.set_ylabel("Pyy")
-    ax.set_title("Pyy over Fyy")
+    ax.plot(Fbar_conv[:, 0, 0], Pbar_conv[:, 0, 0], marker="o")
+    ax.set_xlabel("Fxx")
+    ax.set_ylabel("Pxx")
+    ax.set_title("Pxx over Fxx")
     ax.grid(True)
     fig.tight_layout()
-    fig.savefig(f"{output_dir}/Pyy_over_Fyy.pdf", dpi=300)
+    fig.savefig(f"{output_dir}/Pxx_over_Fxx.pdf", dpi=300)
     plt.close(fig)
 
+if comm.rank == 0 and Fbar_conv.size and Abar_conv.size:
+    fig, ax = plt.subplots()
+    ax.plot(Fbar_conv[:, 0, 0], Abar_conv[:, 0, 0, 0, 0], marker="o")
+    ax.set_xlabel("Fxx")
+    ax.set_ylabel("Axxxx")
+    ax.set_title("Axxxx over Fxx")
+    ax.grid(True)
+    fig.tight_layout()
+    fig.savefig(f"{output_dir}/Axxxx_over_Fxx.pdf", dpi=300)
+    plt.close(fig)

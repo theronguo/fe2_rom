@@ -12,7 +12,7 @@ from .boundary import ReactionProbe
 from .forms import build_homogenization_weak_form, build_weak_forms
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
-from .solvers import CylindricalArcLength, NewtonSolver
+from .solvers import CylindricalArcLength, NewtonSolver, NewtonSolverFE2
 from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 
@@ -421,7 +421,7 @@ class PeriodicHyperelasticHomogenizationSolver:
         self._bc_specs: list = []
         self._bcs: list = []
         self._reaction_probes: list[ReactionProbe] = []
-        self._newton: NewtonSolver | None = None
+        self._newton: NewtonSolverFE2 | None = None
         self._stability: StabilityAnalyzer | None = None
         self._F_var = None
         self._P_ufl = None
@@ -536,15 +536,17 @@ class PeriodicHyperelasticHomogenizationSolver:
         V = self.V
         dx = ufl.Measure("dx", domain=mesh, subdomain_data=self._cell_tags)
 
-        R_form, J_form, F_var, P_ufl, J_ufl, W_ufl, u_total = build_homogenization_weak_form(
+        R_form, J_form, Jij_forms, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total = build_homogenization_weak_form(
             mesh, V, self.u, self.F_bar, self._material, dx=dx
         )
         self._R_form = R_form
         self._J_form = J_form
+        self._Jij_forms = Jij_forms
         self._F_var = F_var
         self._P_ufl = P_ufl
         self._J_ufl = J_ufl
         self._W_ufl = W_ufl
+        self._A_ufl = A_ufl
         self._u_total = u_total
 
         bcs, mpc = self._setup_periodic_bcs_and_mpc()
@@ -567,8 +569,8 @@ class PeriodicHyperelasticHomogenizationSolver:
                 if newton_options["switch_to_minres"] is False:
                     logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
             newton_options["switch_to_minres"] = True
-        self._newton = NewtonSolver(
-            self.comm, R_form, J_form, self.u, self._du, bcs, self.mpc,
+        self._newton = NewtonSolverFE2(
+            self.comm, R_form, J_form, Jij_forms, self.u, self._du, bcs, self.mpc,
             **newton_options,
         )
 
@@ -615,14 +617,43 @@ class PeriodicHyperelasticHomogenizationSolver:
         if vol_global <= 0.0:
             raise RuntimeError("Domain volume is non-positive; cannot average stress.")
 
-        P_avg = np.zeros((dim, dim), dtype=float)
+        P_eff = np.zeros((dim, dim), dtype=float)
         for i in range(dim):
             for j in range(dim):
                 P_ij_local = fem.assemble_scalar(fem.form(self._P_ufl[i, j] * dx))
                 P_ij_global = self.comm.allreduce(P_ij_local, op=MPI.SUM)
-                P_avg[i, j] = P_ij_global / vol_global
+                P_eff[i, j] = P_ij_global / vol_global
 
-        return P_avg
+        return P_eff
+
+    def compute_effective_tangent_moduli(self) -> np.ndarray:
+        """Compute effective tangent moduli tensor from the current converged state with adjoints."""
+        dim = self._mesh.geometry.dim
+        dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
+        vol_local = fem.assemble_scalar(fem.form(1.0 * dx))
+        vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
+
+        adjoints = self._newton.solve_adjoint()
+        A_eff = np.zeros((dim, dim, dim, dim), dtype=float)
+        for i in range(dim):
+            for j in range(dim):
+                for k in range(dim):
+                    for l in range(dim):
+                        A_ij_local = fem.assemble_scalar(fem.form(self._A_ufl[i, j, k, l] * dx))
+                        A_ij_global = self.comm.allreduce(A_ij_local, op=MPI.SUM)
+                        A_eff[i, j, k, l] = A_ij_global / vol_global
+
+        for i in range(dim):
+            for j in range(dim):
+                for k in range(dim):
+                    for l in range(dim):
+                        A_adj_local = fem.assemble_scalar(
+                            fem.form(ufl.inner(self._A_ufl[i, j, :, :], ufl.grad(adjoints[k][l])) * dx)
+                            )
+                        A_adj_global = self.comm.allreduce(A_adj_local, op=MPI.SUM)
+                        A_eff[i, j, k, l] += A_adj_global / vol_global
+
+        return A_eff
 
     def __call__(self, Fbar: np.array,
             output_manager: VTXManager | None = None,
@@ -663,6 +694,9 @@ class PeriodicHyperelasticHomogenizationSolver:
             elif quantity == "P":
                 Peff = self.compute_average_first_pk_stress()
                 quantities.append(Peff.copy())
+            elif quantity == "A":
+                Aeff = self.compute_effective_tangent_moduli()
+                quantities.append(Aeff.copy())
         output_quantities.append(quantities)
 
         simulation_finished = False
@@ -714,6 +748,9 @@ class PeriodicHyperelasticHomogenizationSolver:
                             elif quantity == "P":
                                 Peff = self.compute_average_first_pk_stress()
                                 quantities.append(Peff.copy())
+                            elif quantity == "A":
+                                Aeff = self.compute_effective_tangent_moduli()
+                                quantities.append(Aeff.copy())
                         output_quantities.append(quantities)
 
                         if output_manager is not None:
