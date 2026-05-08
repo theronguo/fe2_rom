@@ -1,8 +1,9 @@
+import os
 import logging
 from typing import Callable
 
 import numpy as np
-from dolfinx import fem, mesh as dmesh
+from dolfinx import fem, io, mesh as dmesh
 from petsc4py import PETSc
 from mpi4py import MPI
 import ufl
@@ -384,62 +385,141 @@ class PeriodicHyperelasticHomogenizationSolver:
         u_int, F_func, P_func, J_func
     """
 
-    def __init__(self, mesh, cell_tags, facet_tags, material: MaterialModel, *,
-                 degree: int = 1, enable_viz_fields: bool = True):
-        self.comm = mesh.comm
-        self._mesh = mesh
-        self._cell_tags = cell_tags
-        self._facet_tags = facet_tags
+    def __init__(self, mesh_path, comm, gdim, 
+                 material: MaterialModel, *,
+                 degree: int = 1, 
+                 output_dir: str = "output",
+                 check_stability: bool = True,
+                 visualize_fields: list[str] | None = None,
+                 average_fields: list[str] | None = None,
+                 stability_options: dict | None = None,
+                 newton_options: dict | None = None,
+                 timestepper_options: dict | None = None) -> None:
+        
+        ### Default Newton, Timestepper, Visualization, Averaging options ###
+        newton_options = newton_options if newton_options is not None else {
+            "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 10, "max_iter_instab": 30, "switch_to_minres": False
+        }
+        timestepper_options = timestepper_options if timestepper_options is not None else {
+            "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5, "dt_max": 1.0, "good_newton_steps": 7
+        }
+        stability_options = stability_options if stability_options is not None else {
+            "nev": 5, "neg_tol": -1e-12
+        }
+        if visualize_fields is None:
+            visualize_fields = ["u_fluc"]
+        if average_fields is None:
+            average_fields = ["P"]
+
+        ### Read mesh ###
+        self.comm = comm
+        self._mesh, self._cell_tags, self._facet_tags = io.gmshio.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
+        self._mesh.topology.create_connectivity(self._mesh.topology.dim - 1, self._mesh.topology.dim)
+        self.dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
+        self.gdim = gdim
+        
+        ### Material model ###
         self._material = material
+        
+        ### Function space and fields ###
         self._degree = degree
-        self._enable_viz_fields = enable_viz_fields
-
-        mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
-        space_dims = mesh.geometry.dim
-
-        self.V = fem.functionspace(mesh, ("Lagrange", degree, (space_dims,)))
+        self.V = fem.functionspace(self._mesh, ("Lagrange", degree, (self.gdim,)))
+        n_dofs = self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs
+        
         self.u = fem.Function(self.V)
         self._u_last = fem.Function(self.V)
         self._du = fem.Function(self.V)
         self._eigenfunction = fem.Function(self.V)
-        self.F_bar = fem.Constant(mesh, np.eye(space_dims, dtype=PETSc.ScalarType))
+        self.F_bar = fem.Constant(self._mesh, np.eye(self.gdim, dtype=PETSc.ScalarType))
+        logger.info("Functions set up with %d global DOFs", n_dofs)
 
-        if enable_viz_fields:
-            V1 = fem.functionspace(mesh, ("DG", 1, (space_dims,)))
-            TT = fem.functionspace(mesh, ("DG", 1, (space_dims, space_dims)))
-            SS = fem.functionspace(mesh, ("DG", 1))
-            self.u_int = fem.Function(V1, name="u")
-            self.u_total = fem.Function(V1, name="u_total")
-            self.F_func = fem.Function(TT, name="DeformationGradient")
-            self.P_func = fem.Function(TT, name="Stress1PK")
-            self.J_func = fem.Function(SS, name="JacobianDet")
-            self.W_func = fem.Function(SS, name="StrainEnergyDensity")
+        ### Periodic BCs ###
+        bcs, mpc = self._setup_periodic_bcs_and_mpc()
+        self.mpc = mpc
+        self._bcs = bcs
+        logger.info("Periodic BCs set up with %d slave points", self.comm.allreduce(len(mpc.slaves), op=MPI.SUM))
+        
+        ### Stability analyzer (optional) ###
+        if check_stability:
+            self._stability = StabilityAnalyzer(self.comm, **stability_options)
+            logger.info("Stability checks enabled with options: %s", stability_options)
+            if "switch_to_minres" in newton_options:
+                if newton_options["switch_to_minres"] is False:
+                    logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
+            newton_options["switch_to_minres"] = True
 
-        n_dofs = self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs
-        logger.info("Global DOFs: %d", n_dofs)
+        ### Newton solver ###
+        R_form, J_form, Jij_forms, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total = build_homogenization_weak_form(
+            self._mesh, self.V, self.u, self.F_bar, self._material, dx=self.dx
+        )
+        self._newton = NewtonSolverFE2(
+            self.comm, R_form, J_form, Jij_forms, self.u, self._du, bcs, self.mpc,
+            **newton_options,
+        )
+        logger.info("Newton solver initialized with options: %s", newton_options)
 
-        self._bc_specs: list = []
-        self._bcs: list = []
-        self._reaction_probes: list[ReactionProbe] = []
-        self._newton: NewtonSolverFE2 | None = None
-        self._stability: StabilityAnalyzer | None = None
-        self._F_var = None
-        self._P_ufl = None
-        self._W_ufl = None
+        ### Time stepper ###
+        self._timestepper = TimeStepper(**timestepper_options)
+        logger.info("Time stepper initialized with options: %s", timestepper_options)
+        
+        ### Visualization setup ###
+        fields = []
+        for field in visualize_fields:
+            TT = fem.functionspace(self._mesh, ("DG", 1, (self.gdim, self.gdim)))
+            V1 = fem.functionspace(self._mesh, ("DG", 1, (self.gdim,)))
+            SS = fem.functionspace(self._mesh, ("DG", 1))
+            if field == "u_fluc":
+                self.u_int = fem.Function(V1, name="u_fluc")
+                fields.append(self.u_int)
+            elif field == "u_total":
+                self.u_total = fem.Function(V1, name="u_total")
+                self._u_total_expr = fem.Expression(u_total, V1.element.interpolation_points())
+                fields.append(self.u_total)
+            elif field == "F":
+                self.F_func = fem.Function(TT, name="F")
+                self._F_expr = fem.Expression(F_var, TT.element.interpolation_points())
+                fields.append(self.F_func)
+            elif field == "P":
+                self.P_func = fem.Function(TT, name="P")
+                self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points())
+                fields.append(self.P_func)
+            elif field == "J":
+                self.J_func = fem.Function(SS, name="J")
+                self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points())
+                fields.append(self.J_func)
+            elif field == "W":
+                self.W_func = fem.Function(SS, name="W")
+                self._W_expr = fem.Expression(W_ufl, SS.element.interpolation_points())
+                fields.append(self.W_func)
+        if fields:
+            self.vtx = VTXManager(self.comm, f"{output_dir}/solution.bp", fields)
+        else:
+            self.vtx = None
+        logger.info("Visualization fields: %s", visualize_fields)
+
+        # Averaging setup
+        self.average_fields = average_fields
+        if "P" in average_fields:
+            self._P_ufl = P_ufl
+        if "W" in average_fields:
+            self._W_ufl = W_ufl
+        if "A" in average_fields:
+            self._A_ufl = A_ufl
+        logger.info("Averaging fields: %s", average_fields)
+        logger.info("Setup complete")
 
     def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Return global min/max coordinates along each geometric axis."""
         coords = self._mesh.geometry.x
-        dim = self._mesh.geometry.dim
-        mins_local = np.min(coords[:, :dim], axis=0)
-        maxs_local = np.max(coords[:, :dim], axis=0)
+        mins_local = np.min(coords[:, :self.gdim], axis=0)
+        maxs_local = np.max(coords[:, :self.gdim], axis=0)
 
         mins = np.array(
-            [self.comm.allreduce(float(mins_local[i]), op=MPI.MIN) for i in range(dim)],
+            [self.comm.allreduce(float(mins_local[i]), op=MPI.MIN) for i in range(self.gdim)],
             dtype=float,
         )
         maxs = np.array(
-            [self.comm.allreduce(float(maxs_local[i]), op=MPI.MAX) for i in range(dim)],
+            [self.comm.allreduce(float(maxs_local[i]), op=MPI.MAX) for i in range(self.gdim)],
             dtype=float,
         )
         return mins, maxs
@@ -489,10 +569,9 @@ class PeriodicHyperelasticHomogenizationSolver:
         """Build periodic corner constraints and MPC ties for rectangular/cuboid domains."""
         mesh = self._mesh
         V = self.V
-        dim = mesh.geometry.dim
-        if dim not in (2, 3):
+        if self.gdim not in (2, 3):
             raise ValueError(
-                f"Periodic homogenization supports only 2D rectangle or 3D cuboid, got dim={dim}."
+                f"Periodic homogenization supports only 2D rectangle or 3D cuboid, got dim={self.gdim}."
             )
 
         mins, maxs = self._compute_domain_bounds()
@@ -500,14 +579,14 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         # Fix all corner DOFs to remove rigid modes and avoid over-constraining periodic ties.
         corner = self._locate_corner_dofs(V, mins, maxs, tol)
-        u_zero = fem.Constant(mesh, np.zeros(mesh.geometry.dim, dtype=PETSc.ScalarType))
+        u_zero = fem.Constant(mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
         bcs = [fem.dirichletbc(u_zero, corner, V)]
 
         mpc = dolfinx_mpc.MultiPointConstraint(V)
         # Build one non-overlapping periodic slave set per axis:
         # axis 0 uses all x_min points, axis 1 excludes x-boundaries,
         # axis 2 (3D only) excludes x/y-boundaries.
-        for axis in range(dim):
+        for axis in range(self.gdim):
             selector = self._make_periodic_slave_selector(
                 axis=axis,
                 mins=mins,
@@ -521,106 +600,39 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         return bcs, mpc
 
-    def setup(self, check_stability: bool = True,
-              newton_options: dict | None = None,
-              timestepper_options: dict | None = None) -> None:
-        """Freeze BCs, compile UFL forms, and instantiate sub-solvers.
-
-        Must be called once after all add_bc() calls and before run().
-        Collective: calls fem.form() on all MPI ranks.
-        """
-        newton_options = newton_options if newton_options is not None else {}
-        timestepper_options = timestepper_options if timestepper_options is not None else {"t_end": 1.0, "dt_init": 1.0}
-
-        mesh = self._mesh
-        V = self.V
-        dx = ufl.Measure("dx", domain=mesh, subdomain_data=self._cell_tags)
-
-        R_form, J_form, Jij_forms, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total = build_homogenization_weak_form(
-            mesh, V, self.u, self.F_bar, self._material, dx=dx
-        )
-        self._R_form = R_form
-        self._J_form = J_form
-        self._Jij_forms = Jij_forms
-        self._F_var = F_var
-        self._P_ufl = P_ufl
-        self._J_ufl = J_ufl
-        self._W_ufl = W_ufl
-        self._A_ufl = A_ufl
-        self._u_total = u_total
-
-        bcs, mpc = self._setup_periodic_bcs_and_mpc()
-        self.mpc = mpc
-        self._bcs = bcs
-        
-        if self._enable_viz_fields:
-            TT = self.F_func.function_space
-            SS = self.J_func.function_space
-            V1 = self.u_int.function_space
-            self._F_expr = fem.Expression(F_var, TT.element.interpolation_points())
-            self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points())
-            self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points())
-            self._W_expr = fem.Expression(W_ufl, SS.element.interpolation_points())
-            self._u_total_expr = fem.Expression(u_total, V1.element.interpolation_points())
-
-        if check_stability:
-            self._stability = StabilityAnalyzer(self.comm)
-            if "switch_to_minres" in newton_options:
-                if newton_options["switch_to_minres"] is False:
-                    logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
-            newton_options["switch_to_minres"] = True
-        self._newton = NewtonSolverFE2(
-            self.comm, R_form, J_form, Jij_forms, self.u, self._du, bcs, self.mpc,
-            **newton_options,
-        )
-
-        self._timestepper = TimeStepper(**timestepper_options)  # Single step
-
-        logger.info("Setup complete")
-
-    def _write_fields(self, output_manager: VTXManager | None, t: float) -> None:
-        if self._enable_viz_fields:
+    def _write_fields(self, t: float) -> None:
+        if self.vtx is not None:
             self.u_int.interpolate(self.u)
             self.u_total.interpolate(self._u_total_expr)
             self.F_func.interpolate(self._F_expr)
             self.P_func.interpolate(self._P_expr)
             self.J_func.interpolate(self._J_expr)
             self.W_func.interpolate(self._W_expr)
-        if output_manager is not None:
-            output_manager.write(t)
+            self.vtx.write(t)
+        else:
+            logger.warning("No fields to write at t=%.5f (vtx is None)", t)
 
     def compute_effective_strain_energy_density(self) -> float:
         """Compute domain-average effective strain energy density from the current converged state."""
-        assert self._W_ufl is not None
 
-        dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
-        W_local = fem.assemble_scalar(fem.form(self._W_ufl * dx))
+        W_local = fem.assemble_scalar(fem.form(self._W_ufl * self.dx))
         W_global = self.comm.allreduce(W_local, op=MPI.SUM)
 
-        vol_local = fem.assemble_scalar(fem.form(1.0 * dx))
+        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
         vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
-
-        if vol_global <= 0.0:
-            raise RuntimeError("Domain volume is non-positive; cannot average strain energy density.")
 
         return W_global / vol_global
 
     def compute_average_first_pk_stress(self) -> np.ndarray:
         """Compute domain-average first Piola-Kirchhoff stress tensor from the current converged state."""
-        assert self._P_ufl is not None
 
-        dim = self._mesh.geometry.dim
-        dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
-        vol_local = fem.assemble_scalar(fem.form(1.0 * dx))
+        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
         vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
 
-        if vol_global <= 0.0:
-            raise RuntimeError("Domain volume is non-positive; cannot average stress.")
-
-        P_eff = np.zeros((dim, dim), dtype=float)
-        for i in range(dim):
-            for j in range(dim):
-                P_ij_local = fem.assemble_scalar(fem.form(self._P_ufl[i, j] * dx))
+        P_eff = np.zeros((self.gdim, self.gdim), dtype=float)
+        for i in range(self.gdim):
+            for j in range(self.gdim):
+                P_ij_local = fem.assemble_scalar(fem.form(self._P_ufl[i, j] * self.dx))
                 P_ij_global = self.comm.allreduce(P_ij_local, op=MPI.SUM)
                 P_eff[i, j] = P_ij_global / vol_global
 
@@ -628,37 +640,29 @@ class PeriodicHyperelasticHomogenizationSolver:
 
     def compute_effective_tangent_moduli(self) -> np.ndarray:
         """Compute effective tangent moduli tensor from the current converged state with adjoints."""
-        dim = self._mesh.geometry.dim
-        dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
-        vol_local = fem.assemble_scalar(fem.form(1.0 * dx))
+        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
         vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
 
         adjoints = self._newton.solve_adjoint()
-        A_eff = np.zeros((dim, dim, dim, dim), dtype=float)
-        for i in range(dim):
-            for j in range(dim):
-                for k in range(dim):
-                    for l in range(dim):
-                        A_ij_local = fem.assemble_scalar(fem.form(self._A_ufl[i, j, k, l] * dx))
-                        A_ij_global = self.comm.allreduce(A_ij_local, op=MPI.SUM)
-                        A_eff[i, j, k, l] = A_ij_global / vol_global
-
-        for i in range(dim):
-            for j in range(dim):
-                for k in range(dim):
-                    for l in range(dim):
-                        A_adj_local = fem.assemble_scalar(
-                            fem.form(ufl.inner(self._A_ufl[i, j, :, :], ufl.grad(adjoints[k][l])) * dx)
+        A_eff = np.zeros((self.gdim, self.gdim, self.gdim, self.gdim), dtype=float)
+        for i in range(self.gdim):
+            for j in range(self.gdim):
+                for k in range(self.gdim):
+                    for l in range(self.gdim):
+                        A_avg_local = fem.assemble_scalar(fem.form(self._A_ufl[i, j, k, l] * self.dx))
+                        A_fluc_local = fem.assemble_scalar(
+                            fem.form(ufl.inner(self._A_ufl[i, j, :, :], ufl.grad(adjoints[k][l])) * self.dx)
                             )
-                        A_adj_global = self.comm.allreduce(A_adj_local, op=MPI.SUM)
-                        A_eff[i, j, k, l] += A_adj_global / vol_global
+                        
+                        A_avg_global = self.comm.allreduce(A_avg_local, op=MPI.SUM)
+                        A_fluc_global = self.comm.allreduce(A_fluc_local, op=MPI.SUM)
+                        
+                        A_eff[i, j, k, l] = (A_avg_global + A_fluc_global) / vol_global
 
         return A_eff
 
     def __call__(self, Fbar: np.array,
-            output_manager: VTXManager | None = None,
             pert_amplitude_init: float = 1e1,
-            return_quantities: list[str] = ["P"],
             plot_time_start: float = 0.0
             ) -> list:
         """Main time-stepping loop.
@@ -679,13 +683,13 @@ class PeriodicHyperelasticHomogenizationSolver:
                     self.F_bar.value[i, j] = t * (Fbar[i, j] - Fbar_prev[i, j])  + Fbar_prev[i, j]  # Linear ramp from 0 to Fbar
 
         u = self.u
-        if output_manager is not None:
-            self._write_fields(output_manager, 0.0+plot_time_start)
+        if self.vtx is not None:
+            self._write_fields(0.0+plot_time_start)
 
-        output_quantities = []
         # first step
+        output_quantities = []
         quantities = []
-        for quantity in return_quantities:
+        for quantity in self.average_fields:
             if quantity == "F":
                 quantities.append(self.F_bar.value.copy())
             elif quantity == "W":
@@ -739,7 +743,7 @@ class PeriodicHyperelasticHomogenizationSolver:
                         self._u_last.x.scatter_forward()
 
                         quantities = []
-                        for quantity in return_quantities:
+                        for quantity in self.average_fields:
                             if quantity == "F":
                                 quantities.append(self.F_bar.value.copy())
                             elif quantity == "W":
@@ -753,8 +757,8 @@ class PeriodicHyperelasticHomogenizationSolver:
                                 quantities.append(Aeff.copy())
                         output_quantities.append(quantities)
 
-                        if output_manager is not None:
-                            self._write_fields(output_manager, self._timestepper.t_current+plot_time_start)
+                        if self.vtx is not None:
+                            self._write_fields(self._timestepper.t_current+plot_time_start)
 
                 else:
                     ok = self._timestepper.reject()

@@ -47,6 +47,7 @@ class NewtonSolver:
             self._du = fem.Function(mpc.function_space, name="du")  # shadow du with MPC-aware version
 
         self._solver_type = PETSc.KSP.Type.CG
+        self._pc_type = PETSc.PC.Type.GAMG
         self.effective_max_iter = max_iter
         self._abs_b_norm_init = 1.0
 
@@ -113,7 +114,7 @@ class NewtonSolver:
             ksp = PETSc.KSP().create(self._comm)
             ksp.setOperators(K)
             ksp.setType(self._solver_type)
-            ksp.getPC().setType(PETSc.PC.Type.GAMG)
+            ksp.getPC().setType(self._pc_type)
             ksp.solve(-residual, self._du.x.petsc_vec)
 
             logger.debug("du norm: %.3e", self._du.x.petsc_vec.norm())
