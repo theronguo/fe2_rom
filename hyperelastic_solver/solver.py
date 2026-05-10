@@ -394,7 +394,9 @@ class PeriodicHyperelasticHomogenizationSolver:
                  average_fields: list[str] | None = None,
                  stability_options: dict | None = None,
                  newton_options: dict | None = None,
-                 timestepper_options: dict | None = None) -> None:
+                 timestepper_options: dict | None = None,
+                 save_snapshots: list[str] | None = None,
+                 ) -> None:
         
         ### Default Newton, Timestepper, Visualization, Averaging options ###
         newton_options = newton_options if newton_options is not None else {
@@ -410,6 +412,8 @@ class PeriodicHyperelasticHomogenizationSolver:
             visualize_fields = ["u_fluc"]
         if average_fields is None:
             average_fields = ["P"]
+        if save_snapshots is None:
+            save_snapshots = []
 
         ### Read mesh ###
         self.comm = comm
@@ -518,6 +522,10 @@ class PeriodicHyperelasticHomogenizationSolver:
         if "A" in average_fields:
             self._A_ufl = A_ufl
         logger.info("Averaging fields: %s", average_fields)
+
+        # Snapshot saving setup
+        self.output_dir = output_dir
+        self.save_snapshots = save_snapshots
         logger.info("Setup complete")
 
     def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
@@ -767,8 +775,27 @@ class PeriodicHyperelasticHomogenizationSolver:
                                 quantities.append(Aeff.copy())
                         output_quantities.append(quantities)
 
+                        t_save = self._timestepper.t_current+plot_time_start
                         if self.vtx is not None:
-                            self._write_fields(self._timestepper.t_current+plot_time_start)
+                            self._write_fields(t_save)
+                        
+                        for field in self.save_snapshots:
+                            os.makedirs(f"{self.output_dir}/snapshots", exist_ok=True)
+                            if field == "u_fluc":
+                                scatter, u_seq = PETSc.Scatter.toZero(u.x.petsc_vec)
+                                scatter.scatter(u.x.petsc_vec, u_seq, False, PETSc.ScatterMode.FORWARD)
+                                if self.comm.rank == 0:
+                                    np.save(f"{self.output_dir}/snapshots/u_fluc_{t_save:.5f}.npy", u_seq.array.copy())
+                                scatter.destroy()
+                                u_seq.destroy()
+                            elif field == "P":
+                                self.P_func.interpolate(self._P_expr)
+                                scatter, p_seq = PETSc.Scatter.toZero(self.P_func.x.petsc_vec)
+                                scatter.scatter(self.P_func.x.petsc_vec, p_seq, False, PETSc.ScatterMode.FORWARD)
+                                if self.comm.rank == 0:
+                                    np.save(f"{self.output_dir}/snapshots/P_{t_save:.5f}.npy", p_seq.array.copy())
+                                scatter.destroy()
+                                p_seq.destroy()
 
                 else:
                     ok = self._timestepper.reject()

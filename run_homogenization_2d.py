@@ -40,7 +40,8 @@ solver = PeriodicHyperelasticHomogenizationSolver(
                     "F", "P", "J", "W"],
     average_fields=["F", "P", "A"],
     newton_options={"switch_to_minres": True},
-    timestepper_options={"t_end": 1.0, "dt_init": 1.0}
+    timestepper_options={"t_end": 1.0, "dt_init": 1.0},
+    save_snapshots=["u_fluc", "P"]
 )
 
 res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]),
