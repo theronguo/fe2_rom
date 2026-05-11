@@ -1,0 +1,14 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%files
+    environment.yml /tmp/environment.yml
+
+%post
+    mamba env create -f /tmp/environment.yml
+    mamba clean --all --yes
+
+%environment
+    export PATH=/opt/conda/envs/fenicsx-new/bin:$PATH
+    export CONDA_DEFAULT_ENV=fenicsx-new
+    export CONDA_PREFIX=/opt/conda/envs/fenicsx-new
