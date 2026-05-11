@@ -3,6 +3,10 @@
 *.msh
 *.vtk
 *.pyc
+*.bp
+*.h5
+*.xdmf
+*.npy
 
 .vscode/
 .claude/
