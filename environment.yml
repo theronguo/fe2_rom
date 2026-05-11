@@ -8,9 +8,10 @@ dependencies:
   - pyvista=0.48.0
   - pip=25.1
   - dolfinx_mpc=0.9.3
+  - gmsh==4.13.1
+  - python-gmsh
 
   - pip:
-    - gmsh==4.13.1
     - scipy==1.17.1
     - tqdm==4.67.3
     - meshio==5.3.5

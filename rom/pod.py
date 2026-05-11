@@ -337,11 +337,11 @@ class ECM:
         basis_u_sub = np.stack([
             _parent_to_sub_array(self.basis_u[:, i], self.V, V_sub, cell_map)
             for i in range(self.N)
-        ])
+        ]).T
         basis_P_sub = np.stack([
             _parent_to_sub_array(self.basis_P[:, j], self.S, S_sub, cell_map)
             for j in range(self.M)
-        ])
+        ]).T
 
         omega = self._make_omega()
         omega_sub = _parent_to_sub_array(omega.x.array, self._Q0, Q0_sub, cell_map)
@@ -350,6 +350,8 @@ class ECM:
         np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
         np.save(os.path.join(output_dir, "basis_P_sub.npy"), basis_P_sub)
         np.save(os.path.join(output_dir, "omega_sub.npy"),   omega_sub)
+        np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
+        np.save(os.path.join(output_dir, "basis_P.npy"), self.basis_P)
 
     # ── integration test variants ─────────────────────────────────────────────
 
@@ -549,9 +551,11 @@ if __name__ == "__main__":
     pod_P.visualize_modes(M, "pod_mode_P.xdmf", S, S0)
 
     ecm = ECM(pod_u.basis[:, :N], pod_P.basis[:, :M], V, S)
-    ecm.compute_magic(tol=1e-6)
+    ecm.compute_magic(tol=1e-4)
     ecm.show_active_cells("active.xdmf")
 
-    ecm.test_variant1(10000)
-    ecm.test_variant2(10000)
-    ecm.test_variant3(10000)
+    # ecm.test_variant1(10000)
+    # ecm.test_variant2(10000)
+    # ecm.test_variant3(10000)
+
+    ecm.save_variant2("ecm_variant2_data")
