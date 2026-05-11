@@ -348,7 +348,6 @@ class ECM:
 
         np.save(os.path.join(output_dir, "indices.npy"),     indices)
         np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
-        np.save(os.path.join(output_dir, "basis_P_sub.npy"), basis_P_sub)
         np.save(os.path.join(output_dir, "omega_sub.npy"),   omega_sub)
         np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
         np.save(os.path.join(output_dir, "basis_P.npy"), self.basis_P)
@@ -542,17 +541,17 @@ if __name__ == "__main__":
 
     snapshots_u = POD.load_snapshots("output/snapshots/u_fluc_*.npy")
     pod_u = POD(snapshots_u, V, inner_product="H1")
-    pod_u.plot_eigenvalues()
-    pod_u.visualize_modes(N, "pod_mode_u.xdmf", V)
+    # pod_u.plot_eigenvalues()
+    # pod_u.visualize_modes(N, "pod_mode_u.xdmf", V)
 
     snapshots_P = POD.load_snapshots("output/snapshots/P_*.npy")
     pod_P = POD(snapshots_P, S, inner_product="L2")
-    pod_P.plot_eigenvalues()
-    pod_P.visualize_modes(M, "pod_mode_P.xdmf", S, S0)
+    # pod_P.plot_eigenvalues()
+    # pod_P.visualize_modes(M, "pod_mode_P.xdmf", S, S0)
 
     ecm = ECM(pod_u.basis[:, :N], pod_P.basis[:, :M], V, S)
     ecm.compute_magic(tol=1e-4)
-    ecm.show_active_cells("active.xdmf")
+    # ecm.show_active_cells("active.xdmf")
 
     # ecm.test_variant1(10000)
     # ecm.test_variant2(10000)

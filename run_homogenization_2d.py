@@ -72,11 +72,14 @@ if comm.rank == 0 and Fbar_conv.size and Pbar_conv.size:
 
 if comm.rank == 0 and Fbar_conv.size and Abar_conv.size:
     fig, ax = plt.subplots()
-    ax.plot(Fbar_conv[:, 0, 0], Abar_conv[:, 0, 0, 0, 0], marker="o")
+    ax.plot(Fbar_conv[:, 0, 0], Abar_conv[:, 0, 0, 0, 0], marker="o", label="Axxxx")
+    ax.plot(Fbar_conv[:, 0, 0], Abar_conv[:, 0, 0, 1, 1], marker="o", label="Ayyyy")
+    ax.plot(Fbar_conv[:, 0, 0], Abar_conv[:, 0, 0, 0, 1], marker="o", label="Axxxy")
     ax.set_xlabel("Fxx")
     ax.set_ylabel("Axxxx")
     ax.set_title("Axxxx over Fxx")
     ax.grid(True)
+    plt.legend()
     fig.tight_layout()
     fig.savefig(f"{output_dir}/Axxxx_over_Fxx.pdf", dpi=300)
     plt.close(fig)
