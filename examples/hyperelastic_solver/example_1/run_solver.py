@@ -25,7 +25,7 @@ from fe2_rom.hyperelastic_solver import (
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 
-mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("lattice.msh", comm, 0, gdim=3)
+mesh, cell_tags, facet_tags, _, _, _ = io.gmsh.read_from_msh("lattice.msh", comm, 0, gdim=3)
 
 material = NeoHookean(mu=1000.0, lmbda=2000.0)
 solver = HyperelasticStabilitySolver(

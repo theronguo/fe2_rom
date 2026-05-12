@@ -134,9 +134,9 @@ class HyperelasticStabilitySolver:
         if self._enable_viz_fields:
             TT = self.F_func.function_space
             SS = self.J_func.function_space
-            self._F_expr = fem.Expression(F_var, TT.element.interpolation_points())
-            self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points())
-            self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points())
+            self._F_expr = fem.Expression(F_var, TT.element.interpolation_points)
+            self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points)
+            self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points)
 
         if check_stability:
             self._stability = StabilityAnalyzer(self.comm)
@@ -417,7 +417,10 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         ### Read mesh ###
         self.comm = comm
-        self._mesh, self._cell_tags, self._facet_tags = io.gmshio.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
+        mesh_data = io.gmsh.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
+        self._mesh = mesh_data.mesh
+        self._cell_tags = mesh_data.cell_tags
+        self._facet_tags = mesh_data.facet_tags
         self._mesh.topology.create_connectivity(self._mesh.topology.dim - 1, self._mesh.topology.dim)
         self.dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
         self.gdim = gdim
@@ -489,23 +492,23 @@ class PeriodicHyperelasticHomogenizationSolver:
                 fields.append(self.u_int)
             elif field == "u_total":
                 self.u_total = fem.Function(V1, name="u_total")
-                self._u_total_expr = fem.Expression(u_total, V1.element.interpolation_points())
+                self._u_total_expr = fem.Expression(u_total, V1.element.interpolation_points)
                 fields.append(self.u_total)
             elif field == "F":
                 self.F_func = fem.Function(TT, name="F")
-                self._F_expr = fem.Expression(F_var, TT.element.interpolation_points())
+                self._F_expr = fem.Expression(F_var, TT.element.interpolation_points)
                 fields.append(self.F_func)
             elif field == "P":
                 self.P_func = fem.Function(TT, name="P")
-                self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points())
+                self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points)
                 fields.append(self.P_func)
             elif field == "J":
                 self.J_func = fem.Function(SS, name="J")
-                self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points())
+                self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points)
                 fields.append(self.J_func)
             elif field == "W":
                 self.W_func = fem.Function(SS, name="W")
-                self._W_expr = fem.Expression(W_ufl, SS.element.interpolation_points())
+                self._W_expr = fem.Expression(W_ufl, SS.element.interpolation_points)
                 fields.append(self.W_func)
         if fields:
             self.vtx = VTXManager(self.comm, f"{output_dir}/solution.bp", fields)

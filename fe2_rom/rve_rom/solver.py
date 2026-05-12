@@ -68,7 +68,7 @@ class RVESolver:
 
         # --- Mesh & submesh ---
         # (no cell/facet tags in ROM — mesh is only used to build the full-DOF output function)
-        mesh, _, _ = io.gmshio.read_from_msh(mesh_path, comm, 0, gdim=gdim)
+        mesh = io.gmsh.read_from_msh(mesh_path, comm, 0, gdim=gdim).mesh
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
         tdim = mesh.topology.dim
         submesh, _, _, _ = dmesh.create_submesh(mesh, tdim, indices)
@@ -158,7 +158,7 @@ class RVESolver:
                 X = ufl.SpatialCoordinate(mesh)
                 u_total_ufl = (self._F_bar_full - ufl.Identity(gdim)) * X + self.u_full
                 self.u_total = fem.Function(V, name="u_total")
-                self._u_total_expr = fem.Expression(u_total_ufl, V.element.interpolation_points())
+                self._u_total_expr = fem.Expression(u_total_ufl, V.element.interpolation_points)
                 fields.append(self.u_total)
         if fields:
             self.vtx = VTXManager(comm, os.path.join(output_dir, "solution.bp"), fields)

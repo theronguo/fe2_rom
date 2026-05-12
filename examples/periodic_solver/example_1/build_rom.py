@@ -19,10 +19,10 @@ ecm_dir = "ecm"
 mesh_file = "rve.msh"
 ecm_tol = 1e-6
 ratio_uP = 10.0
-ratio_P = 2.0
+ratio_P = 3.0
 energy_tol = 0.9999
 
-mesh, _, _ = io.gmshio.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim)
+mesh = io.gmsh.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim).mesh
 V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
 S  = fem.functionspace(mesh, ("DG", 1, (gdim, gdim)))
 
