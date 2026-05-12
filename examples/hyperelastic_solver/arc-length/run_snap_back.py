@@ -34,7 +34,7 @@ from dolfinx import mesh as dmesh
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from hyperelastic_solver import (
+from fe2_rom.hyperelastic_solver import (
     CylindricalArcLength,
     HyperelasticStabilitySolver,
     VTXManager,

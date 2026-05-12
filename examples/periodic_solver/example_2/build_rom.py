@@ -10,7 +10,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 from dolfinx import io, fem
 from mpi4py import MPI
-from rve_rom.pod import POD, ECM
+from fe2_rom.rve_rom.pod import POD, ECM
 
 comm = MPI.COMM_WORLD
 gdim = 3

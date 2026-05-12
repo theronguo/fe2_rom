@@ -13,7 +13,7 @@ from dolfinx import fem, io
 from mpi4py import MPI
 from petsc4py import PETSc
 
-from hyperelastic_solver import (
+from fe2_rom.hyperelastic_solver import (
     HyperelasticStabilitySolver,
     NeoHookean,
     ReactionForceLogger,
@@ -73,7 +73,7 @@ solver.run(
     pert_amplitude_init=1e1,
 )
 
-# from hyperelastic_solver.solvers import CylindricalArcLength
+# from fe2_rom.hyperelastic_solver.solvers import CylindricalArcLength
 # arc = CylindricalArcLength(
 #     arc_length=15,        # arc-length step in (U, λ) space; increase for larger λ steps
 #     max_arc_steps=800,

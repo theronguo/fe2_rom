@@ -1,8 +1,8 @@
-# hyperelastic_solver
+# fe2_rom
 
-A modular finite-element package for **large-deformation** hyperelasticity and
-**buckling analysis via eigenvalue perturbation**, built on
-[FEniCSx / DOLFINx](https://fenicsproject.org/) and
+**Reduced-order FE² for hyperelastic materials in DOLFINx** — POD + ECM
+hyper-reduction on periodic RVEs, with full-order buckling and homogenization
+solvers included. Built on [FEniCSx / DOLFINx](https://fenicsproject.org/) and
 [`dolfinx_mpc`](https://github.com/jorgensd/dolfinx_mpc).
 
 The package ships with ready-to-use solvers in 2D and 3D for:
@@ -39,9 +39,9 @@ periodic RVEs under macroscopic stretch.</sub>
 - **Periodic homogenization** on Gmsh-generated RVEs using `dolfinx_mpc`
   periodic constraints, with macroscopic-gradient driving and effective
   quantities `F̄, P̄, W̄, Ā` exported on demand.
-- **ROM toolkit** (`rve_rom`) — POD basis construction with `H¹` / `L²` inner
-  products, ECM hyper-reduction (magic-point selection), and an `RVESolver`
-  that runs entirely on the reduced submesh.
+- **ROM toolkit** (`fe2_rom.rve_rom`) — POD basis construction with `H¹` / `L²`
+  inner products, ECM hyper-reduction (magic-point selection), and an
+  `RVESolver` that runs entirely on the reduced submesh.
 - **MPI-parallel** snapshot generation, ROM assembly, and online evaluation.
 - **VTX (ADIOS2) output** for ParaView visualisation and CSV reaction-force
   logging.
@@ -52,7 +52,7 @@ A conda/mamba environment file is provided:
 
 ```bash
 mamba env create -f environment.yml
-mamba activate fenicsx-new
+mamba activate fe2_rom_env
 pip install -e .
 ```
 
@@ -62,19 +62,19 @@ deployments (HPC, CI, reproducible runs).
 ## Repository layout
 
 ```
-hyperelastic_solver/    # core package
-├── solver.py           # HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
-├── solvers.py          # NewtonSolver, ArcLengthSolver, CylindricalArcLength, ...
-├── stability.py        # SLEPc-based eigenvalue / instability analysis
-├── material.py         # MaterialModel, NeoHookean, LambdaMaterial
-├── forms.py            # weak-form assembly
-├── boundary.py         # ReactionProbe
-├── timestepping.py     # adaptive TimeStepper
-└── output.py           # VTXManager, ReactionForceLogger
-
-rve_rom/                # reduced-order modelling
-├── pod.py              # POD basis, ECM hyper-reduction
-└── solver.py           # RVESolver (reduced online stage)
+fe2_rom/
+├── hyperelastic_solver/    # full-order FE solver
+│   ├── solver.py           # HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
+│   ├── solvers.py          # NewtonSolver, ArcLengthSolver, CylindricalArcLength, ...
+│   ├── stability.py        # SLEPc-based eigenvalue / instability analysis
+│   ├── material.py         # MaterialModel, NeoHookean, LambdaMaterial
+│   ├── forms.py            # weak-form assembly
+│   ├── boundary.py         # ReactionProbe
+│   ├── timestepping.py     # adaptive TimeStepper
+│   └── output.py           # VTXManager, ReactionForceLogger
+└── rve_rom/                # reduced-order modelling
+    ├── pod.py              # POD basis, ECM hyper-reduction
+    └── solver.py           # RVESolver (reduced online stage)
 
 examples/
 ├── hyperelastic_solver/
@@ -95,7 +95,7 @@ examples/
 from mpi4py import MPI
 from dolfinx import fem, io
 from petsc4py import PETSc
-from hyperelastic_solver import (
+from fe2_rom.hyperelastic_solver import (
     HyperelasticStabilitySolver, NeoHookean,
     TimeStepper, VTXManager, ReactionForceLogger,
 )
@@ -143,7 +143,7 @@ parabolic arch, where both `λ` and the displacement reverse simultaneously.
 ### 3. Periodic RVE homogenization
 
 ```python
-from hyperelastic_solver import PeriodicHyperelasticHomogenizationSolver, NeoHookean
+from fe2_rom.hyperelastic_solver import PeriodicHyperelasticHomogenizationSolver, NeoHookean
 import numpy as np
 
 solver = PeriodicHyperelasticHomogenizationSolver(
@@ -171,11 +171,10 @@ python run_homogenization_rom.py
 
 `build_rom.py` constructs POD bases (energy criterion 99.99%), then ECM
 hyper-reduction selects "magic points" on a sub-mesh. The reduced solver
-(`rve_rom.solver.RVESolver`) reproduces `P̄(F̄)` and the tangent `Ā(F̄)` at a
+(`fe2_rom.rve_rom.solver.RVESolver`) reproduces `P̄(F̄)` and the tangent `Ā(F̄)` at a
 fraction of the full-order cost.
 
 ## License
 
 Released under the [MIT License](LICENSE) — free for academic and commercial
-use; please retain the copyright notice. If this code is useful for your
-research, citations to the associated publications are appreciated.
+use; please retain the copyright notice.

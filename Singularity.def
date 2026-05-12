@@ -3,7 +3,7 @@ From: condaforge/miniforge3:latest
 
 %post
     cat <<'EOF' > /tmp/environment.yml
-name: fenicsx-new
+name: fe2_rom_env
 channels:
   - conda-forge
 dependencies:
@@ -24,15 +24,11 @@ dependencies:
 EOF
     mamba env create -f /tmp/environment.yml
     mamba clean --all --yes
-    find /opt/conda/envs/fenicsx-new -name "_sysconfigdata_*.py" -exec \
+    find /opt/conda/envs/fe2_rom_env -name "_sysconfigdata_*.py" -exec \
         sed -i "s|'CC': '[^']*'|'CC': 'gcc'|g; s|'CXX': '[^']*'|'CXX': 'g++'|g" {} \;
 
 %environment
-    export PATH=/opt/conda/envs/fenicsx-new/bin:$PATH
-    export CONDA_DEFAULT_ENV=fenicsx-new
-    export CONDA_PREFIX=/opt/conda/envs/fenicsx-new
+    export PATH=/opt/conda/envs/fe2_rom_env/bin:$PATH
 
 %runscript
-    . /opt/conda/etc/profile.d/conda.sh
-    conda activate fenicsx-new
     exec python "$@"

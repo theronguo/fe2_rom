@@ -11,7 +11,7 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from mpi4py import MPI
-from hyperelastic_solver import (
+from fe2_rom.hyperelastic_solver import (
     PeriodicHyperelasticHomogenizationSolver,
     NeoHookean,
     setup_logging,

@@ -3,12 +3,12 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hyperelastic_solver"
+name = "fe2_rom"
 version = "0.1.0"
-description = "Nonlinear quasi-static hyperelastic solver with DOLFINx, together with tools for ROM."
+description = "Reduced-order FE² for hyperelastic materials in DOLFINx — POD + ECM hyper-reduction on periodic RVEs, with full-order buckling and homogenization solvers."
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [{ name = "Theron Guo" }]
 
 [tool.setuptools]
-packages = ["hyperelastic_solver", "rve_rom"]
+packages = ["fe2_rom", "fe2_rom.hyperelastic_solver", "fe2_rom.rve_rom"]

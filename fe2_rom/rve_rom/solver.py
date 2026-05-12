@@ -6,7 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 import scipy
 
-from hyperelastic_solver import NeoHookean, VTXManager, TimeStepper, setup_logging
+from ..hyperelastic_solver import NeoHookean, VTXManager, TimeStepper, setup_logging
 from dolfinx import io, fem, mesh as dmesh
 from mpi4py import MPI
 from petsc4py import PETSc

@@ -10,8 +10,8 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from mpi4py import MPI
-from hyperelastic_solver import NeoHookean, setup_logging
-from rve_rom.solver import RVESolver
+from fe2_rom.hyperelastic_solver import NeoHookean, setup_logging
+from fe2_rom.rve_rom.solver import RVESolver
 
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
