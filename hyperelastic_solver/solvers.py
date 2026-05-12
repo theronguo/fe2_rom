@@ -16,19 +16,27 @@ logger = logging.getLogger(__name__)
 
 
 class NewtonSolver:
-    """Newton-Raphson solver with CG+GAMG primary solver and MINRES fallback.
+    """Newton-Raphson solver with configurable linear solver and optional MINRES fallback.
+
+    Default primary solver: CG + GAMG with PETSc default smoothers.
+
+    Pass *petsc_options* (dict of option-key → value, without the leading '-') to
+    replace the default solver entirely with any PETSc KSP/PC combination.
+
+    When *switch_to_minres* is True and the primary solver diverges, the solver
+    switches to a hardcoded MINRES + GAMG setup (ignoring *petsc_options*) and
+    expands *effective_max_iter* to *max_iter_instab*.  This is useful for
+    following the solution through buckling where K becomes indefinite.
 
     Designed to be called multiple times per time step (once per stability retry)
-    via solve(iter_start=...). The iter_start parameter allows iter_newton to
-    accumulate across stability retries, matching the original solver's behaviour.
-
-    Call reset_for_new_timestep() at the start of each time step to reset
-    solver_type, effective_max_iter, and the stored initial residual norm.
+    via solve(iter_start=...).  Call reset_for_new_timestep() at the start of
+    each time step.
     """
 
     def __init__(self, comm, R_form, J_form, u, du, bcs, mpc=None, *,
                  rel_tol=1e-8, abs_tol=1e-6, max_iter=10, max_iter_instab=30,
-                 switch_to_minres=False
+                 petsc_options: dict | None = None,
+                 switch_to_minres=False,
                  ):
         self._comm = comm
         self._R_form = R_form
@@ -40,22 +48,47 @@ class NewtonSolver:
         self._abs_tol = abs_tol
         self._max_iter = max_iter
         self._max_iter_instab = max_iter_instab
+        self._petsc_options = petsc_options
         self._switch_to_minres = switch_to_minres
         self.mpc = mpc
 
         if mpc is not None:
             self._du = fem.Function(mpc.function_space, name="du")  # shadow du with MPC-aware version
 
-        self._solver_type = PETSc.KSP.Type.CG
-        self._pc_type = PETSc.PC.Type.GAMG
+        self._using_minres_fallback = False
         self.effective_max_iter = max_iter
         self._abs_b_norm_init = 1.0
 
     def reset_for_new_timestep(self):
-        """Reset solver type and iteration state for a fresh time step."""
-        self._solver_type = PETSc.KSP.Type.CG
+        """Reset solver state for a fresh time step."""
+        self._using_minres_fallback = False
         self.effective_max_iter = self._max_iter
         self._abs_b_norm_init = 1.0
+
+    def _make_ksp(self, K: PETSc.Mat) -> PETSc.KSP:
+        """Build and return a KSP for matrix K.
+
+        Priority:
+          1. MINRES + GAMG when _using_minres_fallback is True (ignores petsc_options).
+          2. User-supplied petsc_options via PETSc.Options + setFromOptions().
+          3. Default: CG + GAMG with PETSc default smoother.
+        """
+        ksp = PETSc.KSP().create(self._comm)
+        ksp.setOperators(K)
+
+        if self._using_minres_fallback:
+            ksp.setType(PETSc.KSP.Type.MINRES)
+            ksp.getPC().setType(PETSc.PC.Type.GAMG)
+        elif self._petsc_options is not None:
+            opts = PETSc.Options()
+            for key, val in self._petsc_options.items():
+                opts[key] = val
+        else:
+            ksp.setType(PETSc.KSP.Type.CG)
+            ksp.getPC().setType(PETSc.PC.Type.GAMG)
+
+        ksp.setFromOptions()
+        return ksp
 
     def _scatter_update(self, vec):
         vec.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
@@ -111,31 +144,28 @@ class NewtonSolver:
             else:
                 K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
             K.assemble()
-            ksp = PETSc.KSP().create(self._comm)
-            ksp.setOperators(K)
-            ksp.setType(self._solver_type)
-            ksp.getPC().setType(self._pc_type)
+            ksp = self._make_ksp(K)
             ksp.solve(-residual, self._du.x.petsc_vec)
 
             logger.debug("du norm: %.3e", self._du.x.petsc_vec.norm())
 
             reason = ksp.getConvergedReason()
-            if reason < 0 and self._solver_type == PETSc.KSP.Type.CG:
+            if reason < 0 and not self._using_minres_fallback:
                 if self._switch_to_minres:
-                    logger.warning("CG did not converge (reason %d) — switching to MINRES", reason)
-                    self._solver_type = PETSc.KSP.Type.MINRES
+                    logger.warning("Primary solver did not converge (reason %d) — switching to MINRES+GAMG", reason)
+                    self._using_minres_fallback = True
                     self.effective_max_iter = self._max_iter_instab
                     ksp.destroy()
                     PETSc.Vec.destroy(residual)
                     PETSc.Mat.destroy(K)
                     continue
                 else:
-                    logger.warning("CG did not converge (reason %d)", reason)
+                    logger.warning("Primary solver did not converge (reason %d)", reason)
                     ksp.destroy()
                     PETSc.Vec.destroy(residual)
                     PETSc.Mat.destroy(K)
                     return is_converged, iter_newton
-            elif reason < 0 and self._solver_type == PETSc.KSP.Type.MINRES:
+            elif reason < 0 and self._using_minres_fallback:
                 logger.warning("MINRES did not converge (reason %d) — reducing time step", reason)
                 ksp.destroy()
                 PETSc.Vec.destroy(residual)
@@ -186,10 +216,7 @@ class NewtonSolverFE2(NewtonSolver):
             K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
         K.assemble()
 
-        ksp = PETSc.KSP().create(self._comm)
-        ksp.setOperators(K)
-        ksp.setType(self._solver_type)
-        ksp.getPC().setType(PETSc.PC.Type.GAMG)
+        ksp = self._make_ksp(K)
 
         adjoints = []
         for i in range(len(self._Jij_forms)):
@@ -292,7 +319,7 @@ class CylindricalArcLength(ArcLengthSolver):
         return r
 
     def _build_ksp(self, K: PETSc.Mat, comm) -> PETSc.KSP:
-        """Set up a KSP with CG+GAMG for the given symmetric K.
+        """Set up a KSP with CG+GAMG for the given K.
 
         Caller must destroy the returned KSP.
         """
