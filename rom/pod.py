@@ -51,7 +51,7 @@ def my_ecm(A, b, tol=1e-4):
         A_current = A[:, magic_points]
         alpha, _, _, _ = lstsq(A_current, b)
         if np.any(alpha < 0):
-            alpha = nnls(A_current, b)[0]
+            alpha = nnls(A_current, b, maxiter=1000000)[0]
             counter_nnls += 1
             for idx in np.where(alpha < 1e-8)[0][::-1]:
                 candidates.append(magic_points.pop(idx))
@@ -122,7 +122,7 @@ def _apply_dg_perm(arr, src_flat, dst_flat, out_size):
     return result
 
 
-def _write_submesh_to_gmsh(submesh, filename):
+def _write_submesh_to_gmsh(submesh, filename, comm, gdim):
     tdim = submesh.topology.dim
     assert submesh.topology.cell_type.name == "triangle"
     assert submesh.geometry.dofmap.shape[1] == 6, \
@@ -166,7 +166,44 @@ class POD:
 
     @staticmethod
     def load_snapshots(pattern):
-        return np.array([np.load(f) for f in sorted(glob(pattern))])
+        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        return np.array([np.load(f) for f in files])
+
+    @staticmethod
+    def load_and_align_snapshots(pattern, V):
+        """Load snapshots and permute DOFs to match V's serial DOF ordering.
+
+        When snapshots are saved from a parallel run (mpirun -np N), the DOF
+        ordering in each .npy file follows the parallel global-DOF-index
+        assignment, which differs from the serial DOF ordering used by V.
+
+        If a companion *_dof_coords.npy file was written alongside the
+        snapshots (by the solver's _save_snapshot method), this function reads
+        those coordinates, matches them to V's DOF coordinates via a KD-tree,
+        and permutes the snapshot arrays accordingly.  If no coords file is
+        found the snapshots are returned as-is (correct for serial saves).
+        """
+        import os, re
+        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        snapshots = np.array([np.load(f) for f in files])
+        if not files:
+            return snapshots
+
+        # Derive coords filename: strip trailing _<timestamp>.npy
+        first = files[0]
+        coords_basename = re.sub(r'_[\d]+\.[\d]+\.npy$', '_dof_coords.npy',
+                                  os.path.basename(first))
+        coords_path = os.path.join(os.path.dirname(first), coords_basename)
+        if not os.path.exists(coords_path):
+            return snapshots
+
+        saved_coords = np.load(coords_path)       # (n_nodes, gdim) — parallel ordering
+        serial_coords = V.tabulate_dof_coordinates()  # (n_nodes, gdim) — serial ordering
+        bs = V.dofmap.index_map_bs
+
+        _, perm = cKDTree(saved_coords).query(serial_coords, k=1)
+        dof_perm = (perm[:, None] * bs + np.arange(bs)).ravel()
+        return snapshots[:, dof_perm]
 
     def _assemble_inner_product_matrix(self, inner_product):
         u = ufl.TrialFunction(self.V)
@@ -194,10 +231,15 @@ class POD:
         plt.title("POD Eigenvalues")
         plt.show()
 
+    def n_modes(self, energy_fraction=0.9999):
+        """Return the number of modes needed to capture *energy_fraction* of total energy."""
+        cumsum = np.cumsum(self.eigenvalues)
+        return int(np.searchsorted(cumsum, energy_fraction * cumsum[-1])) + 1
+
     def visualize_modes(self, n_modes, filename, visualization_space, interpolation_space=None):
         fn = fem.Function(visualization_space)
         fn_out = fem.Function(interpolation_space) if interpolation_space is not None else fn
-        with XDMFFile(comm, filename, "w") as xdmf:
+        with XDMFFile(self.mesh.comm, filename, "w") as xdmf:
             xdmf.write_mesh(self.mesh)
             for i in range(n_modes):
                 fn.x.array[:] = self.basis[:, i]
@@ -209,17 +251,28 @@ class POD:
 # ── ECM ───────────────────────────────────────────────────────────────────────
 
 class ECM:
-    """Empirical Cubature Method for hyper-reduction.
+    """Adapted Empirical Cubature Method for hyper-reduction.
 
     Parameters
     ----------
-    basis_u : (n_dofs_V, N) ndarray   — displacement ROM basis
-    basis_P : (n_dofs_S, M) ndarray   — stress ROM basis
-    V       : displacement FunctionSpace
-    S       : stress FunctionSpace
+    basis_u   : (n_dofs_V, N) ndarray   — displacement ROM basis
+    basis_P   : (n_dofs_S, M) ndarray   — stress ROM basis
+    V         : displacement FunctionSpace
+    S         : stress FunctionSpace
+    sigma_u   : (N,) array-like or None — singular values for u basis;
+                rows are weighted by sigma_u[i]*sigma_P[j] / (sigma_u[0]*sigma_P[0]).
+                If None, all u modes are weighted equally.
+    sigma_P   : (M,) array-like or None — singular values for P basis (same logic).
+    ratio_uP  : float — overall scale of the P·∇u constraint block relative to
+                the volume row (default 1.0).
+    ratio_P   : float — overall scale of the ∫P dX constraint block relative to
+                the volume row (default 1.0).
     """
 
-    def __init__(self, basis_u, basis_P, V, S):
+    def __init__(self, basis_u, basis_P, V, S,
+                 degree: int = 1,
+                 sigma_u=None, sigma_P=None,
+                 ratio_uP=1.0, ratio_P=1.0):
         self.basis_u = basis_u
         self.basis_P = basis_P
         self.N = basis_u.shape[1]
@@ -227,8 +280,14 @@ class ECM:
         self.V = V
         self.S = S
         self.mesh = V.mesh
+        self.gdim = V.mesh.topology.dim
+        self.degree = degree
         self._Q0 = fem.functionspace(self.mesh, ("DG", 0))
         self._weights, self._volume = self._assemble_weights()
+        self.sigma_u = np.ones(self.N) if sigma_u is None else np.asarray(sigma_u, dtype=float)
+        self.sigma_P = np.ones(self.M) if sigma_P is None else np.asarray(sigma_P, dtype=float)
+        self.ratio_uP = ratio_uP
+        self.ratio_P = ratio_P
         self.magic_points = None
         self.magic_weights = None
 
@@ -247,12 +306,13 @@ class ECM:
         return self._volume
 
     def _build_matrices(self):
-        """Assemble the (N*M+1) x dofs_Q0 constraint matrix A and rhs b."""
+        """Assemble the (N*M + M*n_P_components + 1) x dofs_Q0 constraint matrix A and rhs b."""
         dofs_Q0 = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
         dx = ufl.dx(domain=self.mesh)
         cell_avg = ufl.TestFunction(self._Q0)
         basis_func_u = fem.Function(self.V)
         basis_func_P = fem.Function(self.S)
+        
         mat = np.zeros((self.N, self.M, dofs_Q0))
         form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
         for i in range(self.N):
@@ -263,9 +323,44 @@ class ECM:
                     form
                 ).array.copy()
         mat_int = mat.sum(axis=2)
-        assert np.allclose(mat_int, mat.sum(axis=2))
-        A = np.vstack([mat.reshape(-1, dofs_Q0), self._weights])
-        b = np.concatenate([mat_int.reshape(-1), [self._volume]])
+
+        # Pre-compile one form per flat component of P for ∫P_j_c φ_k dX
+        p_shape = basis_func_P.ufl_shape
+        p_component_forms = []
+        for idx in np.ndindex(*p_shape):
+            if not idx:
+                comp = basis_func_P
+            elif len(idx) == 1:
+                comp = basis_func_P[idx[0]]
+            else:
+                comp = basis_func_P[idx]
+            p_component_forms.append(fem.form(comp * cell_avg * dx))
+        n_P_components = len(p_component_forms)
+
+        mat_P = np.zeros((self.M, n_P_components, dofs_Q0))
+        for j in range(self.M):
+            basis_func_P.x.array[:] = self.basis_P[:, j]
+            for c, form_Pc in enumerate(p_component_forms):
+                mat_P[j, c, :] = petsc.assemble_vector(form_Pc).array.copy()
+        mat_P_int = mat_P.sum(axis=2)
+
+        # Per-row weights from normalised singular values
+        # sigma_u[0] and sigma_P[0] are the reference (largest) values
+        su = self.sigma_u / self.sigma_u[0]   # shape (N,), su[0] == 1
+        sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
+
+        # mat block: w[i,j] = ratio_uP * su[i] * sp[j]
+        w_uP = self.ratio_uP * np.outer(su, sp)          # (N, M)
+        mat_w     = mat     * w_uP[:, :, np.newaxis]     # (N, M, dofs_Q0)
+        mat_int_w = mat_int * w_uP                        # (N, M)
+
+        # mat_P block: w[j] = ratio_P * sp[j]  (same for all components c)
+        w_P     = self.ratio_P * sp                       # (M,)
+        mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
+        mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
+
+        A = np.vstack([mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0), self._weights])
+        b = np.concatenate([mat_int_w.reshape(-1), mat_P_int_w.reshape(-1), [self._volume]])
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 
@@ -281,6 +376,8 @@ class ECM:
             ecm_func = my_ecm
         A, b = self._build_matrices()
         self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol)
+        # self.magic_points = np.array(list(range(len(self.weights)))) if self.magic_points is None else self.magic_points
+        # self.magic_weights = 1 if self.magic_weights is None else self.magic_weights
 
     def show_active_cells(self, filename="active.xdmf"):
         assert self.magic_points is not None, "Call compute_magic first"
@@ -289,7 +386,7 @@ class ECM:
         indices = np.unique(np.asarray(self.magic_points, dtype=np.int32))
         values = 999 * np.ones_like(indices, dtype=np.int32)
         cell_tags = dmesh.meshtags(self.mesh, tdim, indices, values)
-        with XDMFFile(comm, filename, "w") as xdmf:
+        with XDMFFile(self.mesh.comm, filename, "w") as xdmf:
             xdmf.write_mesh(self.mesh)
             xdmf.write_meshtags(cell_tags, self.mesh.geometry)
         return cell_tags
@@ -330,8 +427,8 @@ class ECM:
         tdim = self.mesh.topology.dim
         submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
 
-        V_sub  = fem.functionspace(submesh, ("Lagrange", degree, (gdim,)))
-        S_sub  = fem.functionspace(submesh, ("DG", 1, (gdim, gdim)))
+        V_sub  = fem.functionspace(submesh, ("Lagrange", self.degree, (self.gdim,)))
+        S_sub  = fem.functionspace(submesh, ("DG", 1, (self.gdim, self.gdim)))
         Q0_sub = fem.functionspace(submesh, ("DG", 0))
 
         basis_u_sub = np.stack([
@@ -404,8 +501,8 @@ class ECM:
         submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
         dx_sub = ufl.Measure("dx", domain=submesh)
 
-        V_sub  = fem.functionspace(submesh, ("Lagrange", degree, (gdim,)))
-        S_sub  = fem.functionspace(submesh, ("DG", 1, (gdim, gdim)))
+        V_sub  = fem.functionspace(submesh, ("Lagrange", self.degree, (self.gdim,)))
+        S_sub  = fem.functionspace(submesh, ("DG", 1, (self.gdim, self.gdim)))
         Q0_sub = fem.functionspace(submesh, ("DG", 0))
 
         basis_u_sub = [_parent_to_sub_array(self.basis_u[:, i], self.V, V_sub, cell_map) for i in range(self.N)]
@@ -458,11 +555,11 @@ class ECM:
         submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
 
         omega = self._make_omega()
-        mesh_2 = _write_submesh_to_gmsh(submesh, "active.msh")
+        mesh_2 = _write_submesh_to_gmsh(submesh, "active.msh", self.mesh.comm, self.gdim)
         dx_2 = ufl.Measure("dx", domain=mesh_2)
 
-        V_2  = fem.functionspace(mesh_2, ("Lagrange", degree, (gdim,)))
-        S_2  = fem.functionspace(mesh_2, ("DG", 1, (gdim, gdim)))
+        V_2  = fem.functionspace(mesh_2, ("Lagrange", self.degree, (self.gdim,)))
+        S_2  = fem.functionspace(mesh_2, ("DG", 1, (self.gdim, self.gdim)))
         Q0_2 = fem.functionspace(mesh_2, ("DG", 0))
 
         mesh2_to_sub    = cKDTree(_cell_centroids(submesh)).query(_cell_centroids(mesh_2), k=1)[1]
@@ -537,24 +634,33 @@ if __name__ == "__main__":
     S  = fem.functionspace(mesh, ("DG", 1, (gdim, gdim)))
     S0 = fem.functionspace(mesh, ("DG", 0, (gdim, gdim)))
 
-    N, M = 7, 7
+    energy_tol = 0.9999
 
     snapshots_u = POD.load_snapshots("output/snapshots/u_fluc_*.npy")
     pod_u = POD(snapshots_u, V, inner_product="H1")
+    N = pod_u.n_modes(energy_tol)
     # pod_u.plot_eigenvalues()
     # pod_u.visualize_modes(N, "pod_mode_u.xdmf", V)
 
     snapshots_P = POD.load_snapshots("output/snapshots/P_*.npy")
     pod_P = POD(snapshots_P, S, inner_product="L2")
+    M = pod_P.n_modes(energy_tol)
     # pod_P.plot_eigenvalues()
     # pod_P.visualize_modes(M, "pod_mode_P.xdmf", S, S0)
 
-    ecm = ECM(pod_u.basis[:, :N], pod_P.basis[:, :M], V, S)
-    ecm.compute_magic(tol=1e-4)
+    print(f"Energy criterion ({energy_tol:.4%}): N={N} u-modes, M={M} P-modes")
+
+    ecm = ECM(pod_u.basis[:, :N], pod_P.basis[:, :M], V, S,
+              degree=degree,
+              sigma_u=np.sqrt(pod_u.eigenvalues[:N]), sigma_P=np.sqrt(pod_P.eigenvalues[:M]),
+              ratio_uP=2.0, ratio_P=1.0)
+    ecm.compute_magic(tol=1e-6)
     # ecm.show_active_cells("active.xdmf")
 
     # ecm.test_variant1(10000)
     # ecm.test_variant2(10000)
     # ecm.test_variant3(10000)
+
+    print("Number of magic points:", len(ecm.magic_points))
 
     ecm.save_variant2("ecm_variant2_data")

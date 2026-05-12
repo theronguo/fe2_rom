@@ -108,6 +108,36 @@ class RVESolver:
         self._vol = fem.assemble_scalar(fem.form(1.0 * self._omega_func * self._dx_sub))
         logger.info("Effective domain volume (ECM): %.6f", self._vol)
 
+        if "P" in average_fields:
+            self._P_avg_forms = [
+                [fem.form(self._P_ufl[i, j] * self._omega_func * self._dx_sub)
+                 for j in range(gdim)]
+                for i in range(gdim)
+            ]
+        else:
+            self._P_avg_forms = None
+
+        if "A" in average_fields:
+            self._D_forms = [
+                [fem.form(
+                    ufl.inner(
+                        ufl.as_tensor([[self.A_ufl[i, j, m, n] for n in range(gdim)] for m in range(gdim)]),
+                        ufl.grad(self._v),
+                    ) * self._omega_func * self._dx_sub
+                ) for j in range(gdim)]
+                for i in range(gdim)
+            ]
+            self._A_avg_forms = [
+                [[[fem.form(self.A_ufl[i, j, k, l] * self._omega_func * self._dx_sub)
+                   for l in range(gdim)]
+                  for k in range(gdim)]
+                 for j in range(gdim)]
+                for i in range(gdim)
+            ]
+        else:
+            self._D_forms = None
+            self._A_avg_forms = None
+
         # warm-started ROM coefficients (persist across __call__ invocations)
         self.coeffs = np.zeros(self.N)
 
@@ -165,9 +195,7 @@ class RVESolver:
         Pbar = np.zeros((self.gdim, self.gdim), dtype=float)
         for i in range(self.gdim):
             for j in range(self.gdim):
-                Pbar[i, j] = fem.assemble_scalar(
-                    fem.form(self._P_ufl[i, j] * self._omega_func * self._dx_sub)
-                ) / self._vol
+                Pbar[i, j] = fem.assemble_scalar(self._P_avg_forms[i][j]) / self._vol
         return Pbar
 
     def compute_effective_tangent_moduli(self) -> np.ndarray:
@@ -195,15 +223,9 @@ class RVESolver:
         D = np.zeros((N, gdim, gdim))
         for i in range(gdim):
             for j in range(gdim):
-                A_ij = ufl.as_tensor(
-                    [[self.A_ufl[i, j, m, n] for n in range(gdim)] for m in range(gdim)]
-                )
-                form_ij = fem.form(
-                    ufl.inner(A_ij, ufl.grad(self._v)) * self._omega_func * self._dx_sub
-                )
                 for p in range(N):
                     self._v.x.array[:] = self.basis_u_sub[:, p]
-                    D[p, i, j] = fem.assemble_scalar(form_ij)
+                    D[p, i, j] = fem.assemble_scalar(self._D_forms[i][j])
 
         # Adjoint solve: J · α[k,l] = −D[:,k,l]
         alpha = np.zeros((gdim, gdim, N))
@@ -217,9 +239,7 @@ class RVESolver:
             for j in range(gdim):
                 for k in range(gdim):
                     for l in range(gdim):
-                        A_avg_local = fem.assemble_scalar(
-                            fem.form(self.A_ufl[i, j, k, l] * self._omega_func * self._dx_sub)
-                        )
+                        A_avg_local = fem.assemble_scalar(self._A_avg_forms[i][j][k][l])
                         A_fluc_local = float(D[:, i, j] @ alpha[k, l, :])
                         A_eff[i, j, k, l] = (A_avg_local + A_fluc_local) / self._vol
 

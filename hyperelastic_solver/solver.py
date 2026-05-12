@@ -526,6 +526,7 @@ class PeriodicHyperelasticHomogenizationSolver:
         # Snapshot saving setup
         self.output_dir = output_dir
         self.save_snapshots = save_snapshots
+        logger.info("Saving snapshots for fields: %s", save_snapshots)
         logger.info("Setup complete")
 
     def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
@@ -629,6 +630,39 @@ class PeriodicHyperelasticHomogenizationSolver:
             self.vtx.write(t)
         else:
             logger.warning("No fields to write at t=%.5f (vtx is None)", t)
+
+    def _save_snapshot(self, field_name: str, func, t_save: float) -> None:
+        """Gather owned DOF values and coordinates to rank 0 and save.
+
+        Values are gathered in global-DOF-index order (rank 0's owned DOFs,
+        then rank 1's, …).  DOF coordinates are saved once alongside the
+        snapshots so that a serial post-processing tool (e.g. build_rom.py)
+        can compute the permutation needed to convert from the parallel DOF
+        ordering to the serial DOF ordering.
+
+        Coordinates are written to
+            <output_dir>/snapshots/<field_name>_dof_coords.npy
+        and are not matched by the time-stamped glob pattern used to load
+        snapshots (which contains a decimal point in the stem).
+        """
+        imap = func.function_space.dofmap.index_map
+        bs = func.function_space.dofmap.index_map_bs
+        n_local = imap.size_local
+
+        owned_vals = func.x.array[:n_local * bs].copy()
+        owned_coords = func.function_space.tabulate_dof_coordinates()[:n_local].copy()
+
+        all_vals = self.comm.gather(owned_vals, root=0)
+        all_coords = self.comm.gather(owned_coords, root=0)
+
+        if self.comm.rank == 0:
+            vals = np.concatenate(all_vals)
+            coords = np.concatenate(all_coords, axis=0)
+            snap_dir = f"{self.output_dir}/snapshots"
+            np.save(f"{snap_dir}/{field_name}_{t_save:.5f}.npy", vals)
+            coords_path = f"{snap_dir}/{field_name}_dof_coords.npy"
+            if not os.path.exists(coords_path):
+                np.save(coords_path, coords)
 
     def compute_effective_strain_energy_density(self) -> float:
         """Compute domain-average effective strain energy density from the current converged state."""
@@ -779,23 +813,14 @@ class PeriodicHyperelasticHomogenizationSolver:
                         if self.vtx is not None:
                             self._write_fields(t_save)
                         
-                        for field in self.save_snapshots:
+                        if self.save_snapshots:
                             os.makedirs(f"{self.output_dir}/snapshots", exist_ok=True)
+                        for field in self.save_snapshots:
                             if field == "u_fluc":
-                                scatter, u_seq = PETSc.Scatter.toZero(u.x.petsc_vec)
-                                scatter.scatter(u.x.petsc_vec, u_seq, False, PETSc.ScatterMode.FORWARD)
-                                if self.comm.rank == 0:
-                                    np.save(f"{self.output_dir}/snapshots/u_fluc_{t_save:.5f}.npy", u_seq.array.copy())
-                                scatter.destroy()
-                                u_seq.destroy()
+                                self._save_snapshot("u_fluc", u, t_save)
                             elif field == "P":
                                 self.P_func.interpolate(self._P_expr)
-                                scatter, p_seq = PETSc.Scatter.toZero(self.P_func.x.petsc_vec)
-                                scatter.scatter(self.P_func.x.petsc_vec, p_seq, False, PETSc.ScatterMode.FORWARD)
-                                if self.comm.rank == 0:
-                                    np.save(f"{self.output_dir}/snapshots/P_{t_save:.5f}.npy", p_seq.array.copy())
-                                scatter.destroy()
-                                p_seq.destroy()
+                                self._save_snapshot("P", self.P_func, t_save)
 
                 else:
                     ok = self._timestepper.reject()
