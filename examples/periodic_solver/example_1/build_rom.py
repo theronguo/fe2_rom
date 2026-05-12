@@ -1,7 +1,6 @@
 """
 Run:
     python build_rom.py
-    mpirun -n 4 python build_rom.py
 """
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -10,14 +9,14 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 from dolfinx import io, fem
 from mpi4py import MPI
-from rom.pod import POD, ECM
+from rve_rom.pod import POD, ECM
 
 comm = MPI.COMM_WORLD
-gdim = 3  #2
-degree = 1  #2
-snapshot_dir = "output"  # "output_2d"
-ecm_dir = "ecm_variant2_data"  # "ecm_variant2_data_2d"
-mesh_file = "mesh.msh"  # "holes.msh"
+gdim = 2
+degree = 2
+snapshot_dir = "output"
+ecm_dir = "ecm"
+mesh_file = "rve.msh"
 ecm_tol = 1e-6
 ratio_uP = 10.0
 ratio_P = 2.0

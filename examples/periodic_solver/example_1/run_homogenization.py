@@ -1,7 +1,7 @@
 """
 Run:
-    python run_solver.py
-    mpirun -n 4 python run_solver.py
+    python run_homogenization.py
+    mpirun -n 4 python run_homogenization.py
 """
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"  # avoid OpenBLAS oversubscription
@@ -26,10 +26,10 @@ nu = 0.30
 mu = E / (2.0 * (1.0 + nu))
 lmbda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
 
-output_dir = "output_2d"
+output_dir = "output"
 material = NeoHookean(mu=mu, lmbda=lmbda)
 solver = PeriodicHyperelasticHomogenizationSolver(
-    mesh_path="holes.msh",
+    mesh_path="rve.msh",
     comm=comm,
     gdim=2,
     material=material,

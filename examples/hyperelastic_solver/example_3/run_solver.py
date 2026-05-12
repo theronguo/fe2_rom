@@ -25,7 +25,7 @@ from hyperelastic_solver import (
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 
-mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("mesh.msh", comm, 0, gdim=3)
+mesh, cell_tags, facet_tags = io.gmshio.read_from_msh("hex_extruded.msh", comm, 0, gdim=3)
 
 material = NeoHookean(mu=1000.0, lmbda=2000.0)
 solver = HyperelasticStabilitySolver(
@@ -37,25 +37,19 @@ const_0 = fem.Constant(mesh, PETSc.ScalarType(0.0))
 const_1 = fem.Constant(mesh, PETSc.ScalarType(0.0))
 
 # z_min: fully clamped
-solver.add_bc(0, lambda x: x[2] < 0+1e-8, const_0)
-solver.add_bc(1, lambda x: x[2] < 0+1e-8, const_0)
-solver.add_bc(2, lambda x: x[2] < 0+1e-8, const_0)
+solver.add_bc(0, lambda x: x[0] < -0.8161+1e-8, const_0)
+solver.add_bc(1, lambda x: x[0] < -0.8161+1e-8, const_0)
+solver.add_bc(2, lambda x: x[0] < -0.8161+1e-8, const_0)
 
 # z_max: lateral fixed, prescribed vertical displacement + reaction force probe
-# solver.add_bc(0, lambda x: x[2] > 1-1e-8, const_0)
-# solver.add_bc(1, lambda x: x[2] > 1-1e-8, const_0)
-solver.add_bc(2, lambda x: x[2] > 1-1e-8, const_1,
-              measure_reaction=True, reaction_direction=(0.0, 0.0, 1.0))
+solver.add_bc(0, lambda x: x[0] > 26.796-1e-8, const_1,
+              measure_reaction=True, reaction_direction=(1.0, 0.0, 0.0))
+solver.add_bc(1, lambda x: x[0] > 26.796-1e-8, const_0)
+solver.add_bc(2, lambda x: x[0] > 26.796-1e-8, const_0)
 
 solver.setup(check_stability=True, newton_options={"switch_to_minres": True})
 
-# Compute max_amplitude using MPI-reduced z extents
-z_local = mesh.geometry.x[:, 2]
-z_min = comm.allreduce(float(np.min(z_local)), op=MPI.MIN)
-z_max = comm.allreduce(float(np.max(z_local)), op=MPI.MAX)
-max_amplitude = -0.25
-
-
+max_amplitude = -3.0
 def load_schedule(t: float) -> None:
     const_1.value = t * max_amplitude
 

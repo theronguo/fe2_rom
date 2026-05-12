@@ -1,7 +1,7 @@
 """
 Run:
-    python run_solver.py
-    mpirun -n 4 python run_solver.py
+    python run_homogenization.py
+    mpirun -n 4 python run_homogenization.py
 """
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"  # avoid OpenBLAS oversubscription

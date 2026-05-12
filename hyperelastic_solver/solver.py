@@ -774,7 +774,25 @@ class PeriodicHyperelasticHomogenizationSolver:
                 if converged:
                     K = self._newton.assemble_stiffness()
                     if self._stability is not None:
-                        is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                        try:
+                            is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                        except PETSc.Error as e:
+                            logger.error("Stability check failed: %s", e)
+                            ok = self._timestepper.reject()
+                            if not ok:
+                                logger.error(
+                                    "Minimum time step dt=%.2e reached — stopping.",
+                                    self._timestepper.dt_min,
+                                )
+                                simulation_finished = True
+                            else:
+                                logger.warning(
+                                    "Eigensolver crashed — halving dt to %.2e",
+                                    self._timestepper.dt,
+                                )
+                            u.x.array[:] = self._u_last.x.array[:]
+                            u.x.scatter_forward()
+                            break
                     else:
                         is_stable, eigenvalues = True, np.array([])
 
