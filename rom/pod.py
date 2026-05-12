@@ -166,7 +166,44 @@ class POD:
 
     @staticmethod
     def load_snapshots(pattern):
-        return np.array([np.load(f) for f in sorted(glob(pattern))])
+        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        return np.array([np.load(f) for f in files])
+
+    @staticmethod
+    def load_and_align_snapshots(pattern, V):
+        """Load snapshots and permute DOFs to match V's serial DOF ordering.
+
+        When snapshots are saved from a parallel run (mpirun -np N), the DOF
+        ordering in each .npy file follows the parallel global-DOF-index
+        assignment, which differs from the serial DOF ordering used by V.
+
+        If a companion *_dof_coords.npy file was written alongside the
+        snapshots (by the solver's _save_snapshot method), this function reads
+        those coordinates, matches them to V's DOF coordinates via a KD-tree,
+        and permutes the snapshot arrays accordingly.  If no coords file is
+        found the snapshots are returned as-is (correct for serial saves).
+        """
+        import os, re
+        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        snapshots = np.array([np.load(f) for f in files])
+        if not files:
+            return snapshots
+
+        # Derive coords filename: strip trailing _<timestamp>.npy
+        first = files[0]
+        coords_basename = re.sub(r'_[\d]+\.[\d]+\.npy$', '_dof_coords.npy',
+                                  os.path.basename(first))
+        coords_path = os.path.join(os.path.dirname(first), coords_basename)
+        if not os.path.exists(coords_path):
+            return snapshots
+
+        saved_coords = np.load(coords_path)       # (n_nodes, gdim) — parallel ordering
+        serial_coords = V.tabulate_dof_coordinates()  # (n_nodes, gdim) — serial ordering
+        bs = V.dofmap.index_map_bs
+
+        _, perm = cKDTree(saved_coords).query(serial_coords, k=1)
+        dof_perm = (perm[:, None] * bs + np.arange(bs)).ravel()
+        return snapshots[:, dof_perm]
 
     def _assemble_inner_product_matrix(self, inner_product):
         u = ufl.TrialFunction(self.V)

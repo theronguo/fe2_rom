@@ -27,11 +27,11 @@ mesh, _, _ = io.gmshio.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim)
 V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
 S  = fem.functionspace(mesh, ("DG", 1, (gdim, gdim)))
 
-snapshots_u = POD.load_snapshots(f"{snapshot_dir}/snapshots/u_fluc_*.npy")
+snapshots_u = POD.load_and_align_snapshots(f"{snapshot_dir}/snapshots/u_fluc_*.npy", V)
 pod_u = POD(snapshots_u, V, inner_product="H1")
 N = pod_u.n_modes(energy_tol)
 
-snapshots_P = POD.load_snapshots(f"{snapshot_dir}/snapshots/P_*.npy")
+snapshots_P = POD.load_and_align_snapshots(f"{snapshot_dir}/snapshots/P_*.npy", S)
 pod_P = POD(snapshots_P, S, inner_product="L2")
 M = pod_P.n_modes(energy_tol)
 
