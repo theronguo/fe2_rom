@@ -526,6 +526,7 @@ class PeriodicHyperelasticHomogenizationSolver:
         # Snapshot saving setup
         self.output_dir = output_dir
         self.save_snapshots = save_snapshots
+        logger.info("Saving snapshots for fields: %s", save_snapshots)
         logger.info("Setup complete")
 
     def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:

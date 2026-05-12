@@ -1,7 +1,7 @@
 """
 Run:
-    python run_solver.py
-    mpirun -n 4 python run_solver.py
+    python run_homogenization_2d_rom.py
+    mpirun -n 4 python run_homogenization_2d_rom.py
 """
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"  # avoid OpenBLAS oversubscription
@@ -11,42 +11,33 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from mpi4py import MPI
-from hyperelastic_solver import (
-    PeriodicHyperelasticHomogenizationSolver,
-    NeoHookean,
-    setup_logging,
-)
+from hyperelastic_solver import NeoHookean, setup_logging
+from rom.solver import RVESolver
 
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 
-# material parameters (used by the hyperelastic model)
 E = 3000.0
 nu = 0.30
 mu = E / (2.0 * (1.0 + nu))
 lmbda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
 
-output_dir = "output_2d"
+output_dir = "output_rom_2d"
 material = NeoHookean(mu=mu, lmbda=lmbda)
-solver = PeriodicHyperelasticHomogenizationSolver(
+solver = RVESolver(
     mesh_path="holes.msh",
+    rom_dir="ecm_variant2_data_2d",
+    material=material,
     comm=comm,
     gdim=2,
-    material=material,
     degree=2,
     output_dir=output_dir,
-    check_stability=True, 
-    visualize_fields=["u_fluc", "u_total",
-                    "F", "P", "J", "W"],
+    visualize_fields=[""],
     average_fields=["F", "P", "A"],
-    newton_options={"switch_to_minres": True},
-    timestepper_options={"t_end": 1.0, "dt_init": 1.0},
-    save_snapshots=["u_fluc", "P"]
+    timestepper_options={"t_end": 1.0, "dt_init": 0.01, "dt_min": 1e-5, "dt_max": 0.01, "good_newton_steps": 5},
 )
 
-res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]),
-    pert_amplitude_init=1e-1,
-)
+res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]))
 
 Fbar_conv = []
 Pbar_conv = []
