@@ -426,7 +426,7 @@ class RVESolver:
                     logger.error("Minimum time step dt=%.2e reached — stopping.", self._timestepper.dt_min)
                     raise RVEConvergenceError(
                         f"RVE timestepper hit dt_min={self._timestepper.dt_min:.2e} "
-                        f"at t={self._timestepper.t_current:.4f} (F_bar={self.F_bar.value!r})"
+                        f"at t={self._timestepper.t_current:.4f}"
                     )
                 logger.warning("Newton did not converge — halving dt to %.2e", self._timestepper.dt)
                 continue

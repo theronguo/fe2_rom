@@ -28,6 +28,9 @@ import numpy as np
 
 from dolfinx_materials.generic import Material
 
+from fe2_rom.hyperelastic_solver.logging_utils import qp_context
+from fe2_rom.hyperelastic_solver.exceptions import RVEConvergenceError
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,7 +63,7 @@ def _tangent4_to_mat99(A: np.ndarray) -> np.ndarray:
             M[p, q] = A[i, j, k, l]
     return M
 
-
+from mpi4py import MPI
 class RVEMaterial(Material):
     """dolfinx_materials Material whose response comes from a nested RVE.
 
@@ -75,11 +78,14 @@ class RVEMaterial(Material):
         the RVE with ``average_fields=["P", "A"]``.
     """
 
-    def __init__(self, rve_factory: Callable[[], object]):
+    def __init__(self, rve_factory: Callable[[int, int], object]):
         super().__init__()
         self._rve_factory = rve_factory
         self._rves: list | None = None
         self._n_qp: int | None = None
+        self._rank = MPI.COMM_WORLD.Get_rank()
+        self.step_failed: bool = False
+        self.failure_reason: str = ""
 
     # ------------------------------------------------------------------
     # dolfinx_materials Material interface
@@ -95,8 +101,14 @@ class RVEMaterial(Material):
 
     def _ensure_rves(self, n_qp: int) -> None:
         if self._rves is None:
-            logger.info("RVEMaterial: instantiating %d RVE(s) (one per macro qp)", n_qp)
-            self._rves = [self._rve_factory() for _ in range(n_qp)]
+            logger.info(
+                "RVEMaterial: instantiating %d RVE(s) (one per macro qp)",
+                n_qp, extra={"all_ranks": True},
+            )
+            self._rves = []
+            for i in range(n_qp):
+                with qp_context(i):
+                    self._rves.append(self._rve_factory(self._rank, i))
             self._n_qp = n_qp
         elif n_qp != self._n_qp:
             raise RuntimeError(
@@ -127,19 +139,48 @@ class RVEMaterial(Material):
         P_flat = np.zeros((n_qp, 9), dtype=float)
         A_flat = np.zeros((n_qp, 9, 9), dtype=float)
 
+        local_failure = 0
+        failed_qp = -1
         for i, rve in enumerate(self._rves):
             F_qp = _vec9_to_tensor3(gradients[i])
-            try:
-                out = rve(F_qp)
-            except Exception:
-                logger.exception(
-                    "RVE %d failed for F =\n%s\n(previous F_bar =\n%s)",
-                    i, F_qp, getattr(rve, "F_bar").value,
-                )
-                raise
+            with qp_context(i):
+                try:
+                    out = rve(F_qp)
+                except RVEConvergenceError as exc:
+                    logger.warning(
+                        "RVE did not converge: %s. Step will be rejected collectively.",
+                        exc,
+                    )
+                    local_failure = 1
+                    if failed_qp < 0:
+                        failed_qp = i
+                    P_flat[i] = 0.0
+                    A_flat[i] = np.eye(9)
+                    continue
+                except Exception:
+                    logger.exception(
+                        "RVE failed for F =\n%s\n(previous F_bar =\n%s)",
+                        F_qp, getattr(rve, "F_bar").value,
+                    )
+                    raise
             P_qp, A_qp = out[-1][0], out[-1][1]
             P_flat[i] = _tensor3_to_vec9(P_qp)
             A_flat[i] = _tangent4_to_mat99(A_qp)
+
+        # If any RVE failed on any rank, reject entire macro step by setting very high stress.
+        any_failure = MPI.COMM_WORLD.allreduce(local_failure, op=MPI.LOR)
+        if any_failure:
+            self.step_failed = True
+            if failed_qp >= 0:
+                self.failure_reason = (
+                    f"RVE solve failed (rank {self._rank} "
+                    f"local_failure={bool(local_failure)}, first failed qp={failed_qp})"
+                )
+            else:
+                self.failure_reason = ""
+            
+            # Setting to high value to trigger PETSc-side SNES non-convergence and step rejection.
+            P_flat[:] = 999999999999999
 
         self.data_manager.s1.set_item({"PK1": P_flat})
 
@@ -148,6 +189,18 @@ class RVEMaterial(Material):
             self.data_manager.s1.internal_state_variables,
             A_flat,
         )
+
+    def commit(self) -> None:
+        """Promote every RVE's current ``F_bar`` to its converged restart state.
+
+        Call once from the macro driver after the outer SNES converges *and*
+        the macro time stepper accepts the step.  Calling this after a
+        rejected step would poison each RVE's restart point.
+        """
+        if self._rves is None:
+            return
+        for rve in self._rves:
+            rve.commit()
 
     def constitutive_update(self, F_flat, state, dt):
         # Required by the Material API but unused — we override integrate().

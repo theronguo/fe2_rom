@@ -21,6 +21,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import logging
 import numpy as np
 from mpi4py import MPI
+from petsc4py import PETSc
 
 from dolfinx import fem, mesh
 import ufl
@@ -35,6 +36,7 @@ from fe2_rom.hyperelastic_solver import (
     TimeStepper,
     VTXManager,
     setup_logging,
+    broadcast_logger,
 )
 from fe2_rom.rve_rom.solver import RVESolver
 from fe2_rom.macro_solver import RVEMaterial
@@ -43,15 +45,19 @@ from fe2_rom.macro_solver import RVEMaterial
 comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 logger = logging.getLogger("fe2_rom.macro_solver.example_1")
+logger.addFilter(lambda r: comm.rank == 0)
 
-# Silence the inner RVE chatter — one log line per macro qp per macro Newton
-# iteration adds up fast.  Bump to DEBUG/INFO to inspect inner solves.
-for name in (
+VERBOSE_RVE = False
+_RVE_LOGGERS = (
     "fe2_rom.hyperelastic_solver.solver",
     "fe2_rom.hyperelastic_solver.solvers",
     "fe2_rom.rve_rom.solver",
-):
-    logging.getLogger(name).setLevel(logging.WARNING)
+)
+if VERBOSE_RVE:
+    broadcast_logger(*_RVE_LOGGERS, level=logging.DEBUG)
+else:
+    for name in _RVE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 # ===========================================================================
@@ -73,7 +79,7 @@ mu_micro  = E_micro / (2.0 * (1.0 + nu_micro))
 lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 
 
-def make_rve():
+def make_rve(rank, index):
     """Return a fresh ROM-based periodic RVE on COMM_SELF."""
     return RVESolver(
         mesh_path=RVE_MESH,
@@ -82,19 +88,20 @@ def make_rve():
         comm=MPI.COMM_SELF,
         gdim=3,
         degree=1,
-        output_dir="rve_output",
-        visualize_fields=[],
+        output_dir=f"output/rve_{rank}_{index}",
+        visualize_fields=["u_fluc"],
         average_fields=["P", "A"],
         newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                         "max_iter": 50, "div_rel_tol": 10.0},
         timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-3,
                              "dt_max": 1.0, "good_newton_steps": 5},
+        averages_only_final=True
     )
 
 
-# def make_rve():
+# def make_rve(rank, index):
 #     """Full-order periodic RVE on COMM_SELF.
-#
+
 #     check_stability is disabled in the inner FE² loop: we only need the
 #     response P, A at the given F, and eigenvector perturbations across macro
 #     Newton iterations would make the returned tangent inconsistent.
@@ -105,15 +112,16 @@ def make_rve():
 #         gdim=3,
 #         material=NeoHookean(mu=mu_micro, lmbda=lam_micro),
 #         degree=1,
-#         output_dir="rve_output",
+#         output_dir=f"output/rve_{rank}_{index}",
+#         visualize_fields=["u_fluc"],
 #         check_stability=False,
-#         visualize_fields=[],
 #         average_fields=["P", "A"],
 #         newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
 #                         "max_iter": 25, "switch_to_minres": False},
 #         timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-3,
 #                              "dt_max": 1.0, "good_newton_steps": 5},
 #         save_snapshots=[],
+#         averages_only_final=True,
 #     )
 
 
@@ -122,7 +130,7 @@ def make_rve():
 # ===========================================================================
 # 2×2×2 = 8 hex cells: parallelisable up to 8 MPI ranks (ParMETIS needs
 # n_cells ≥ mpi_size to partition; a 1×1×1 mesh crashes under mpirun).
-domain = mesh.create_unit_cube(comm, 2, 2, 2, cell_type=mesh.CellType.hexahedron)
+domain = mesh.create_unit_cube(comm, 4, 4, 4, cell_type=mesh.CellType.hexahedron, ghost_mode=mesh.GhostMode.none)
 
 V = fem.functionspace(domain, ("Lagrange", 1, (3,)))
 u  = fem.Function(V, name="displacement")
@@ -136,21 +144,21 @@ v  = ufl.TestFunction(V)
 fdim = domain.topology.dim - 1
 domain.topology.create_connectivity(fdim, domain.topology.dim)
 
-x0_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[0], 0.0))
-x1_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[0], 1.0))
+x0_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[2], 0.0))
+x1_facets = mesh.locate_entities_boundary(domain, fdim, lambda x: np.isclose(x[2], 1.0))
 
-bc_left = fem.dirichletbc(
+bc_bot = fem.dirichletbc(
     np.zeros(3, dtype=np.float64),
     fem.locate_dofs_topological(V, fdim, x0_facets),
     V,
 )
 
-V_x, _ = V.sub(0).collapse()
-disp_fn = fem.Function(V_x)
-right_x_dofs = fem.locate_dofs_topological((V.sub(0), V_x), fdim, x1_facets)
-bc_right = fem.dirichletbc(disp_fn, right_x_dofs, V.sub(0))
+V_z, _ = V.sub(2).collapse()
+disp_fn = fem.Function(V_z)
+right_x_dofs = fem.locate_dofs_topological((V.sub(2), V_z), fdim, x1_facets)
+bc_top = fem.dirichletbc(disp_fn, right_x_dofs, V.sub(2))
 
-bcs = [bc_left, bc_right]
+bcs = [bc_bot, bc_top]
 
 
 # ===========================================================================
@@ -194,7 +202,7 @@ problem = NonlinearMaterialProblem(
 # ===========================================================================
 # OUTPUT — BP4 time series (open in ParaView 5.11+ via the ADIOS2 reader)
 # ===========================================================================
-output_dir = "macro_output2"
+output_dir = "output"
 os.makedirs(output_dir, exist_ok=True)
 vtx = VTXManager(comm, os.path.join(output_dir, "macro.bp"), [u])
 
@@ -209,7 +217,7 @@ vtx = VTXManager(comm, os.path.join(output_dir, "macro.bp"), [u])
 # from wherever it currently sits, which is fine for path-independent
 # constitutive laws since each RVE call solves to equilibrium at the target F.
 # ===========================================================================
-disp_total = -0.05   # 5 % uniaxial compression
+disp_total = -0.25   # 25 % uniaxial compression
 timestepper = TimeStepper(
     t_end=1.0, dt_init=0.2, dt_min=1e-3, dt_max=0.2, good_newton_steps=5,
 )
@@ -224,14 +232,24 @@ try:
 
         disp_fn.x.array[:] = disp_total * trial_t
 
-        problem.solve()
-        reason  = problem.solver.getConvergedReason()
-        n_iters = problem.solver.getIterationNumber()
+        material.step_failed = False
+        material.failure_reason = ""
+        try:
+            problem.solve()
+            reason  = problem.solver.getConvergedReason()
+            n_iters = problem.solver.getIterationNumber()
+        except PETSc.Error as exc:
+            reason, n_iters = -1, 0
+
+        if material.step_failed:
+            logger.warning("%s", material.failure_reason)
+            reason = -1
 
         if reason > 0:
             timestepper.accept(n_iters)
             u_last.x.array[:] = u.x.array
             u_last.x.scatter_forward()
+            material.commit()
             logger.info(
                 "   SNES converged in %d iteration(s)  disp=%+.6f",
                 n_iters, disp_total * trial_t,
@@ -248,8 +266,8 @@ try:
                 )
                 break
             logger.warning(
-                "SNES did not converge (reason=%d) — halving dt to %.2e",
-                reason, timestepper.dt,
+                "SNES did not converge in %d iteration(s) (reason=%d) — halving dt to %.2e",
+                n_iters, reason, timestepper.dt,
             )
 finally:
     vtx.close()
