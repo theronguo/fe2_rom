@@ -204,8 +204,9 @@ class HyperelasticStabilitySolver:
                 converged, iter_newton = self._newton.solve(iter_start=iter_newton)
 
                 if converged:
-                    K = self._newton.assemble_stiffness()
                     if self._stability is not None:
+                        K = self._newton.assemble_stiffness()
+                        # _stability.check() takes ownership of K and destroys it.
                         is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
                     else:
                         is_stable, eigenvalues = True, np.array([])
@@ -794,8 +795,10 @@ class PeriodicHyperelasticHomogenizationSolver:
                 converged, iter_newton = self._newton.solve(iter_start=iter_newton)
 
                 if converged:
-                    K = self._newton.assemble_stiffness()
                     if self._stability is not None:
+                        K = self._newton.assemble_stiffness()
+                        # _stability.check() takes ownership of K (its finally
+                        # block always destroys K, even on internal failure).
                         try:
                             is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
                         except (PETSc.Error, SystemError):
