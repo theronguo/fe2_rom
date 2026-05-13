@@ -7,6 +7,7 @@ import numpy as np
 import scipy
 
 from ..hyperelastic_solver import NeoHookean, VTXManager, TimeStepper, setup_logging, silence_c_stdout
+from ..hyperelastic_solver.exceptions import RVEConvergenceError
 from dolfinx import io, fem, mesh as dmesh
 from mpi4py import MPI
 from petsc4py import PETSc
@@ -40,6 +41,7 @@ class RVESolver:
         average_fields: list[str] | None = None,
         newton_options: dict | None = None,
         timestepper_options: dict | None = None,
+        averages_only_final: bool = False,
     ) -> None:
         newton_options = newton_options if newton_options is not None else {
             "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 50, "div_rel_tol": 10.0,
@@ -57,6 +59,11 @@ class RVESolver:
         self.average_fields = average_fields
         self._newton_options = newton_options
         self._timestepper = TimeStepper(**timestepper_options)
+        # If True, ``__call__`` returns only the final converged step's
+        # averages — intermediate ramp steps skip the (expensive) tangent /
+        # PK1 reductions.  Useful for FE² inner solves where only the
+        # endpoint matters.
+        self._averages_only_final = averages_only_final
 
         # --- ROM data ---
         indices          = np.load(os.path.join(rom_dir, "indices.npy"))
@@ -64,7 +71,7 @@ class RVESolver:
         omega_sub        = np.load(os.path.join(rom_dir, "omega_sub.npy"))
         self.basis_u     = np.load(os.path.join(rom_dir, "basis_u.npy"))
         self.N = self.basis_u_sub.shape[1]
-        logger.info("ROM data loaded: N=%d modes", self.N)
+        logger.debug("ROM data loaded: N=%d modes", self.N)
 
         # --- Mesh & submesh ---
         # (no cell/facet tags in ROM — mesh is only used to build the full-DOF output function)
@@ -91,6 +98,9 @@ class RVESolver:
 
         # --- Kinematics & constitutive ---
         self.F_bar = fem.Constant(submesh, np.eye(gdim, dtype=PETSc.ScalarType))
+        # Last *converged* F_bar — updated only when ``__call__`` completes
+        # the full ramp.  ``F_bar`` may hold a failed trial value.
+        self.F_bar_conv = np.eye(gdim, dtype=PETSc.ScalarType)
         F_ufl = ufl.variable(self.F_bar + ufl.grad(self.u_fluc))
         self._P_ufl = material.first_pk_stress(F_ufl)
         self.A_ufl = material.tangent_moduli(F_ufl)
@@ -107,7 +117,7 @@ class RVESolver:
 
         # ECM weights approximate full-domain integrals, so this gives the full volume.
         self._vol = fem.assemble_scalar(fem.form(1.0 * self._omega_func * self._dx_sub))
-        logger.info("Effective domain volume (ECM): %.6f", self._vol)
+        logger.debug("Effective domain volume (ECM): %.6f", self._vol)
 
         if "P" in average_fields:
             self._P_avg_forms = [
@@ -139,11 +149,15 @@ class RVESolver:
             self._D_forms = None
             self._A_avg_forms = None
 
-        # warm-started ROM coefficients (persist across __call__ invocations)
+        # warm-started ROM coefficients (persist across __call__ invocations).
+        # ``coeffs`` is the *trial* state — mutated mid-Newton, may hold a
+        # value from an outer iteration the macro SNES later rejects.
+        # ``coeffs_conv`` mirrors ``F_bar_conv``: only updated on ``commit()``.
         self.coeffs = np.zeros(self.N)
+        self.coeffs_conv = np.zeros(self.N)
 
-        logger.info("Newton solver initialized with options: %s", newton_options)
-        logger.info("Time stepper initialized with options: %s", timestepper_options)
+        logger.debug("Newton solver initialized with options: %s", newton_options)
+        logger.debug("Time stepper initialized with options: %s", timestepper_options)
 
         # --- Visualization ---
         self._u_total_expr = None
@@ -165,9 +179,9 @@ class RVESolver:
             self.vtx = VTXManager(comm, os.path.join(output_dir, "solution.bp"), fields)
         else:
             self.vtx = None
-        logger.info("Visualization fields: %s", visualize_fields)
-        logger.info("Averaging fields: %s", average_fields)
-        logger.info("Setup complete")
+        logger.debug("Visualization fields: %s", visualize_fields)
+        logger.debug("Averaging fields: %s", average_fields)
+        logger.debug("Setup complete")
 
     # --- State management ---
 
@@ -378,12 +392,21 @@ class RVESolver:
         abs_tol  = self._newton_options["abs_tol"]
         max_iter = self._newton_options["max_iter"]
 
-        Fbar_prev = self.F_bar.value.copy()
+        # Restart the ramp from the last *committed* state — a previous
+        # call (or earlier macro Newton iter) may have left F_bar, coeffs,
+        # and u_fluc at a trial value the outer SNES eventually rejected.
+        # ``_restore_state`` rebuilds ``u_fluc`` from coeffs so the compiled
+        # forms see a consistent state on the first residual eval.
+        Fbar_prev = self.F_bar_conv.copy()
+        self.F_bar.value[:] = Fbar_prev
+        self._restore_state(self.coeffs_conv)
         def load_schedule(t: float) -> None:
             self.F_bar.value[:] = Fbar_prev + t * (Fbar - Fbar_prev)
 
         self._write_fields(plot_time_start)
-        output_quantities = [self._collect_averages()]
+        output_quantities = (
+            [] if self._averages_only_final else [self._collect_averages()]
+        )
 
         self._timestepper.reset()
         while not self._timestepper.finished:
@@ -401,14 +424,20 @@ class RVESolver:
                 logger.debug("  reason: %s", e)
                 if not ok:
                     logger.error("Minimum time step dt=%.2e reached — stopping.", self._timestepper.dt_min)
-                    break
+                    raise RVEConvergenceError(
+                        f"RVE timestepper hit dt_min={self._timestepper.dt_min:.2e} "
+                        f"at t={self._timestepper.t_current:.4f} (F_bar={self.F_bar.value!r})"
+                    )
                 logger.warning("Newton did not converge — halving dt to %.2e", self._timestepper.dt)
                 continue
 
             self._timestepper.accept(n_iters)
-            quantities = self._collect_averages()
-            output_quantities.append(quantities)
+            if not self._averages_only_final:
+                output_quantities.append(self._collect_averages())
             self._write_fields(self._timestepper.t_current + plot_time_start)
+
+        if self._averages_only_final:
+            output_quantities.append(self._collect_averages())
 
         if check_tangent and self._timestepper.finished:
             logger.info("Running FD tangent check at final state F_bar = %s", self.F_bar.value)
@@ -416,6 +445,14 @@ class RVESolver:
             self._fd_check_tangent_moduli(Fbar, A_conv)
 
         return output_quantities
+
+    def commit(self) -> None:
+        """Promote trial state (F_bar, coeffs) to the converged restart point.
+
+        Call from the macro driver after a successful outer time step only.
+        """
+        self.F_bar_conv[:] = self.F_bar.value
+        self.coeffs_conv[:] = self.coeffs
 
     def _collect_averages(self) -> list:
         result = []

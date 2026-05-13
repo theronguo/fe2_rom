@@ -11,6 +11,7 @@ import dolfinx_mpc
 
 from .boundary import ReactionProbe
 from .forms import build_homogenization_weak_form, build_weak_forms
+from .exceptions import RVEConvergenceError
 from .logging_utils import silence_c_stdout
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
@@ -397,6 +398,7 @@ class PeriodicHyperelasticHomogenizationSolver:
                  newton_options: dict | None = None,
                  timestepper_options: dict | None = None,
                  save_snapshots: list[str] | None = None,
+                 averages_only_final: bool = False,
                  ) -> None:
         
         ### Default Newton, Timestepper, Visualization, Averaging options ###
@@ -429,16 +431,22 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         self.mins, self.maxs = self._compute_domain_bounds()
         self.length_scale = (self.maxs - self.mins).max()
-        logger.info("Mesh loaded: %d cells, %d facets, gdim=%d",
+        logger.debug("Mesh loaded: %d cells, %d facets, gdim=%d",
                     self._mesh.topology.index_map(self._mesh.topology.dim).size_global,
                     self._mesh.topology.index_map(self._mesh.topology.dim - 1).size_global,
                     gdim,
         )
-        logger.info("Domain bounds: x_min=%.3f  x_max=%.3f", self.mins[0], self.maxs[0])
-        logger.info("Domain bounds: y_min=%.3f  y_max=%.3f", self.mins[1], self.maxs[1])
+        logger.debug("Domain bounds: x_min=%.3f  x_max=%.3f", self.mins[0], self.maxs[0])
+        logger.debug("Domain bounds: y_min=%.3f  y_max=%.3f", self.mins[1], self.maxs[1])
         if gdim == 3:
-            logger.info("Domain bounds: z_min=%.3f  z_max=%.3f", self.mins[2], self.maxs[2])
+            logger.debug("Domain bounds: z_min=%.3f  z_max=%.3f", self.mins[2], self.maxs[2])
         
+        # If True, ``__call__`` runs the (expensive) effective-quantity
+        # reductions only at the final converged endpoint of the F_bar ramp.
+        # Intermediate accepted steps still solve Newton + (optional)
+        # stability, but ``output_quantities`` only contains the final entry.
+        self._averages_only_final = averages_only_final
+
         ### Material model ###
         self._material = material
         
@@ -448,25 +456,31 @@ class PeriodicHyperelasticHomogenizationSolver:
         n_dofs = self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs
         
         self.u = fem.Function(self.V)
-        self._u_last = fem.Function(self.V)
+        self._u_last = fem.Function(self.V)   # within-call revert (per-step)
+        self._u_conv = fem.Function(self.V)   # cross-call commit point
         self._du = fem.Function(self.V)
         self._eigenfunction = fem.Function(self.V)
         self.F_bar = fem.Constant(self._mesh, np.eye(self.gdim, dtype=PETSc.ScalarType))
-        logger.info("Functions set up with %d global DOFs", n_dofs)
+        # Last *converged* F_bar.  ``F_bar`` itself tracks the trial state
+        # (possibly mid-ramp / failed); ``F_bar_conv`` and ``_u_conv`` are
+        # updated only on ``commit()`` and are the canonical restart point
+        # for the next call.
+        self.F_bar_conv = np.eye(self.gdim, dtype=PETSc.ScalarType)
+        logger.debug("Functions set up with %d global DOFs", n_dofs)
 
         ### Periodic BCs ###
         bcs, mpc = self._setup_periodic_bcs_and_mpc()
         self.mpc = mpc
         self._bcs = bcs
-        logger.info("Periodic BCs set up with %d slave points", self.comm.allreduce(len(mpc.slaves), op=MPI.SUM))
+        logger.debug("Periodic BCs set up with %d slave points", self.comm.allreduce(len(mpc.slaves), op=MPI.SUM))
         
         ### Stability analyzer (optional) ###
         if check_stability:
             self._stability = StabilityAnalyzer(self.comm, **stability_options)
-            logger.info("Stability checks enabled with options: %s", stability_options)
+            logger.debug("Stability checks enabled with options: %s", stability_options)
             if "switch_to_minres" in newton_options:
                 if newton_options["switch_to_minres"] is False:
-                    logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
+                    logger.debug("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
             newton_options["switch_to_minres"] = True
         else:
             self._stability = None
@@ -479,11 +493,11 @@ class PeriodicHyperelasticHomogenizationSolver:
             self.comm, R_form, J_form, Jij_forms, self.u, self._du, bcs, self.mpc,
             **newton_options,
         )
-        logger.info("Newton solver initialized with options: %s", newton_options)
+        logger.debug("Newton solver initialized with options: %s", newton_options)
 
         ### Time stepper ###
         self._timestepper = TimeStepper(**timestepper_options)
-        logger.info("Time stepper initialized with options: %s", timestepper_options)
+        logger.debug("Time stepper initialized with options: %s", timestepper_options)
         
         ### Visualization setup ###
         fields = []
@@ -518,7 +532,8 @@ class PeriodicHyperelasticHomogenizationSolver:
             self.vtx = VTXManager(self.comm, f"{output_dir}/solution.bp", fields)
         else:
             self.vtx = None
-        logger.info("Visualization fields: %s", visualize_fields)
+        self.visualize_fields = visualize_fields
+        logger.debug("Visualization fields: %s", visualize_fields)
 
         # Averaging setup
         self.average_fields = average_fields
@@ -528,13 +543,13 @@ class PeriodicHyperelasticHomogenizationSolver:
             self._W_ufl = W_ufl
         if "A" in average_fields:
             self._A_ufl = A_ufl
-        logger.info("Averaging fields: %s", average_fields)
+        logger.debug("Averaging fields: %s", average_fields)
 
         # Snapshot saving setup
         self.output_dir = output_dir
         self.save_snapshots = save_snapshots
-        logger.info("Saving snapshots for fields: %s", save_snapshots)
-        logger.info("Setup complete")
+        logger.debug("Saving snapshots for fields: %s", save_snapshots)
+        logger.debug("Setup complete")
 
     def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
         """Return global min/max coordinates along each geometric axis."""
@@ -628,12 +643,19 @@ class PeriodicHyperelasticHomogenizationSolver:
 
     def _write_fields(self, t: float) -> None:
         if self.vtx is not None:
-            self.u_int.interpolate(self.u)
-            self.u_total.interpolate(self._u_total_expr)
-            self.F_func.interpolate(self._F_expr)
-            self.P_func.interpolate(self._P_expr)
-            self.J_func.interpolate(self._J_expr)
-            self.W_func.interpolate(self._W_expr)
+            for field in self.visualize_fields:
+                if field == "u_fluc":
+                    self.u_int.interpolate(self.u)
+                elif field == "u_total":
+                    self.u_total.interpolate(self._u_total_expr)
+                elif field == "F":
+                    self.F_func.interpolate(self._F_expr)
+                elif field == "P":
+                    self.P_func.interpolate(self._P_expr)
+                elif field == "J":
+                    self.J_func.interpolate(self._J_expr)
+                elif field == "W":
+                    self.W_func.interpolate(self._W_expr)
             self.vtx.write(t)
         else:
             logger.warning("No fields to write at t=%.5f (vtx is None)", t)
@@ -735,7 +757,13 @@ class PeriodicHyperelasticHomogenizationSolver:
         """
         assert self._newton is not None, "Call setup() before run()"
         
-        Fbar_prev = self.F_bar.value.copy()  # Store initial F_bar for ramping
+        # Restart from the last *committed* state — F_bar and the
+        # displacement may have been left at a trial value the outer macro
+        # SNES rejected.
+        Fbar_prev = self.F_bar_conv.copy()
+        self.F_bar.value[:] = Fbar_prev
+        self.u.x.array[:] = self._u_conv.x.array
+        self.u.x.scatter_forward()
         def load_schedule(t: float) -> None:
             for i in range(Fbar.shape[0]):
                 for j in range(Fbar.shape[1]):
@@ -745,24 +773,11 @@ class PeriodicHyperelasticHomogenizationSolver:
         if self.vtx is not None:
             self._write_fields(0.0+plot_time_start)
 
-        # first step
         output_quantities = []
-        quantities = []
-        for quantity in self.average_fields:
-            if quantity == "F":
-                quantities.append(self.F_bar.value.copy())
-            elif quantity == "W":
-                Weff = self.compute_effective_strain_energy_density()
-                quantities.append(Weff)
-            elif quantity == "P":
-                Peff = self.compute_average_first_pk_stress()
-                quantities.append(Peff.copy())
-            elif quantity == "A":
-                Aeff = self.compute_effective_tangent_moduli()
-                quantities.append(Aeff.copy())
-        output_quantities.append(quantities)
+        if not self._averages_only_final:
+            # initial-state snapshot
+            output_quantities.append(self._collect_averages())
 
-        simulation_finished = False
         self._timestepper.reset()
         while not self._timestepper.finished:
             trial_time = self._timestepper.step_forward()
@@ -783,15 +798,20 @@ class PeriodicHyperelasticHomogenizationSolver:
                     if self._stability is not None:
                         try:
                             is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
-                        except PETSc.Error as e:
-                            logger.error("Stability check failed: %s", e)
+                        except (PETSc.Error, SystemError):
+                            logger.error("Stability check failed.")
                             ok = self._timestepper.reject()
                             if not ok:
                                 logger.error(
                                     "Minimum time step dt=%.2e reached — stopping.",
                                     self._timestepper.dt_min,
                                 )
-                                simulation_finished = True
+                                u.x.array[:] = self._u_last.x.array[:]
+                                u.x.scatter_forward()
+                                raise RVEConvergenceError(
+                                    f"Stability check failed and dt_min={self._timestepper.dt_min:.2e} "
+                                    f"reached at t={self._timestepper.t_current:.4f}"
+                                )
                             else:
                                 logger.warning(
                                     "Eigensolver crashed — halving dt to %.2e",
@@ -819,20 +839,8 @@ class PeriodicHyperelasticHomogenizationSolver:
                         self._u_last.x.array[:] = u.x.array[:]
                         self._u_last.x.scatter_forward()
 
-                        quantities = []
-                        for quantity in self.average_fields:
-                            if quantity == "F":
-                                quantities.append(self.F_bar.value.copy())
-                            elif quantity == "W":
-                                Weff = self.compute_effective_strain_energy_density()
-                                quantities.append(Weff)
-                            elif quantity == "P":
-                                Peff = self.compute_average_first_pk_stress()
-                                quantities.append(Peff.copy())
-                            elif quantity == "A":
-                                Aeff = self.compute_effective_tangent_moduli()
-                                quantities.append(Aeff.copy())
-                        output_quantities.append(quantities)
+                        if not self._averages_only_final:
+                            output_quantities.append(self._collect_averages())
 
                         t_save = self._timestepper.t_current+plot_time_start
                         if self.vtx is not None:
@@ -853,7 +861,10 @@ class PeriodicHyperelasticHomogenizationSolver:
                         logger.error(
                             "Minimum time step dt=%.2e reached — stopping.", self._timestepper.dt_min
                         )
-                        simulation_finished = True
+                        raise RVEConvergenceError(
+                            f"Newton did not converge and dt_min={self._timestepper.dt_min:.2e} "
+                            f"reached at t={self._timestepper.t_current:.4f}"
+                        )
                     else:
                         logger.warning(
                             "Newton did not converge — halving dt to %.2e", self._timestepper.dt
@@ -862,7 +873,32 @@ class PeriodicHyperelasticHomogenizationSolver:
                     u.x.scatter_forward()
                     break
 
-            if simulation_finished:
-                break
+        if self._averages_only_final:
+            output_quantities.append(self._collect_averages())
 
         return output_quantities
+
+    def commit(self) -> None:
+        """Promote trial state (F_bar, u) to the converged restart point.
+
+        Call once from the macro driver after a successful outer time step.
+        Calling it after a *failed* macro step would poison the restart, so
+        the inner ``__call__`` never does this automatically.
+        """
+        self.F_bar_conv[:] = self.F_bar.value
+        self._u_conv.x.array[:] = self.u.x.array
+        self._u_conv.x.scatter_forward()
+
+    def _collect_averages(self) -> list:
+        """Snapshot all configured ``average_fields`` at the current state."""
+        quantities = []
+        for quantity in self.average_fields:
+            if quantity == "F":
+                quantities.append(self.F_bar.value.copy())
+            elif quantity == "W":
+                quantities.append(self.compute_effective_strain_energy_density())
+            elif quantity == "P":
+                quantities.append(self.compute_average_first_pk_stress().copy())
+            elif quantity == "A":
+                quantities.append(self.compute_effective_tangent_moduli().copy())
+        return quantities

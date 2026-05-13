@@ -61,11 +61,11 @@ class StabilityAnalyzer:
         # Shift-invert needs to factor (K - σ·I) once per call. Use MUMPS LDLᵀ:
         # symmetric, handles indefinite K via pivoting, ~3–5× faster than the
         # PETSc-builtin LU that SLEPc otherwise picks.
-        st_ksp = st.getKSP()
-        st_ksp.setType("preonly")
-        st_pc = st_ksp.getPC()
-        st_pc.setType("cholesky")
-        st_pc.setFactorSolverType("mumps")
+        # st_ksp = st.getKSP()
+        # st_ksp.setType("preonly")
+        # st_pc = st_ksp.getPC()
+        # st_pc.setType("cholesky")
+        # st_pc.setFactorSolverType("mumps")
         eigensolver.setTarget(0.0)
         eigensolver.setDimensions(nev=self._nev)
         eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)

@@ -6,7 +6,8 @@ from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 from .output import VTXManager, ReactionForceLogger
 from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
-from .logging_utils import setup_logging, silence_c_stdout
+from .logging_utils import setup_logging, silence_c_stdout, broadcast_logger, qp_context
+from .exceptions import RVEConvergenceError
 
 __all__ = [
     "MaterialModel", "NeoHookean", "LambdaMaterial",
@@ -17,5 +18,6 @@ __all__ = [
     "TimeStepper",
     "VTXManager", "ReactionForceLogger",
     "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
-    "setup_logging", "silence_c_stdout",
+    "setup_logging", "silence_c_stdout", "broadcast_logger", "qp_context",
+    "RVEConvergenceError",
 ]
