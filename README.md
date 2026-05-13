@@ -56,6 +56,15 @@ mamba activate fe2_rom_env
 pip install -e .
 ```
 
+The FE² macro solver (`fe2_rom.macro_solver`) additionally requires
+[`dolfinx_materials`](https://github.com/bleyerj/dolfinx_materials), which is
+not on PyPI. Clone it alongside this repo and install:
+
+```bash
+git clone https://github.com/bleyerj/dolfinx_materials
+pip install dolfinx_materials/ --user
+```
+
 A `Dockerfile` and `Singularity.def` are also included for containerised
 deployments (HPC, CI, reproducible runs).
 

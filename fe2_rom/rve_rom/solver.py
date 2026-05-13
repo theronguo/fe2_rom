@@ -6,7 +6,7 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 import scipy
 
-from ..hyperelastic_solver import NeoHookean, VTXManager, TimeStepper, setup_logging
+from ..hyperelastic_solver import NeoHookean, VTXManager, TimeStepper, setup_logging, silence_c_stdout
 from dolfinx import io, fem, mesh as dmesh
 from mpi4py import MPI
 from petsc4py import PETSc
@@ -68,7 +68,8 @@ class RVESolver:
 
         # --- Mesh & submesh ---
         # (no cell/facet tags in ROM — mesh is only used to build the full-DOF output function)
-        mesh = io.gmsh.read_from_msh(mesh_path, comm, 0, gdim=gdim).mesh
+        with silence_c_stdout():
+            mesh = io.gmsh.read_from_msh(mesh_path, comm, 0, gdim=gdim).mesh
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
         tdim = mesh.topology.dim
         submesh, _, _, _ = dmesh.create_submesh(mesh, tdim, indices)

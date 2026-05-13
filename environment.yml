@@ -1,4 +1,4 @@
-name: fe2_rom_env_new
+name: fe2_rom_env
 channels:
   - conda-forge
 dependencies:
@@ -14,3 +14,5 @@ dependencies:
     - tqdm==4.67.3
     - meshio==5.3.5
     - scikit-learn==1.8.0
+    - jax==0.10.0
+    - jaxmat==0.0.3

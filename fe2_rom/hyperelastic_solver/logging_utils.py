@@ -1,4 +1,6 @@
+import contextlib
 import logging
+import os
 import sys
 import warnings
 
@@ -42,3 +44,25 @@ def setup_logging(comm, level: int = logging.INFO) -> None:
         message="mpi4py.MPI.Session size changed",
         category=RuntimeWarning,
     )
+
+
+@contextlib.contextmanager
+def silence_c_stdout():
+    """Silence file-descriptor-1 output for the duration of the context.
+
+    Python's ``contextlib.redirect_stdout`` only intercepts ``sys.stdout``
+    writes — it doesn't touch the underlying file descriptor.  Native code
+    (gmsh, MUMPS, ParMETIS, …) writes directly to fd 1 and bypasses Python,
+    so we redirect fd 1 itself to /dev/null instead.
+    """
+    sys.stdout.flush()
+    saved_fd = os.dup(1)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 1)
+        yield
+    finally:
+        sys.stdout.flush()
+        os.dup2(saved_fd, 1)
+        os.close(devnull)
+        os.close(saved_fd)

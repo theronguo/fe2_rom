@@ -6,7 +6,7 @@ from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
 from .output import VTXManager, ReactionForceLogger
 from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
-from .logging_utils import setup_logging
+from .logging_utils import setup_logging, silence_c_stdout
 
 __all__ = [
     "MaterialModel", "NeoHookean", "LambdaMaterial",
@@ -17,5 +17,5 @@ __all__ = [
     "TimeStepper",
     "VTXManager", "ReactionForceLogger",
     "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
-    "setup_logging",
+    "setup_logging", "silence_c_stdout",
 ]

@@ -11,6 +11,7 @@ import dolfinx_mpc
 
 from .boundary import ReactionProbe
 from .forms import build_homogenization_weak_form, build_weak_forms
+from .logging_utils import silence_c_stdout
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
 from .solvers import CylindricalArcLength, NewtonSolver, NewtonSolverFE2
@@ -417,7 +418,8 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         ### Read mesh ###
         self.comm = comm
-        mesh_data = io.gmsh.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
+        with silence_c_stdout():
+            mesh_data = io.gmsh.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
         self._mesh = mesh_data.mesh
         self._cell_tags = mesh_data.cell_tags
         self._facet_tags = mesh_data.facet_tags
@@ -466,6 +468,8 @@ class PeriodicHyperelasticHomogenizationSolver:
                 if newton_options["switch_to_minres"] is False:
                     logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
             newton_options["switch_to_minres"] = True
+        else:
+            self._stability = None
 
         ### Newton solver ###
         R_form, J_form, Jij_forms, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total = build_homogenization_weak_form(
