@@ -25,6 +25,7 @@ from fe2_rom.hyperelastic_solver import (
     TimeStepper,
     ReactionForceLogger,
     setup_logging,
+    broadcast_logger,
 )
 from fe2_rom.macro_solver import MacroSolver
 
@@ -34,17 +35,24 @@ comm = MPI.COMM_WORLD
 setup_logging(comm, level=logging.INFO)
 logger = logging.getLogger("fe2_rom.macro_solver.example_1")
 logger.addFilter(lambda r: comm.rank == 0)
-for name in (
+
+VERBOSE_RVE = False  # set True to see per-qp Newton/stability output
+_RVE_LOGGERS = (
     "fe2_rom.hyperelastic_solver.solver",
     "fe2_rom.hyperelastic_solver.solvers",
+    "fe2_rom.hyperelastic_solver.stability",
     "fe2_rom.rve_rom.solver",
-):
-    logging.getLogger(name).setLevel(logging.ERROR)
+)
+if VERBOSE_RVE:
+    broadcast_logger(*_RVE_LOGGERS, level=logging.DEBUG)
+else:
+    for name in _RVE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.ERROR)
 
 
 # --- Macro mesh: single hex on [0,1]^3 --------------------------------------
 domain = dmesh.create_unit_cube(
-    comm, 2, 2, 4,
+    comm, 1, 1, 1,
     cell_type=dmesh.CellType.hexahedron,
     ghost_mode=dmesh.GhostMode.none,
 )
@@ -52,8 +60,7 @@ domain = dmesh.create_unit_cube(
 
 # --- RVE setup (matches legacy run_macro.py) --------------------------------
 HERE = os.path.dirname(__file__)
-RVE_MESH = os.path.join(HERE, "..", "..", "periodic_solver", "example_2", "mesh.msh")
-ROM_DIR  = os.path.join(HERE, "..", "..", "periodic_solver", "example_2", "ecm")
+RVE_MESH = os.path.join(HERE, "mesh.msh")
 
 E_micro, nu_micro = 3000.0, 0.30
 mu_micro  = E_micro / (2.0 * (1.0 + nu_micro))
@@ -63,18 +70,18 @@ lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 # --- Macro solver -----------------------------------------------------------
 solver = MacroSolver(
     mesh=domain,
-    full=False,
-    n_qp=2,
+    full=True,
+    n_qp=1,
     rve_mesh_path=RVE_MESH,
     rve_material=NeoHookean(mu=mu_micro, lmbda=lam_micro),
-    rom_dir=ROM_DIR,
+    rve_check_stability=True,
     gdim=3,
     rve_degree=1,
     rve_output_dir="output",
     rve_visualize_fields=[""],
     rve_average_fields=["P", "A"],
     rve_newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
-                        "max_iter": 50, "div_rel_tol": 10.0},
+                        "max_iter": 50},
     rve_timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-3,
                              "dt_max": 1.0, "good_newton_steps": 5},
     rve_averages_only_final=True,
@@ -95,12 +102,12 @@ solver.setup()
 
 
 # --- Load history & time stepper --------------------------------------------
-disp_total = -0.25  # 25 % uniaxial compression
+disp_total = -0.05  # 25 % uniaxial compression
 def loadhistory(t):
     disp.value = disp_total * t
 
 timestepper = TimeStepper(
-    t_end=1.0, dt_init=0.05, dt_min=1e-3, dt_max=0.05, good_newton_steps=5,
+    t_end=1.0, dt_init=1.0, dt_min=1e-3, dt_max=1.0, good_newton_steps=5,
 )
 reaction_logger = ReactionForceLogger()
 
