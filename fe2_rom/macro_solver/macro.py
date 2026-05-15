@@ -402,8 +402,27 @@ class MacroSolver:
                     if self._stability is not None:
                         K = fem.petsc.assemble_matrix(self._Jac_form, bcs=self._bcs)
                         K.assemble()
-                        is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
-                        # StabilityAnalyzer.check destroys K internally.
+                        try:
+                            is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                            # StabilityAnalyzer.check destroys K internally.
+                        except (PETSc.Error, SystemError):
+                            logger.error("Stability check failed.")
+                            ok = timestepper.reject()
+                            u.x.array[:] = self._u_last.x.array
+                            u.x.scatter_forward()
+                            if not ok:
+                                logger.error(
+                                    "Minimum time step dt=%.2e reached — stopping.",
+                                    timestepper.dt_min,
+                                )
+                                simulation_finished = True
+                            else:
+                                logger.warning(
+                                    "SNES did not converge in %d iter (reason=%d) "
+                                    "— halving dt to %.2e",
+                                    n_iters, reason, timestepper.dt,
+                                )
+                            break
                     else:
                         is_stable, eigenvalues = True, np.array([])
 
