@@ -11,4 +11,4 @@ license = { file = "LICENSE" }
 authors = [{ name = "Theron Guo" }]
 
 [tool.setuptools]
-packages = ["fe2_rom", "fe2_rom.hyperelastic_solver", "fe2_rom.rve_rom"]
+packages = ["fe2_rom", "fe2_rom.hyperelastic_solver", "fe2_rom.rve_rom", "fe2_rom.macro_solver"]

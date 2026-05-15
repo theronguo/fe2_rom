@@ -35,6 +35,7 @@ class NewtonSolver:
 
     def __init__(self, comm, R_form, J_form, u, du, bcs, mpc=None, *,
                  rel_tol=1e-8, abs_tol=1e-6, max_iter=10, max_iter_instab=30,
+                 div_rel_tol=10.0,
                  petsc_options: dict | None = None,
                  switch_to_minres=False,
                  ):
@@ -48,6 +49,7 @@ class NewtonSolver:
         self._abs_tol = abs_tol
         self._max_iter = max_iter
         self._max_iter_instab = max_iter_instab
+        self._div_rel_tol = div_rel_tol
         self._petsc_options = petsc_options
         self._switch_to_minres = switch_to_minres
         self.mpc = mpc
@@ -114,10 +116,10 @@ class NewtonSolver:
                                           x0=[self._u.x.petsc_vec], scale=-1.0)
             else:
                 residual = fem_petsc.assemble_vector(self._R_form)
-                fem.apply_lifting(residual, [self._J_form], [self._bcs],
-                                  x0=[self._u.x.petsc_vec], alpha=-1.0)
+                fem_petsc.apply_lifting(residual, [self._J_form], [self._bcs],
+                                        x0=[self._u.x.petsc_vec], alpha=-1.0)
             residual.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-            fem.set_bc(residual, self._bcs, x0=self._u.x.petsc_vec, scale=-1.0)
+            fem_petsc.set_bc(residual, self._bcs, x0=self._u.x.petsc_vec, alpha=-1.0)
 
             abs_b_norm = residual.norm()
             if iter_newton == 0:
@@ -135,7 +137,7 @@ class NewtonSolver:
                 is_converged = True
                 break
 
-            if rel > 10 or np.isnan(abs_b_norm):
+            if rel > self._div_rel_tol or np.isnan(abs_b_norm):
                 PETSc.Vec.destroy(residual)
                 break
             
@@ -228,9 +230,9 @@ class NewtonSolverFE2(NewtonSolver):
                     dolfinx_mpc.apply_lifting(rhs, [self._J_form], [self._bcs], self.mpc)
                 else:
                     rhs = fem_petsc.assemble_vector(rhs_form)
-                    fem.apply_lifting(rhs, [self._J_form], [self._bcs])
+                    fem_petsc.apply_lifting(rhs, [self._J_form], [self._bcs])
                 rhs.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-                fem.set_bc(rhs, self._bcs)
+                fem_petsc.set_bc(rhs, self._bcs)
 
                 ksp.solve(rhs, self._du.x.petsc_vec)
                 self._du.x.petsc_vec.ghostUpdate(
@@ -312,10 +314,10 @@ class CylindricalArcLength(ArcLengthSolver):
     def _assemble_residual(self, newton: NewtonSolver) -> PETSc.Vec:
         """Assemble R with lifting and BC enforcement at newton._u."""
         r = fem_petsc.assemble_vector(newton._R_form)
-        fem.apply_lifting(r, [newton._J_form], [newton._bcs],
-                          x0=[newton._u.x.petsc_vec], alpha=-1.0)
+        fem_petsc.apply_lifting(r, [newton._J_form], [newton._bcs],
+                                x0=[newton._u.x.petsc_vec], alpha=-1.0)
         r.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-        fem.set_bc(r, newton._bcs, x0=newton._u.x.petsc_vec, scale=-1.0)
+        fem_petsc.set_bc(r, newton._bcs, x0=newton._u.x.petsc_vec, alpha=-1.0)
         return r
 
     def _build_ksp(self, K: PETSc.Mat, comm) -> PETSc.KSP:

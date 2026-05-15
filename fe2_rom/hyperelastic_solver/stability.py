@@ -61,11 +61,11 @@ class StabilityAnalyzer:
         # Shift-invert needs to factor (K - σ·I) once per call. Use MUMPS LDLᵀ:
         # symmetric, handles indefinite K via pivoting, ~3–5× faster than the
         # PETSc-builtin LU that SLEPc otherwise picks.
-        st_ksp = st.getKSP()
-        st_ksp.setType("preonly")
-        st_pc = st_ksp.getPC()
-        st_pc.setType("cholesky")
-        st_pc.setFactorSolverType("mumps")
+        # st_ksp = st.getKSP()
+        # st_ksp.setType("preonly")
+        # st_pc = st_ksp.getPC()
+        # st_pc.setType("cholesky")
+        # st_pc.setFactorSolverType("mumps")
         eigensolver.setTarget(0.0)
         eigensolver.setDimensions(nev=self._nev)
         eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
@@ -77,23 +77,25 @@ class StabilityAnalyzer:
                 opts[key] = val
 
         eigensolver.setFromOptions()
-        eigensolver.solve()
-        PETSc.Mat.destroy(K)
+        try:
+            eigensolver.solve()
 
-        n_conv = eigensolver.getConverged()
-        eigenvalues = np.array([
-            eigensolver.getEigenvalue(i).real
-            for i in range(min(n_conv, self._nev))
-        ])
+            n_conv = eigensolver.getConverged()
+            eigenvalues = np.array([
+                eigensolver.getEigenvalue(i).real
+                for i in range(min(n_conv, self._nev))
+            ])
 
-        logger.info("Smallest eigenvalues: %s", np.array2string(eigenvalues, precision=4))
+            logger.info("Smallest eigenvalues: %s", np.array2string(eigenvalues, precision=4))
 
-        is_stable = True
-        if np.any(eigenvalues < self._neg_tol):
-            target_indices = np.where(eigenvalues < self._neg_tol)[0]
-            eigensolver.getEigenvector(target_indices[0], eigenfunction.x.petsc_vec)
-            eigenfunction.x.scatter_forward()
-            is_stable = False
+            is_stable = True
+            if np.any(eigenvalues < self._neg_tol):
+                target_indices = np.where(eigenvalues < self._neg_tol)[0]
+                eigensolver.getEigenvector(target_indices[0], eigenfunction.x.petsc_vec)
+                eigenfunction.x.scatter_forward()
+                is_stable = False
+        finally:
+            eigensolver.destroy()
+            PETSc.Mat.destroy(K)
 
-        eigensolver.destroy()
         return is_stable, eigenvalues

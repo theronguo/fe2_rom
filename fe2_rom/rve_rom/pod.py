@@ -65,10 +65,22 @@ def my_ecm(A, b, tol=1e-4):
 
 # ── Transfer utilities ────────────────────────────────────────────────────────
 
+def _cell_map_to_array(cell_map, submesh):
+    """Return a sub→parent cell index array from an EntityMap or pass-through ndarray."""
+    if isinstance(cell_map, dmesh.EntityMap):
+        tdim = submesh.topology.dim
+        n_sub = submesh.topology.index_map(tdim).size_local
+        return np.asarray(
+            cell_map.sub_topology_to_topology(np.arange(n_sub, dtype=np.int32), inverse=False),
+            dtype=np.int32,
+        )
+    return np.asarray(cell_map, dtype=np.int32)
+
+
 def _parent_to_sub_array(arr_parent, V_parent, V_sub, cell_map):
     bs = V_parent.dofmap.bs
     assert bs == V_sub.dofmap.bs
-    cell_map = np.asarray(cell_map, dtype=np.int32)
+    cell_map = _cell_map_to_array(cell_map, V_sub.mesh)
     n_sub = cell_map.size
     pd = np.stack([V_parent.dofmap.cell_dofs(int(c)) for c in cell_map])
     sd = np.stack([V_sub.dofmap.cell_dofs(c) for c in range(n_sub)])
@@ -142,7 +154,7 @@ def _write_submesh_to_gmsh(submesh, filename, comm, gdim):
     gmsh.model.setPhysicalName(tdim, pg, "active")
     gmsh.write(filename)
     gmsh.finalize()
-    return io.gmshio.read_from_msh(filename, comm, 0, gdim=gdim)[0]
+    return io.gmsh.read_from_msh(filename, comm, 0, gdim=gdim).mesh
 
 
 # ── POD ───────────────────────────────────────────────────────────────────────
@@ -553,6 +565,7 @@ class ECM:
         _, indices = self._make_cell_tags_and_indices()
         tdim = self.mesh.topology.dim
         submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
+        cell_map_arr = _cell_map_to_array(cell_map, submesh)
 
         omega = self._make_omega()
         mesh_2 = _write_submesh_to_gmsh(submesh, "active.msh", self.mesh.comm, self.gdim)
@@ -563,7 +576,7 @@ class ECM:
         Q0_2 = fem.functionspace(mesh_2, ("DG", 0))
 
         mesh2_to_sub    = cKDTree(_cell_centroids(submesh)).query(_cell_centroids(mesh_2), k=1)[1]
-        mesh2_to_parent = cell_map[mesh2_to_sub.astype(np.int32)]
+        mesh2_to_parent = cell_map_arr[mesh2_to_sub.astype(np.int32)]
 
         perm_V    = _make_coord_perm(self.V,   V_2)
         perm_Q0   = _make_coord_perm(self._Q0, Q0_2)
@@ -629,7 +642,7 @@ if __name__ == "__main__":
     gdim = 2
     degree = 2
 
-    mesh, _, _ = io.gmshio.read_from_msh("holes.msh", comm, 0, gdim=gdim)
+    mesh = io.gmsh.read_from_msh("holes.msh", comm, 0, gdim=gdim).mesh
     V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
     S  = fem.functionspace(mesh, ("DG", 1, (gdim, gdim)))
     S0 = fem.functionspace(mesh, ("DG", 0, (gdim, gdim)))
