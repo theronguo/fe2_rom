@@ -79,7 +79,7 @@ solver = MacroSolver(
     rve_degree=1,
     rve_output_dir="output",
     rve_visualize_fields=[""],
-    rve_average_fields=["P", "A"],
+    rve_average_quantities=["P", "A"],
     rve_newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                         "max_iter": 50, "div_rel_tol": 10},
     rve_timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-3,

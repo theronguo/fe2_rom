@@ -204,27 +204,54 @@ class NewtonSolver:
         return K
 
 class NewtonSolverFE2(NewtonSolver):
-    """Newton solver variant for FE2 homogenization with adjoint solves."""
+    """Newton solver variant for FE2 homogenization with adjoint / forward-
+    sensitivity solves.
 
-    def __init__(self, comm, R_form, J_form, Jij_forms, u, du, bcs, mpc=None, **kwargs):
+    Exposes a generic API ``solve_macro_sensitivities(rhs_forms_dict)`` that
+    solves ``K p_k = rhs_k`` for each scalar component of each named macro
+    variable, sharing one factorisation across all RHS. The legacy
+    ``solve_adjoint()`` (Fbar-only, gdim² × gdim² nested list) is preserved
+    as a thin wrapper for backward compatibility.
+    """
+
+    def __init__(self, comm, R_form, J_form, u, du, bcs, mpc=None, *,
+                 Jij_forms=None, **kwargs):
         super().__init__(comm, R_form, J_form, u, du, bcs, mpc=mpc, **kwargs)
+        # Optional legacy Fbar-only RHS forms (nested list[gdim][gdim]).
+        # Used only by ``solve_adjoint``; ``solve_macro_sensitivities`` does
+        # not depend on it.
         self._Jij_forms = Jij_forms
 
-    def solve_adjoint(self):
-        """Solve K * p_ij = rhs_ij for all ij and return adjoint fields p_ij."""
+    def solve_macro_sensitivities(
+        self, rhs_forms_dict: dict[str, list],
+    ) -> dict[str, list[fem.Function]]:
+        """Solve ``K p_k = rhs_k`` for every scalar component ``k`` of every
+        named macro variable in ``rhs_forms_dict``.
+
+        Parameters
+        ----------
+        rhs_forms_dict
+            ``{name -> list[fem.Form]}`` — each form is linear in the test
+            function and represents the per-component RHS in the variation
+            of the residual w.r.t. that macro variable.
+
+        Returns
+        -------
+        ``{name -> list[fem.Function]}`` — the forward sensitivities
+        ``p_k = ∂w/∂μ_k`` for each scalar component, in the same order as
+        the input forms.
+        """
         if self.mpc is not None:
             K = dolfinx_mpc.assemble_matrix(self._J_form, self.mpc, bcs=self._bcs)
         else:
             K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
         K.assemble()
-
         ksp = self._make_ksp(K)
 
-        adjoints = []
-        for i in range(len(self._Jij_forms)):
-            adjoint = []
-            for j in range(len(self._Jij_forms)):
-                rhs_form = self._Jij_forms[i][j]
+        results: dict[str, list[fem.Function]] = {}
+        for name, forms in rhs_forms_dict.items():
+            sensitivities: list[fem.Function] = []
+            for rhs_form in forms:
                 if self.mpc is not None:
                     rhs = dolfinx_mpc.assemble_vector(rhs_form, self.mpc)
                     dolfinx_mpc.apply_lifting(rhs, [self._J_form], [self._bcs], self.mpc)
@@ -234,21 +261,42 @@ class NewtonSolverFE2(NewtonSolver):
                 rhs.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
                 fem_petsc.set_bc(rhs, self._bcs)
 
-                ksp.solve(rhs, self._du.x.petsc_vec)
-                self._du.x.petsc_vec.ghostUpdate(
-                    addv=PETSc.InsertMode.INSERT,  # type: ignore
-                    mode=PETSc.ScatterMode.FORWARD,  # type: ignore
+                X = self._du.x.petsc_vec.duplicate()
+                ksp.solve(rhs, X)
+                X.ghostUpdate(
+                    addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD,
                 )
                 if self.mpc is not None:
-                    self.mpc.backsubstitution(self._du.x.petsc_vec)
+                    self.mpc.backsubstitution(X)
 
-                adjoint.append(self._du.copy())
+                p = fem.Function(self._u.function_space)
+                X.copy(p.x.petsc_vec)
+                p.x.scatter_forward()
+                sensitivities.append(p)
+
                 PETSc.Vec.destroy(rhs)
-            adjoints.append(adjoint)
+                PETSc.Vec.destroy(X)
+            results[name] = sensitivities
 
         ksp.destroy()
         PETSc.Mat.destroy(K)
-        return adjoints
+        return results
+
+    def solve_adjoint(self):
+        """Legacy API: return nested ``adjoints[k][l]`` for Fbar components.
+
+        Equivalent to ``solve_macro_sensitivities({"Fbar": flat_forms})`` with
+        the flattened ``Jij_forms`` provided at construction.
+        """
+        if self._Jij_forms is None:
+            raise RuntimeError(
+                "solve_adjoint() requires Jij_forms to be supplied at construction; "
+                "for new code use solve_macro_sensitivities(rhs_forms_dict)."
+            )
+        gdim = len(self._Jij_forms)
+        flat = [self._Jij_forms[k][l] for k in range(gdim) for l in range(gdim)]
+        flat_out = self.solve_macro_sensitivities({"Fbar": flat})["Fbar"]
+        return [[flat_out[k * gdim + l] for l in range(gdim)] for k in range(gdim)]
 
 # ---------------------------------------------------------------------------
 # Arc-length solvers

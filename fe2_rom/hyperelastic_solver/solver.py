@@ -9,9 +9,16 @@ from mpi4py import MPI
 import ufl
 import dolfinx_mpc
 
+from .averages import (
+    EffectiveAbar,
+    EffectiveFbar,
+    EffectivePbar,
+    HomogenizationContext,
+    resolve_average_quantities,
+)
 from .boundary import ReactionProbe
-from .forms import build_homogenization_weak_form, build_weak_forms
 from .exceptions import RVEConvergenceError
+from .forms import basis_tensor_ufl, build_homogenization_weak_form, build_weak_forms
 from .logging_utils import silence_c_stdout
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
@@ -374,53 +381,56 @@ class HyperelasticStabilitySolver:
             PETSc.Vec.destroy(du_prev)
 
 
-
 class PeriodicHyperelasticHomogenizationSolver:
-    """Modular hyperelastic periodic homogenization solver.
+    """Periodic hyperelastic homogenization with pluggable effective quantities.
 
-    Usage pattern (two-phase init):
-        solver = HyperelasticStabilitySolver(mesh, cell_tags, facet_tags, material)
-        solver.add_bc(...)      # call for each BC component
-        solver.setup()          # compiles UFL forms (collective)
-        solver.run(load_schedule, ...)
+    Rigid-body modes are removed by Dirichlet-pinning the corner nodes (the
+    original gauge fix) and the periodic ties are enforced via ``dolfinx_mpc``.
+    The Newton step is the standard ``NewtonSolverFE2`` path with CG/MINRES
+    + GAMG (no saddle-point augmentation).
 
-    Attributes exposed for VTXManager (only when enable_viz_fields=True):
-        u_int, F_func, P_func, J_func
+    Effective quantities and tangent moduli are computed through the modular
+    ``AverageQuantity`` interface; ``__call__`` returns
+    ``list[dict[str, ...]]`` — one dict per accepted load step, keyed by
+    each quantity's ``name``.
+
+    Subclass hooks (``_setup_phi``, ``_setup_macro_vars``,
+    ``_build_u_total_extra``, ``_build_macro_var_rhs_forms``,
+    ``_make_default_average_quantities``, etc.) allow derived classes to add
+    additional macro variables, ansatz contributions, constraints, and
+    effective quantities — used by the micromorphic subclass.
     """
 
-    def __init__(self, mesh_path, comm, gdim, 
+    def __init__(self, mesh_path, comm, gdim,
                  material: MaterialModel, *,
-                 degree: int = 1, 
+                 degree: int = 1,
                  output_dir: str = "output",
                  check_stability: bool = True,
                  visualize_fields: list[str] | None = None,
-                 average_fields: list[str] | None = None,
+                 average_quantities: list | None = None,
                  stability_options: dict | None = None,
                  newton_options: dict | None = None,
                  timestepper_options: dict | None = None,
                  save_snapshots: list[str] | None = None,
                  averages_only_final: bool = False,
                  ) -> None:
-        
-        ### Default Newton, Timestepper, Visualization, Averaging options ###
+
         newton_options = newton_options if newton_options is not None else {
-            "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 10, "max_iter_instab": 30, 
-            "switch_to_minres": False, "div_rel_tol": 10.0
+            "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 10, "max_iter_instab": 30,
+            "switch_to_minres": False, "div_rel_tol": 10.0,
         }
         timestepper_options = timestepper_options if timestepper_options is not None else {
-            "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5, "dt_max": 1.0, "good_newton_steps": 7
+            "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5, "dt_max": 1.0, "good_newton_steps": 7,
         }
         stability_options = stability_options if stability_options is not None else {
-            "nev": 5, "neg_tol": -1e-12
+            "nev": 5, "neg_tol": -1e-12,
         }
         if visualize_fields is None:
             visualize_fields = ["u_fluc"]
-        if average_fields is None:
-            average_fields = ["P"]
         if save_snapshots is None:
             save_snapshots = []
 
-        ### Read mesh ###
+        # ---- Mesh ----
         self.comm = comm
         with silence_c_stdout():
             mesh_data = io.gmsh.read_from_msh(mesh_path, self.comm, 0, gdim=gdim)
@@ -434,74 +444,251 @@ class PeriodicHyperelasticHomogenizationSolver:
         self.mins, self.maxs = self._compute_domain_bounds()
         self.length_scale = (self.maxs - self.mins).max()
         logger.debug("Mesh loaded: %d cells, %d facets, gdim=%d",
-                    self._mesh.topology.index_map(self._mesh.topology.dim).size_global,
-                    self._mesh.topology.index_map(self._mesh.topology.dim - 1).size_global,
-                    gdim,
-        )
-        logger.debug("Domain bounds: x_min=%.3f  x_max=%.3f", self.mins[0], self.maxs[0])
-        logger.debug("Domain bounds: y_min=%.3f  y_max=%.3f", self.mins[1], self.maxs[1])
+                     self._mesh.topology.index_map(self._mesh.topology.dim).size_global,
+                     self._mesh.topology.index_map(self._mesh.topology.dim - 1).size_global,
+                     gdim)
+        logger.debug("Domain bounds: x [%.3f, %.3f]", self.mins[0], self.maxs[0])
+        logger.debug("Domain bounds: y [%.3f, %.3f]", self.mins[1], self.maxs[1])
         if gdim == 3:
-            logger.debug("Domain bounds: z_min=%.3f  z_max=%.3f", self.mins[2], self.maxs[2])
-        
-        # If True, ``__call__`` runs the (expensive) effective-quantity
-        # reductions only at the final converged endpoint of the F_bar ramp.
-        # Intermediate accepted steps still solve Newton + (optional)
-        # stability, but ``output_quantities`` only contains the final entry.
-        self._averages_only_final = averages_only_final
+            logger.debug("Domain bounds: z [%.3f, %.3f]", self.mins[2], self.maxs[2])
 
-        ### Material model ###
+        self._averages_only_final = averages_only_final
         self._material = material
-        
-        ### Function space and fields ###
+
+        # ---- Function space and state fields ----
         self._degree = degree
         self.V = fem.functionspace(self._mesh, ("Lagrange", degree, (self.gdim,)))
         n_dofs = self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs
-        
+
         self.u = fem.Function(self.V)
-        self._u_last = fem.Function(self.V)   # within-call revert (per-step)
-        self._u_conv = fem.Function(self.V)   # cross-call commit point
+        self._u_last = fem.Function(self.V)
+        self._u_conv = fem.Function(self.V)
         self._du = fem.Function(self.V)
         self._eigenfunction = fem.Function(self.V)
         self.F_bar = fem.Constant(self._mesh, np.eye(self.gdim, dtype=PETSc.ScalarType))
-        # Last *converged* F_bar.  ``F_bar`` itself tracks the trial state
-        # (possibly mid-ramp / failed); ``F_bar_conv`` and ``_u_conv`` are
-        # updated only on ``commit()`` and are the canonical restart point
-        # for the next call.
         self.F_bar_conv = np.eye(self.gdim, dtype=PETSc.ScalarType)
         logger.debug("Functions set up with %d global DOFs", n_dofs)
 
-        ### Periodic BCs ###
-        bcs, mpc = self._setup_periodic_bcs_and_mpc()
-        self.mpc = mpc
+        # ---- Periodic BCs + MPC (corner-pinning makes K SPD) ----
+        bcs, self.mpc = self._setup_periodic_bcs_and_mpc()
         self._bcs = bcs
-        logger.debug("Periodic BCs set up with %d slave points", self.comm.allreduce(len(mpc.slaves), op=MPI.SUM))
-        
-        ### Stability analyzer (optional) ###
+        logger.debug("Periodic BCs set up with %d slave points",
+                     self.comm.allreduce(len(self.mpc.slaves), op=MPI.SUM))
+
+        # ---- Subclass hooks: φᵢ and the macro-variable dict ----
+        self._setup_phi()
+        self._setup_macro_vars()
+
+        # ---- Stability analyzer (optional) ----
         if check_stability:
-            self._stability = StabilityAnalyzer(self.comm, **stability_options)
-            logger.debug("Stability checks enabled with options: %s", stability_options)
+            # With corner-pinning K is SPD (no zero modes); subclasses that
+            # introduce additional zero modes override ``_count_zero_modes``.
+            n_skip_default = self._count_zero_modes()
+            n_skip = stability_options.pop("n_skip_eigenvalues", n_skip_default)
+            self._stability = StabilityAnalyzer(
+                self.comm, n_skip_eigenvalues=n_skip, **stability_options,
+            )
+            logger.debug("Stability checks enabled (skipping %d gauge eigenvalues); options: %s",
+                         n_skip, stability_options)
             if "switch_to_minres" in newton_options:
                 if newton_options["switch_to_minres"] is False:
-                    logger.debug("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
+                    logger.debug("Overriding newton_options['switch_to_minres'] to True for stability checks.")
             newton_options["switch_to_minres"] = True
         else:
             self._stability = None
 
-        ### Newton solver ###
-        R_form, J_form, Jij_forms, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total = build_homogenization_weak_form(
-            self._mesh, self.V, self.u, self.F_bar, self._material, dx=self.dx
+        # ---- Weak form (with optional u_total_extra from subclass) ----
+        u_total_extra = self._build_u_total_extra()
+        (R_form, J_form, F_var, P_ufl, J_ufl, W_ufl, A_ufl, u_total,
+         build_tangent_rhs_forms) = build_homogenization_weak_form(
+            self._mesh, self.V, self.u, self.F_bar, self._material,
+            u_total_extra=u_total_extra, dx=self.dx,
         )
+
+        # ---- Adjoint-RHS forms per macro variable (subclass extends) ----
+        self._macro_var_rhs_forms = self._build_macro_var_rhs_forms(build_tangent_rhs_forms)
+
+        # ---- Newton solver (NewtonSolverFE2 with corner-pinning BCs) ----
         self._newton = NewtonSolverFE2(
-            self.comm, R_form, J_form, Jij_forms, self.u, self._du, bcs, self.mpc,
+            self.comm, R_form, J_form, self.u, self._du, self._bcs, self.mpc,
             **newton_options,
         )
         logger.debug("Newton solver initialized with options: %s", newton_options)
 
-        ### Time stepper ###
+        # ---- Time stepper ----
         self._timestepper = TimeStepper(**timestepper_options)
         logger.debug("Time stepper initialized with options: %s", timestepper_options)
-        
-        ### Visualization setup ###
+
+        # ---- Visualization ----
+        self._setup_visualization(visualize_fields, F_var, P_ufl, J_ufl, W_ufl, u_total, output_dir)
+
+        # ---- Volume + homogenization context ----
+        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
+        self._vol_global = float(self.comm.allreduce(vol_local, op=MPI.SUM))
+        self._context = HomogenizationContext(
+            mesh=self._mesh, V=self.V, dx=self.dx, comm=self.comm,
+            vol_global=self._vol_global,
+            F_var=F_var, P_ufl=P_ufl, A_ufl=A_ufl, W_ufl=W_ufl,
+            u=self.u, u_total=u_total,
+            macro_vars=self.macro_vars,
+            phi=self._phi,
+        )
+
+        # ---- Average quantities ----
+        if average_quantities is None:
+            average_quantities = self._make_default_average_quantities()
+        self._average_quantities = resolve_average_quantities(average_quantities)
+        for q in self._average_quantities:
+            q.setup(self._context)
+
+        # ---- Snapshot saving ----
+        self.output_dir = output_dir
+        self.save_snapshots = save_snapshots
+        logger.debug("Snapshot fields: %s", save_snapshots)
+        logger.debug("Setup complete (n_dofs=%d)", n_dofs)
+
+    # ------------------------------------------------------------------
+    # Subclass hooks
+    # ------------------------------------------------------------------
+
+    def _setup_phi(self) -> None:
+        """Register the user-provided global modes φᵢ. Default: empty list."""
+        self._phi: list[fem.Function] = []
+
+    def _setup_macro_vars(self) -> None:
+        """Initialize ``self.macro_vars``. Default: ``{"Fbar": self.F_bar}``."""
+        self.macro_vars: dict = {"Fbar": self.F_bar}
+
+    def _build_u_total_extra(self):
+        """Return the additional UFL contribution to ``u_total`` beyond
+        ``(F̄ − I)·X + w``. Default: ``None`` (no extra contribution)."""
+        return None
+
+    def _build_macro_var_rhs_forms(self, build_tangent_rhs_forms) -> dict:
+        """Build adjoint-RHS forms per macro variable.
+
+        Returned dict maps macro variable name -> flat list of compiled
+        ``fem.Form`` (one per scalar component, in C order).
+        """
+        gdim = self.gdim
+        dF_dFbar_list = [basis_tensor_ufl(gdim, i, j)
+                         for i in range(gdim) for j in range(gdim)]
+        return {"Fbar": build_tangent_rhs_forms(dF_dFbar_list)}
+
+    def _make_default_average_quantities(self) -> list:
+        """Default effective quantities. Base: F̄ (echo), P̄, dP̄/dF̄."""
+        return [EffectiveFbar(), EffectivePbar(), EffectiveAbar()]
+
+    def _restore_trial_state(self) -> None:
+        """Hook: restore subclass-specific trial state from converged. Base: no-op."""
+        return
+
+    def _update_macro_load_schedule(self, t: float) -> None:
+        """Hook: update subclass-specific load constants at trial time ``t``. Base: no-op."""
+        return
+
+    def _commit_extra_state(self) -> None:
+        """Hook: commit subclass-specific trial state to the converged restart. Base: no-op."""
+        return
+
+    def _count_zero_modes(self) -> int:
+        """Number of near-zero modes of K that the stability check should skip.
+
+        With corner-pinning Dirichlet BCs (this base class), K is SPD and has
+        no zero modes — return 0. Subclasses that swap corner-pinning for an
+        integral gauge or otherwise introduce gauge directions in K's null
+        space must override; e.g. for ``⟨w⟩=0`` the value is ``gdim``.
+        """
+        return 0
+
+    # ------------------------------------------------------------------
+    # Mesh / MPC helpers
+    # ------------------------------------------------------------------
+
+    def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        coords = self._mesh.geometry.x
+        mins_local = np.min(coords[:, :self.gdim], axis=0)
+        maxs_local = np.max(coords[:, :self.gdim], axis=0)
+        mins = np.array(
+            [self.comm.allreduce(float(mins_local[i]), op=MPI.MIN) for i in range(self.gdim)],
+            dtype=float,
+        )
+        maxs = np.array(
+            [self.comm.allreduce(float(maxs_local[i]), op=MPI.MAX) for i in range(self.gdim)],
+            dtype=float,
+        )
+        return mins, maxs
+
+    @staticmethod
+    def _make_axis_map(axis: int, target_value: float) -> Callable:
+        def axis_map(x):
+            y = x.copy()
+            y[axis] = target_value
+            return y
+        return axis_map
+
+    @staticmethod
+    def _make_periodic_slave_selector(axis: int, mins: np.ndarray, maxs: np.ndarray,
+                                      tol: float, exclude_axes: tuple[int, ...]) -> Callable:
+        def selector(x):
+            mask = np.isclose(x[axis], mins[axis], atol=tol, rtol=0.0)
+            for ex_axis in exclude_axes:
+                mask &= (x[ex_axis] > mins[ex_axis] + tol)
+                mask &= (x[ex_axis] < maxs[ex_axis] - tol)
+            return mask
+        return selector
+
+    @staticmethod
+    def _locate_corner_dofs(V, mins: np.ndarray, maxs: np.ndarray, tol: float) -> np.ndarray:
+        """Locate all corner DOFs (4 in 2D, 8 in 3D; times vector components)."""
+        dim = len(mins)
+
+        def corner_selector(x):
+            mask = np.ones(x.shape[1], dtype=bool)
+            for axis in range(dim):
+                on_min = np.isclose(x[axis], mins[axis], atol=tol, rtol=0.0)
+                on_max = np.isclose(x[axis], maxs[axis], atol=tol, rtol=0.0)
+                mask &= on_min | on_max
+            return mask
+
+        return fem.locate_dofs_geometrical(V, corner_selector)
+
+    def _setup_periodic_bcs_and_mpc(self) -> tuple[list, dolfinx_mpc.MultiPointConstraint]:
+        """Build periodic-tie MPC and corner-pinning Dirichlet BCs for a
+        rectangular / cuboid domain.
+
+        Corner-pinning removes the rigid-body translation null space so K is
+        SPD and CG + GAMG works out of the box. The Lagrange-multiplier
+        gauge alternative (``⟨w⟩=0`` etc.) lives in ``SaddlePointNewtonSolver``
+        and is used by the micromorphic subclass.
+        """
+        if self.gdim not in (2, 3):
+            raise ValueError(
+                f"Periodic homogenization supports only 2D rectangle or 3D cuboid, got dim={self.gdim}."
+            )
+        tol = 1e-8 * max(1.0, float(np.max(self.maxs - self.mins)))
+
+        corner = self._locate_corner_dofs(self.V, self.mins, self.maxs, tol)
+        u_zero = fem.Constant(self._mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
+        bcs = [fem.dirichletbc(u_zero, corner, self.V)]
+
+        mpc = dolfinx_mpc.MultiPointConstraint(self.V)
+        for axis in range(self.gdim):
+            selector = self._make_periodic_slave_selector(
+                axis=axis, mins=self.mins, maxs=self.maxs, tol=tol,
+                exclude_axes=tuple(range(axis)),
+            )
+            axis_map = self._make_axis_map(axis, self.maxs[axis])
+            mpc.create_periodic_constraint_geometrical(self.V, selector, axis_map, bcs)
+        mpc.finalize()
+
+        return bcs, mpc
+
+    # ------------------------------------------------------------------
+    # Visualization and snapshots
+    # ------------------------------------------------------------------
+
+    def _setup_visualization(self, visualize_fields, F_var, P_ufl, J_ufl, W_ufl, u_total, output_dir) -> None:
         fields = []
         for field in visualize_fields:
             TT = fem.functionspace(self._mesh, ("DG", 1, (self.gdim, self.gdim)))
@@ -537,112 +724,6 @@ class PeriodicHyperelasticHomogenizationSolver:
         self.visualize_fields = visualize_fields
         logger.debug("Visualization fields: %s", visualize_fields)
 
-        # Averaging setup
-        self.average_fields = average_fields
-        if "P" in average_fields:
-            self._P_ufl = P_ufl
-        if "W" in average_fields:
-            self._W_ufl = W_ufl
-        if "A" in average_fields:
-            self._A_ufl = A_ufl
-        logger.debug("Averaging fields: %s", average_fields)
-
-        # Snapshot saving setup
-        self.output_dir = output_dir
-        self.save_snapshots = save_snapshots
-        logger.debug("Saving snapshots for fields: %s", save_snapshots)
-        logger.debug("Setup complete")
-
-    def _compute_domain_bounds(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return global min/max coordinates along each geometric axis."""
-        coords = self._mesh.geometry.x
-        mins_local = np.min(coords[:, :self.gdim], axis=0)
-        maxs_local = np.max(coords[:, :self.gdim], axis=0)
-
-        mins = np.array(
-            [self.comm.allreduce(float(mins_local[i]), op=MPI.MIN) for i in range(self.gdim)],
-            dtype=float,
-        )
-        maxs = np.array(
-            [self.comm.allreduce(float(maxs_local[i]), op=MPI.MAX) for i in range(self.gdim)],
-            dtype=float,
-        )
-        return mins, maxs
-
-    @staticmethod
-    def _make_axis_map(axis: int, target_value: float) -> Callable:
-        """Return x -> y map that sets y[axis] to target_value."""
-        def axis_map(x):
-            y = x.copy()
-            y[axis] = target_value
-            return y
-
-        return axis_map
-
-    @staticmethod
-    def _make_periodic_slave_selector(axis: int,
-                                      mins: np.ndarray,
-                                      maxs: np.ndarray,
-                                      tol: float,
-                                      exclude_axes: tuple[int, ...]) -> Callable:
-        """Select lower-side boundary DOFs for one axis, excluding previous-axis boundaries."""
-        def selector(x):
-            mask = np.isclose(x[axis], mins[axis], atol=tol, rtol=0.0)
-            for ex_axis in exclude_axes:
-                mask &= (x[ex_axis] > mins[ex_axis] + tol)
-                mask &= (x[ex_axis] < maxs[ex_axis] - tol)
-            return mask
-
-        return selector
-
-    @staticmethod
-    def _locate_corner_dofs(V, mins: np.ndarray, maxs: np.ndarray, tol: float) -> np.ndarray:
-        """Locate all corner DOFs (4 in 2D, 8 in 3D; times vector components)."""
-        dim = len(mins)
-
-        def corner_selector(x):
-            mask = np.ones(x.shape[1], dtype=bool)
-            for axis in range(dim):
-                on_min = np.isclose(x[axis], mins[axis], atol=tol, rtol=0.0)
-                on_max = np.isclose(x[axis], maxs[axis], atol=tol, rtol=0.0)
-                mask &= on_min | on_max
-            return mask
-
-        return fem.locate_dofs_geometrical(V, corner_selector)
-
-    def _setup_periodic_bcs_and_mpc(self) -> tuple[list, dolfinx_mpc.MultiPointConstraint]:
-        """Build periodic corner constraints and MPC ties for rectangular/cuboid domains."""
-        mesh = self._mesh
-        V = self.V
-        if self.gdim not in (2, 3):
-            raise ValueError(
-                f"Periodic homogenization supports only 2D rectangle or 3D cuboid, got dim={self.gdim}."
-            )
-        tol = 1e-8 * max(1.0, float(np.max(self.maxs - self.mins)))
-
-        # Fix all corner DOFs to remove rigid modes and avoid over-constraining periodic ties.
-        corner = self._locate_corner_dofs(V, self.mins, self.maxs, tol)
-        u_zero = fem.Constant(mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
-        bcs = [fem.dirichletbc(u_zero, corner, V)]
-
-        mpc = dolfinx_mpc.MultiPointConstraint(V)
-        # Build one non-overlapping periodic slave set per axis:
-        # axis 0 uses all x_min points, axis 1 excludes x-boundaries,
-        # axis 2 (3D only) excludes x/y-boundaries.
-        for axis in range(self.gdim):
-            selector = self._make_periodic_slave_selector(
-                axis=axis,
-                mins=self.mins,
-                maxs=self.maxs,
-                tol=tol,
-                exclude_axes=tuple(range(axis)),
-            )
-            axis_map = self._make_axis_map(axis, self.maxs[axis])
-            mpc.create_periodic_constraint_geometrical(V, selector, axis_map, bcs)
-        mpc.finalize()
-
-        return bcs, mpc
-
     def _write_fields(self, t: float) -> None:
         if self.vtx is not None:
             for field in self.visualize_fields:
@@ -663,29 +744,13 @@ class PeriodicHyperelasticHomogenizationSolver:
             logger.warning("No fields to write at t=%.5f (vtx is None)", t)
 
     def _save_snapshot(self, field_name: str, func, t_save: float) -> None:
-        """Gather owned DOF values and coordinates to rank 0 and save.
-
-        Values are gathered in global-DOF-index order (rank 0's owned DOFs,
-        then rank 1's, …).  DOF coordinates are saved once alongside the
-        snapshots so that a serial post-processing tool (e.g. build_rom.py)
-        can compute the permutation needed to convert from the parallel DOF
-        ordering to the serial DOF ordering.
-
-        Coordinates are written to
-            <output_dir>/snapshots/<field_name>_dof_coords.npy
-        and are not matched by the time-stamped glob pattern used to load
-        snapshots (which contains a decimal point in the stem).
-        """
         imap = func.function_space.dofmap.index_map
         bs = func.function_space.dofmap.index_map_bs
         n_local = imap.size_local
-
         owned_vals = func.x.array[:n_local * bs].copy()
         owned_coords = func.function_space.tabulate_dof_coordinates()[:n_local].copy()
-
         all_vals = self.comm.gather(owned_vals, root=0)
         all_coords = self.comm.gather(owned_coords, root=0)
-
         if self.comm.rank == 0:
             vals = np.concatenate(all_vals)
             coords = np.concatenate(all_coords, axis=0)
@@ -695,89 +760,61 @@ class PeriodicHyperelasticHomogenizationSolver:
             if not os.path.exists(coords_path):
                 np.save(coords_path, coords)
 
-    def compute_effective_strain_energy_density(self) -> float:
-        """Compute domain-average effective strain energy density from the current converged state."""
+    # ------------------------------------------------------------------
+    # Averaging and __call__
+    # ------------------------------------------------------------------
 
-        W_local = fem.assemble_scalar(fem.form(self._W_ufl * self.dx))
-        W_global = self.comm.allreduce(W_local, op=MPI.SUM)
+    def _collect_averages(self) -> dict:
+        """Compute all configured ``average_quantities`` at the current trial state."""
+        needed: set[str] = set()
+        for q in self._average_quantities:
+            for name in q.required_macro_adjoints:
+                needed.add(name)
+        adjoints: dict | None = None
+        if needed:
+            rhs_dict = {name: self._macro_var_rhs_forms[name] for name in needed}
+            adjoints = self._newton.solve_macro_sensitivities(rhs_dict)
+        out: dict = {}
+        for q in self._average_quantities:
+            out[q.name] = q.compute(self._context, adjoints)
+        return out
 
-        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
-        vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
-
-        return W_global / vol_global
-
-    def compute_average_first_pk_stress(self) -> np.ndarray:
-        """Compute domain-average first Piola-Kirchhoff stress tensor from the current converged state."""
-
-        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
-        vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
-
-        P_eff = np.zeros((self.gdim, self.gdim), dtype=float)
-        for i in range(self.gdim):
-            for j in range(self.gdim):
-                P_ij_local = fem.assemble_scalar(fem.form(self._P_ufl[i, j] * self.dx))
-                P_ij_global = self.comm.allreduce(P_ij_local, op=MPI.SUM)
-                P_eff[i, j] = P_ij_global / vol_global
-
-        return P_eff
-
-    def compute_effective_tangent_moduli(self) -> np.ndarray:
-        """Compute effective tangent moduli tensor from the current converged state with adjoints."""
-        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
-        vol_global = self.comm.allreduce(vol_local, op=MPI.SUM)
-
-        adjoints = self._newton.solve_adjoint()
-        A_eff = np.zeros((self.gdim, self.gdim, self.gdim, self.gdim), dtype=float)
-        for i in range(self.gdim):
-            for j in range(self.gdim):
-                for k in range(self.gdim):
-                    for l in range(self.gdim):
-                        A_avg_local = fem.assemble_scalar(fem.form(self._A_ufl[i, j, k, l] * self.dx))
-                        A_fluc_local = fem.assemble_scalar(
-                            fem.form(ufl.inner(self._A_ufl[i, j, :, :], ufl.grad(adjoints[k][l])) * self.dx)
-                            )
-                        
-                        A_avg_global = self.comm.allreduce(A_avg_local, op=MPI.SUM)
-                        A_fluc_global = self.comm.allreduce(A_fluc_local, op=MPI.SUM)
-                        
-                        A_eff[i, j, k, l] = (A_avg_global + A_fluc_global) / vol_global
-
-        return A_eff
-
-    def __call__(self, Fbar: np.array,
-            pert_amplitude_init: float = 1e1,
-            plot_time_start: float = 0.0
-            ) -> list:
+    def __call__(self, Fbar: np.ndarray, *,
+                 pert_amplitude_init: float = 1e1,
+                 plot_time_start: float = 0.0) -> list[dict]:
         """Main time-stepping loop.
 
-        load_schedule(t) is called once per trial time step to update any
-        time-varying fem.Constants (e.g. prescribed displacements).
+        Linearly ramps ``F̄`` from the last committed state to the target.
+        Subclasses extend the ramp via the ``_update_macro_load_schedule`` hook.
 
-        pert_amplitude_init: initial eigenvector perturbation amplitude.
-        Doubles on each stability retry; reset to this value each new time step.
-        TODO: improve by normalising eigenvector relative to mesh size h.
+        ``pert_amplitude_init`` is the initial eigenvector perturbation
+        amplitude — doubles on each stability retry; reset at each new step.
         """
-        assert self._newton is not None, "Call setup() before run()"
-        
-        # Restart from the last *committed* state — F_bar and the
-        # displacement may have been left at a trial value the outer macro
-        # SNES rejected.
+        assert self._newton is not None, "Setup not complete."
+
+        # Restart from the last committed state.
         Fbar_prev = self.F_bar_conv.copy()
         self.F_bar.value[:] = Fbar_prev
         self.u.x.array[:] = self._u_conv.x.array
         self.u.x.scatter_forward()
+        self._restore_trial_state()
+
+        target_F = np.asarray(Fbar, dtype=PETSc.ScalarType)
+
         def load_schedule(t: float) -> None:
-            for i in range(Fbar.shape[0]):
-                for j in range(Fbar.shape[1]):
-                    self.F_bar.value[i, j] = t * (Fbar[i, j] - Fbar_prev[i, j])  + Fbar_prev[i, j]  # Linear ramp from 0 to Fbar
+            for i in range(target_F.shape[0]):
+                for j in range(target_F.shape[1]):
+                    self.F_bar.value[i, j] = (
+                        t * (target_F[i, j] - Fbar_prev[i, j]) + Fbar_prev[i, j]
+                    )
+            self._update_macro_load_schedule(t)
 
         u = self.u
         if self.vtx is not None:
-            self._write_fields(0.0+plot_time_start)
+            self._write_fields(0.0 + plot_time_start)
 
-        output_quantities = []
+        output_quantities: list[dict] = []
         if not self._averages_only_final:
-            # initial-state snapshot
             output_quantities.append(self._collect_averages())
 
         self._timestepper.reset()
@@ -798,8 +835,6 @@ class PeriodicHyperelasticHomogenizationSolver:
                 if converged:
                     if self._stability is not None:
                         K = self._newton.assemble_stiffness()
-                        # _stability.check() takes ownership of K (its finally
-                        # block always destroys K, even on internal failure).
                         try:
                             is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
                         except (PETSc.Error, SystemError):
@@ -846,10 +881,10 @@ class PeriodicHyperelasticHomogenizationSolver:
                         if not self._averages_only_final:
                             output_quantities.append(self._collect_averages())
 
-                        t_save = self._timestepper.t_current+plot_time_start
+                        t_save = self._timestepper.t_current + plot_time_start
                         if self.vtx is not None:
                             self._write_fields(t_save)
-                        
+
                         if self.save_snapshots:
                             os.makedirs(f"{self.output_dir}/snapshots", exist_ok=True)
                         for field in self.save_snapshots:
@@ -883,26 +918,11 @@ class PeriodicHyperelasticHomogenizationSolver:
         return output_quantities
 
     def commit(self) -> None:
-        """Promote trial state (F_bar, u) to the converged restart point.
+        """Promote trial state to the converged restart point.
 
         Call once from the macro driver after a successful outer time step.
-        Calling it after a *failed* macro step would poison the restart, so
-        the inner ``__call__`` never does this automatically.
         """
         self.F_bar_conv[:] = self.F_bar.value
         self._u_conv.x.array[:] = self.u.x.array
         self._u_conv.x.scatter_forward()
-
-    def _collect_averages(self) -> list:
-        """Snapshot all configured ``average_fields`` at the current state."""
-        quantities = []
-        for quantity in self.average_fields:
-            if quantity == "F":
-                quantities.append(self.F_bar.value.copy())
-            elif quantity == "W":
-                quantities.append(self.compute_effective_strain_energy_density())
-            elif quantity == "P":
-                quantities.append(self.compute_average_first_pk_stress().copy())
-            elif quantity == "A":
-                quantities.append(self.compute_effective_tangent_moduli().copy())
-        return quantities
+        self._commit_extra_state()

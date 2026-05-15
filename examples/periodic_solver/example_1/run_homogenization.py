@@ -38,7 +38,7 @@ solver = PeriodicHyperelasticHomogenizationSolver(
     check_stability=True, 
     visualize_fields=["u_fluc", "u_total",
                     "F", "P", "J", "W"],
-    average_fields=["F", "P", "A"],
+    average_quantities=["F", "P", "A"],
     newton_options={"switch_to_minres": True},
     timestepper_options={"t_end": 1.0, "dt_init": 1.0},
     save_snapshots=["u_fluc", "P"]
@@ -52,9 +52,9 @@ Fbar_conv = []
 Pbar_conv = []
 Abar_conv = []
 for q in res:
-    Fbar_conv.append(q[0])
-    Pbar_conv.append(q[1])
-    Abar_conv.append(q[2])
+    Fbar_conv.append(q["Fbar"])
+    Pbar_conv.append(q["Pbar"])
+    Abar_conv.append(q["dPbar_dFbar"])
 Fbar_conv = np.array(Fbar_conv)
 Pbar_conv = np.array(Pbar_conv)
 Abar_conv = np.array(Abar_conv)

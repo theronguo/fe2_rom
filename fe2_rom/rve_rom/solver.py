@@ -23,9 +23,20 @@ class RVESolver:
         solver = RVESolver(mesh_path, rom_dir, material)
         output_quantities = solver(Fbar_target)
 
-    output_quantities is a list with one entry per accepted load step;
-    each entry is a list aligned with average_fields, e.g. [Pbar].
+    output_quantities is a list with one entry (a dict) per accepted load step.
+    Dict keys are aligned with the new ``average_quantities`` API of the
+    full-order solver: ``"Fbar"``, ``"Pbar"``, ``"dPbar_dFbar"``.
     """
+
+    _KEY_MAP = {
+        "F": "Fbar",
+        "Fbar": "Fbar",
+        "P": "Pbar",
+        "Pbar": "Pbar",
+        "A": "dPbar_dFbar",
+        "Abar": "dPbar_dFbar",
+        "dPbar_dFbar": "dPbar_dFbar",
+    }
 
     def __init__(
         self,
@@ -38,7 +49,7 @@ class RVESolver:
         comm=MPI.COMM_WORLD,
         output_dir: str = "output",
         visualize_fields: list[str] | None = None,
-        average_fields: list[str] | None = None,
+        average_quantities: list | None = None,
         newton_options: dict | None = None,
         timestepper_options: dict | None = None,
         averages_only_final: bool = False,
@@ -51,12 +62,29 @@ class RVESolver:
         }
         if visualize_fields is None:
             visualize_fields = ["u_fluc"]
-        if average_fields is None:
-            average_fields = ["P"]
+        if average_quantities is None:
+            average_quantities = ["P"]
+
+        # Normalize the user input (strings or quantity instances) to the
+        # canonical dict-key form ("Fbar" / "Pbar" / "dPbar_dFbar"), preserving
+        # order and de-duplicating.
+        canonical_keys: list[str] = []
+        for item in average_quantities:
+            key = item if isinstance(item, str) else getattr(item, "name", None)
+            mapped = self._KEY_MAP.get(key, key)
+            if mapped is None:
+                raise ValueError(f"Unknown average quantity: {item!r}")
+            if mapped not in self._KEY_MAP.values():
+                raise ValueError(
+                    f"RVESolver does not implement quantity {mapped!r}; "
+                    f"supported keys: {sorted(set(self._KEY_MAP.values()))}"
+                )
+            if mapped not in canonical_keys:
+                canonical_keys.append(mapped)
 
         self.comm = comm
         self.gdim = gdim
-        self.average_fields = average_fields
+        self.average_quantities = canonical_keys
         self._newton_options = newton_options
         self._timestepper = TimeStepper(**timestepper_options)
         # If True, ``__call__`` returns only the final converged step's
@@ -119,7 +147,7 @@ class RVESolver:
         self._vol = fem.assemble_scalar(fem.form(1.0 * self._omega_func * self._dx_sub))
         logger.debug("Effective domain volume (ECM): %.6f", self._vol)
 
-        if "P" in average_fields:
+        if "Pbar" in self.average_quantities:
             self._P_avg_forms = [
                 [fem.form(self._P_ufl[i, j] * self._omega_func * self._dx_sub)
                  for j in range(gdim)]
@@ -128,7 +156,7 @@ class RVESolver:
         else:
             self._P_avg_forms = None
 
-        if "A" in average_fields:
+        if "dPbar_dFbar" in self.average_quantities:
             self._D_forms = [
                 [fem.form(
                     ufl.inner(
@@ -180,7 +208,7 @@ class RVESolver:
         else:
             self.vtx = None
         logger.debug("Visualization fields: %s", visualize_fields)
-        logger.debug("Averaging fields: %s", average_fields)
+        logger.debug("Average quantities: %s", self.average_quantities)
         logger.debug("Setup complete")
 
     # --- State management ---
@@ -385,8 +413,9 @@ class RVESolver:
                  check_tangent: bool = False) -> list:
         """Adaptive load stepping from current F_bar to target Fbar.
 
-        Returns a list with one entry per accepted step (including t=0);
-        each entry is a list aligned with average_fields, e.g. [Pbar].
+        Returns a list with one entry (a dict) per accepted step (including t=0).
+        Dict keys are ``"Fbar"``, ``"Pbar"``, ``"dPbar_dFbar"`` (depending on
+        which quantities were requested at construction time).
         """
         rel_tol  = self._newton_options["rel_tol"]
         abs_tol  = self._newton_options["abs_tol"]
@@ -454,15 +483,15 @@ class RVESolver:
         self.F_bar_conv[:] = self.F_bar.value
         self.coeffs_conv[:] = self.coeffs
 
-    def _collect_averages(self) -> list:
-        result = []
-        for field in self.average_fields:
-            if field == "P":
-                result.append(self.compute_average_first_pk_stress())
-            elif field == "A":
-                result.append(self.compute_effective_tangent_moduli())
-            elif field == "F":
-                result.append(self.F_bar.value.copy())
+    def _collect_averages(self) -> dict:
+        result: dict = {}
+        for key in self.average_quantities:
+            if key == "Fbar":
+                result["Fbar"] = self.F_bar.value.copy()
+            elif key == "Pbar":
+                result["Pbar"] = self.compute_average_first_pk_stress()
+            elif key == "dPbar_dFbar":
+                result["dPbar_dFbar"] = self.compute_effective_tangent_moduli()
         return result
 
 
@@ -482,7 +511,7 @@ if __name__ == "__main__":
         material=NeoHookean(mu=mu, lmbda=lmbda),
         output_dir=output_dir,
         visualize_fields=["u_fluc", "u_total"],
-        average_fields=["F", "P", "A"],
+        average_quantities=["F", "P", "A"],
         timestepper_options={"t_end": 1.0, "dt_init": 0.01, "dt_min": 1e-5, "dt_max": 0.01, "good_newton_steps": 5},
     )
 
@@ -495,9 +524,9 @@ if __name__ == "__main__":
     Pbar_conv = []
     Abar_conv = []
     for q in output_quantities:
-        Fbar_conv.append(q[0])
-        Pbar_conv.append(q[1])
-        Abar_conv.append(q[2])
+        Fbar_conv.append(q["Fbar"])
+        Pbar_conv.append(q["Pbar"])
+        Abar_conv.append(q["dPbar_dFbar"])
     Fbar_conv = np.array(Fbar_conv)
     Pbar_conv = np.array(Pbar_conv)
     Abar_conv = np.array(Abar_conv)

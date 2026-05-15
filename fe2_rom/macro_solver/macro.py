@@ -35,6 +35,7 @@ from dolfinx_materials.quadrature_map import QuadratureMap
 from dolfinx_materials.solvers import NonlinearMaterialProblem
 from dolfinx_materials.utils import nonsymmetric_tensor_to_vector
 
+from fe2_rom.hyperelastic_solver.averages import AverageQuantity, STRING_KEY_MAP
 from fe2_rom.hyperelastic_solver.output import ReactionForceLogger, VTXManager
 from fe2_rom.hyperelastic_solver.solver import PeriodicHyperelasticHomogenizationSolver
 from fe2_rom.hyperelastic_solver.stability import StabilityAnalyzer
@@ -43,6 +44,24 @@ from fe2_rom.rve_rom.solver import RVESolver
 from .material import RVEMaterial
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_quantity_names(items) -> set[str]:
+    """Return the set of dict keys an ``average_quantities`` list will emit.
+
+    Accepts string keys (resolved via ``STRING_KEY_MAP``) and ``AverageQuantity``
+    instances. Used by ``MacroSolver`` to validate the inner-RVE config statically
+    without instantiating an RVE.
+    """
+    names: set[str] = set()
+    for q in items:
+        if isinstance(q, str):
+            cls = STRING_KEY_MAP.get(q)
+            if cls is not None:
+                names.add(cls.name)
+        elif isinstance(q, AverageQuantity):
+            names.add(q.name)
+    return names
 
 
 class MacroSolver:
@@ -72,7 +91,7 @@ class MacroSolver:
         rve_degree: int = 2,
         rve_output_dir: str = "output",
         rve_visualize_fields: list | None = None,
-        rve_average_fields: list | None = None,
+        rve_average_quantities: list | None = None,
         rve_newton_options: dict | None = None,
         rve_timestepper_options: dict | None = None,
         rve_averages_only_final: bool = True,
@@ -113,12 +132,17 @@ class MacroSolver:
 
         # RVE factory: one fresh inner solver per macro qp, always on COMM_SELF
         # so each macro rank handles its own qp population independently.
-        _rve_average_fields = rve_average_fields if rve_average_fields is not None else ["P", "A"]
-        for required in ("P", "A"):
-            if required not in _rve_average_fields:
+        # ``rve_average_quantities`` accepts string keys ("P", "A", ...) or
+        # AverageQuantity instances — same as the inner solver's kwarg.
+        _rve_average_quantities = (
+            rve_average_quantities if rve_average_quantities is not None else ["P", "A"]
+        )
+        provided_names = _resolve_quantity_names(_rve_average_quantities)
+        for required in ("Pbar", "dPbar_dFbar"):
+            if required not in provided_names:
                 raise ValueError(
-                    f"rve_average_fields must contain {required!r} "
-                    f"(RVEMaterial reads back [Pbar, Abar])."
+                    f"rve_average_quantities must produce {required!r} "
+                    f"(RVEMaterial reads out[-1]['Pbar'] and out[-1]['dPbar_dFbar'])."
                 )
 
         if full:
@@ -132,7 +156,7 @@ class MacroSolver:
                     output_dir=f"{rve_output_dir}/rve_{rank}_{index}",
                     check_stability=rve_check_stability,
                     visualize_fields=rve_visualize_fields,
-                    average_fields=_rve_average_fields,
+                    average_quantities=_rve_average_quantities,
                     stability_options=rve_stability_options,
                     newton_options=rve_newton_options,
                     timestepper_options=rve_timestepper_options,
@@ -150,7 +174,7 @@ class MacroSolver:
                     degree=rve_degree,
                     output_dir=f"{rve_output_dir}/rve_{rank}_{index}",
                     visualize_fields=rve_visualize_fields,
-                    average_fields=_rve_average_fields,
+                    average_quantities=_rve_average_quantities,
                     newton_options=rve_newton_options,
                     timestepper_options=rve_timestepper_options,
                     averages_only_final=rve_averages_only_final,

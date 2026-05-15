@@ -32,7 +32,7 @@ solver = RVESolver(
     degree=1,
     output_dir=output_dir,
     visualize_fields=[""],
-    average_fields=["F", "P", "A"],
+    average_quantities=["F", "P", "A"],
     timestepper_options={"t_end": 1.0, "dt_init": 0.01, "dt_min": 1e-5, "dt_max": 0.01, "good_newton_steps": 5},
 )
 
@@ -42,9 +42,9 @@ Fbar_conv = []
 Pbar_conv = []
 Abar_conv = []
 for q in res:
-    Fbar_conv.append(q[0])
-    Pbar_conv.append(q[1])
-    Abar_conv.append(q[2])
+    Fbar_conv.append(q["Fbar"])
+    Pbar_conv.append(q["Pbar"])
+    Abar_conv.append(q["dPbar_dFbar"])
 Fbar_conv = np.array(Fbar_conv)
 Pbar_conv = np.array(Pbar_conv)
 Abar_conv = np.array(Abar_conv)
