@@ -35,6 +35,7 @@ class NewtonSolver:
 
     def __init__(self, comm, R_form, J_form, u, du, bcs, mpc=None, *,
                  rel_tol=1e-8, abs_tol=1e-6, max_iter=10, max_iter_instab=30,
+                 div_rel_tol=10.0,
                  petsc_options: dict | None = None,
                  switch_to_minres=False,
                  ):
@@ -48,6 +49,7 @@ class NewtonSolver:
         self._abs_tol = abs_tol
         self._max_iter = max_iter
         self._max_iter_instab = max_iter_instab
+        self._div_rel_tol = div_rel_tol
         self._petsc_options = petsc_options
         self._switch_to_minres = switch_to_minres
         self.mpc = mpc
@@ -135,7 +137,7 @@ class NewtonSolver:
                 is_converged = True
                 break
 
-            if rel > 10 or np.isnan(abs_b_norm):
+            if rel > self._div_rel_tol or np.isnan(abs_b_norm):
                 PETSc.Vec.destroy(residual)
                 break
             

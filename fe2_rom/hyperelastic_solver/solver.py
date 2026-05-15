@@ -404,7 +404,8 @@ class PeriodicHyperelasticHomogenizationSolver:
         
         ### Default Newton, Timestepper, Visualization, Averaging options ###
         newton_options = newton_options if newton_options is not None else {
-            "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 10, "max_iter_instab": 30, "switch_to_minres": False
+            "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 10, "max_iter_instab": 30, 
+            "switch_to_minres": False, "div_rel_tol": 10.0
         }
         timestepper_options = timestepper_options if timestepper_options is not None else {
             "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5, "dt_max": 1.0, "good_newton_steps": 7

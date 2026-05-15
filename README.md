@@ -12,7 +12,11 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 - first-order **computational homogenization** on periodic RVEs (Hill–Mandel
   averaging of `F`, `P`, energy `W`, and tangent `A`),
 - **reduced-order modelling** (POD + ECM hyper-reduction) and a matching
-  reduced RVE solver for fast online queries.
+  reduced RVE solver for fast online queries,
+- **two-scale FE² simulation** — a macroscopic continuum whose constitutive
+  response at every quadrature point comes from a nested RVE solve, with
+  either the full periodic homogenization solver or the reduced ROM as the
+  inner driver.
 
 <p align="center">
   <img src="gifs/lattice.gif" width="32%" />
@@ -20,13 +24,12 @@ The package ships with ready-to-use solvers in 2D and 3D for:
   <img src="gifs/3d_rve.gif" width="32%" />
 </p>
 
-<sub>Left: buckling of a 3D lattice under compression. Middle/right: 2D and 3D
-periodic RVEs under macroscopic stretch.</sub>
+<sub>Compression and buckling of various 2D/3D microstructures.</sub>
 
 ## Features
 
 - **Hyperelastic material models** — `NeoHookean` out of the box, plus a generic
-  `MaterialModel` / `LambdaMaterial` interface to plug in any stored-energy
+  `MaterialModel` / `LambdaMaterial` interface to plug in any strain energy
   density.
 - **Stability monitoring** — every Newton step optionally solves a generalised
   eigenproblem (SLEPc) on the tangent stiffness. When an instability is
@@ -38,10 +41,16 @@ periodic RVEs under macroscopic stretch.</sub>
   / snap-back responses where load- or displacement-control alone fails.
 - **Periodic homogenization** on Gmsh-generated RVEs using `dolfinx_mpc`
   periodic constraints, with macroscopic-gradient driving and effective
-  quantities `F̄, P̄, W̄, Ā` exported on demand.
+  quantities `P̄, W̄, Ā` exported on demand.
 - **ROM toolkit** (`fe2_rom.rve_rom`) — POD basis construction with `H¹` / `L²`
   inner products, ECM hyper-reduction (magic-point selection), and an
   `RVESolver` that runs entirely on the reduced submesh.
+- **FE² macro solver** (`fe2_rom.macro_solver`) — `MacroSolver` wires a
+  macroscopic continuum to a nested RVE at every quadrature point through
+  `dolfinx_materials`. A single `full=True/False` flag switches the inner
+  driver between the full `PeriodicHyperelasticHomogenizationSolver` and the ECM-reduced
+  `RVESolver`, with adaptive load stepping, optional macro-level stability
+  monitoring, and per-rank parallelism over quadrature points.
 - **MPI-parallel** snapshot generation, ROM assembly, and online evaluation.
 - **VTX (ADIOS2) output** for ParaView visualisation and CSV reaction-force
   logging.
@@ -81,9 +90,12 @@ fe2_rom/
 │   ├── boundary.py         # ReactionProbe
 │   ├── timestepping.py     # adaptive TimeStepper
 │   └── output.py           # VTXManager, ReactionForceLogger
-└── rve_rom/                # reduced-order modelling
-    ├── pod.py              # POD basis, ECM hyper-reduction
-    └── solver.py           # RVESolver (reduced online stage)
+├── rve_rom/                # reduced-order modelling
+│   ├── pod.py              # POD basis, ECM hyper-reduction
+│   └── solver.py           # RVESolver (reduced online stage)
+└── macro_solver/           # FE² two-scale driver
+    ├── macro.py            # MacroSolver (outer continuum + nested RVEs)
+    └── material.py         # RVEMaterial (dolfinx_materials bridge)
 
 examples/
 ├── hyperelastic_solver/
@@ -91,9 +103,11 @@ examples/
 │   ├── example_2/      # 3D hexagonal lattice — compressive buckling
 │   ├── example_3/      # 3D extruded honeycomb beam — bending/buckling
 │   └── arc-length/     # snap-back of a deep parabolic arch
-└── periodic_solver/
-    ├── example_1/      # 2D perforated RVE — full-order and ROM
-    └── example_2/      # 3D periodic RVE — full-order and ROM
+├── periodic_solver/
+│   ├── example_1/      # 2D perforated RVE — full-order and ROM
+│   └── example_2/      # 3D periodic RVE — full-order and ROM
+└── macro_solver/
+    └── example_1/      # FE² — single-element macro cube × 3D periodic RVE
 ```
 
 ## Quick start
@@ -182,6 +196,67 @@ python run_homogenization_rom.py
 hyper-reduction selects "magic points" on a sub-mesh. The reduced solver
 (`fe2_rom.rve_rom.solver.RVESolver`) reproduces `P̄(F̄)` and the tangent `Ā(F̄)` at a
 fraction of the full-order cost.
+
+### 5. Two-scale FE² simulation
+
+`MacroSolver` wires a macroscopic continuum to a nested RVE at every macro
+quadrature point. The inner driver is selected by a single `full` flag — set
+`full=True` to use the periodic homogenization solver directly, or `full=False`
+(with `rom_dir=...`) to drive each qp with the ECM-reduced `RVESolver`.
+
+```python
+from mpi4py import MPI
+from dolfinx import fem, mesh as dmesh
+from fe2_rom.hyperelastic_solver import NeoHookean, TimeStepper, ReactionForceLogger
+from fe2_rom.macro_solver import MacroSolver
+import numpy as np
+
+comm = MPI.COMM_WORLD
+domain = dmesh.create_unit_cube(comm, 1, 1, 1, cell_type=dmesh.CellType.hexahedron)
+
+solver = MacroSolver(
+    mesh=domain,
+    full=True,                              # full=False + rom_dir=... for ROM-backed FE²
+    n_qp=1,
+    rve_mesh_path="mesh.msh",
+    rve_material=NeoHookean(mu=1153.8, lmbda=1730.8),
+    rve_average_fields=["P", "A"],          # MacroSolver reads back [P̄, Ā]
+    rve_check_stability=True,
+    gdim=3, degree=1,
+    check_stability=True,                    # macro-level instability monitoring
+)
+
+zero, disp = fem.Constant(domain, 0.0), fem.Constant(domain, 0.0)
+for sub in (0, 1, 2):
+    solver.add_bc(sub, lambda x: np.isclose(x[2], 0.0), zero)
+solver.add_bc(2, lambda x: np.isclose(x[2], 1.0), disp,
+              measure_reaction=True, reaction_direction=(0.0, 0.0, 1.0))
+solver.setup()
+
+solver.solve(
+    output_dir="output",
+    timestepper=TimeStepper(t_end=1.0, dt_init=1.0, dt_min=1e-3),
+    loadhistory=lambda t: setattr(disp, "value", -0.05 * t),
+    reaction_logger=ReactionForceLogger(),
+)
+```
+
+Run the full example (single hex element, 3D RVE inside):
+
+```bash
+cd examples/macro_solver/example_1
+python run_macro.py
+```
+
+Each accepted macro step commits every RVE's state so nested solves
+warm-start from their previous converged configuration. On RVE non-convergence
+the macro step is rejected and the timestepper halves dt; on macro
+instability the displacement is perturbed along the lowest eigenmode and the
+Newton solve is re-driven.
+
+> Note: the FE² macro solver depends on
+> [`dolfinx_materials`](https://github.com/bleyerj/dolfinx_materials) — see the
+> install instructions above.
 
 ## License
 
