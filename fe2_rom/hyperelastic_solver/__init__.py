@@ -7,6 +7,7 @@ from .averages import (
     EffectivePi,
     EffectiveW,
     HomogenizationContext,
+    TangentBlock,
     resolve_average_quantities,
 )
 from .boundary import ReactionProbe
@@ -23,6 +24,7 @@ from .material import LambdaMaterial, MaterialModel, NeoHookean
 from .output import ReactionForceLogger, VTXManager
 from .saddle_point import SaddlePointNewtonSolver
 from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
+from .solver_micromorphic import MicromorphicHyperelasticHomogenizationSolver
 from .solvers import (
     ArcLengthSolver,
     CylindricalArcLength,
@@ -42,13 +44,14 @@ __all__ = [
     "NewtonSolver", "NewtonSolverFE2", "SaddlePointNewtonSolver",
     "ArcLengthSolver", "CylindricalArcLength",
     "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
+    "MicromorphicHyperelasticHomogenizationSolver",
     # Constraints
     "LinearConstraint",
     "ZeroVolumeAverage", "ZeroVolumeAverageDot", "ZeroVolumeAverageOuter",
     # Average quantities
     "AverageQuantity", "HomogenizationContext",
     "EffectiveFbar", "EffectivePbar", "EffectiveAbar", "EffectiveW",
-    "EffectivePi", "EffectiveLambda",
+    "EffectivePi", "EffectiveLambda", "TangentBlock",
     "resolve_average_quantities",
     # Misc infrastructure
     "StabilityAnalyzer",

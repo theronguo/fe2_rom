@@ -71,7 +71,7 @@ lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 solver = MacroSolver(
     mesh=domain,
     full=True,
-    n_qp=1,
+    n_qp=2,
     rve_mesh_path=RVE_MESH,
     rve_material=NeoHookean(mu=mu_micro, lmbda=lam_micro),
     rve_check_stability=True,

@@ -225,6 +225,77 @@ class EffectiveLambda(AverageQuantity):
         return Lam
 
 
+class TangentBlock(AverageQuantity):
+    """Generic ``dQ/dμ`` block for quantities of the form ``Q = ⟨inner(M, P)⟩``.
+
+    ``M`` is a 2-tensor independent of ``F`` and macro variables, indexed by
+    ``q_shape`` (in C order). ``μ`` is a macro variable whose forward
+    sensitivities ``p_{μ_k} = ∂w/∂μ_k`` were computed by the Newton solver and
+    are passed as ``adjoints[macro_var_name]``. The block reads
+
+        T[q, μ] = ⟨ M[q] : A : (∂F/∂μ_k + ∇p_{μ_k}) ⟩ / V
+
+    and is returned as a NumPy array of shape ``q_shape + mu_shape``.
+
+    M and ∂F/∂μ are supplied as factories ``f(context) -> list[ufl.Expr]`` so
+    they can reference symbolic state (``phi``, ``X``, etc.) constructed by
+    the solver.
+    """
+
+    def __init__(self, name: str, macro_var_name: str,
+                 q_shape: tuple, mu_shape: tuple,
+                 M_factory, dF_dmu_factory):
+        self.name = name
+        self.required_macro_adjoints = [macro_var_name]
+        self._macro_var = macro_var_name
+        self._q_shape = tuple(q_shape)
+        self._mu_shape = tuple(mu_shape)
+        self._M_factory = M_factory
+        self._dF_dmu_factory = dF_dmu_factory
+
+    def setup(self, context):
+        M_list = self._M_factory(context)
+        dF_list = self._dF_dmu_factory(context)
+        n_q = int(np.prod(self._q_shape)) if self._q_shape else 1
+        n_mu = int(np.prod(self._mu_shape)) if self._mu_shape else 1
+        if len(M_list) != n_q:
+            raise ValueError(
+                f"TangentBlock {self.name!r}: M_factory returned {len(M_list)} "
+                f"entries; expected {n_q} for q_shape={self._q_shape}"
+            )
+        if len(dF_list) != n_mu:
+            raise ValueError(
+                f"TangentBlock {self.name!r}: dF_dmu_factory returned {len(dF_list)} "
+                f"entries; expected {n_mu} for mu_shape={self._mu_shape}"
+            )
+
+        i, j, k, l = ufl.indices(4)
+        A = context.A_ufl
+        self._adj_slots = [fem.Function(context.V) for _ in range(n_mu)]
+        self._forms = [[None] * n_mu for _ in range(n_q)]
+        for qi in range(n_q):
+            M = M_list[qi]
+            for mi in range(n_mu):
+                dF_total = dF_list[mi] + ufl.grad(self._adj_slots[mi])
+                A_dF = ufl.as_tensor(A[i, j, k, l] * dF_total[k, l], (i, j))
+                self._forms[qi][mi] = fem.form(ufl.inner(M, A_dF) * context.dx)
+        self._n_q = n_q
+        self._n_mu = n_mu
+
+    def compute(self, context, adjoints):
+        src_list = adjoints[self._macro_var]
+        for mi, slot in enumerate(self._adj_slots):
+            slot.x.array[:] = src_list[mi].x.array
+            slot.x.scatter_forward()
+        flat = np.zeros((self._n_q, self._n_mu))
+        for qi in range(self._n_q):
+            for mi in range(self._n_mu):
+                flat[qi, mi] = _avg_scalar(
+                    self._forms[qi][mi], context.comm, context.vol_global
+                )
+        return flat.reshape(self._q_shape + self._mu_shape)
+
+
 STRING_KEY_MAP: dict[str, type[AverageQuantity]] = {
     "F": EffectiveFbar,
     "Fbar": EffectiveFbar,
