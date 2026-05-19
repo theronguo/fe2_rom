@@ -7,6 +7,38 @@ from slepc4py import SLEPc
 logger = logging.getLogger(__name__)
 
 
+def solve_smallest_eigenpairs(
+    K: PETSc.Mat, comm, *, nev: int, tol: float = 1e-4,
+    petsc_options: dict | None = None,
+) -> tuple[SLEPc.EPS, int]:
+    """Solve ``K φ = λ φ`` for the ``nev`` eigenpairs closest to zero.
+
+    Uses SLEPc EPS with shift-invert at σ=0 and ``TARGET_REAL`` ordering, so
+    converged eigenvalues come back sorted by ascending |λ|. Returns the
+    configured/solved ``EPS`` plus the number of converged eigenpairs; the
+    caller owns ``eps`` and is responsible for ``eps.destroy()`` (and for
+    ``K`` destruction).
+    """
+    eps = SLEPc.EPS().create(comm)
+    eps.setOperators(K)
+    eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
+    st = eps.getST()
+    st.setType(SLEPc.ST.Type.SINVERT)
+    eps.setTarget(0.0)
+    eps.setDimensions(nev=nev)
+    eps.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
+    eps.setTolerances(tol=tol)
+
+    if petsc_options is not None:
+        opts = PETSc.Options()
+        for key, val in petsc_options.items():
+            opts[key] = val
+
+    eps.setFromOptions()
+    eps.solve()
+    return eps, eps.getConverged()
+
+
 class StabilityAnalyzer:
     """Checks stability of the current equilibrium state via eigenvalue analysis.
 
@@ -68,34 +100,11 @@ class StabilityAnalyzer:
         logger.info("Running stability analysis (nev=%d, skip=%d) ...",
                     self._nev, self._n_skip)
 
-        eigensolver = SLEPc.EPS().create(self._comm)
-        eigensolver.setOperators(K)
-        eigensolver.setProblemType(SLEPc.EPS.ProblemType.HEP)
-        st = eigensolver.getST()
-        st.setType(SLEPc.ST.Type.SINVERT)
-        # Shift-invert needs to factor (K - σ·I) once per call. Use MUMPS LDLᵀ:
-        # symmetric, handles indefinite K via pivoting, ~3–5× faster than the
-        # PETSc-builtin LU that SLEPc otherwise picks.
-        # st_ksp = st.getKSP()
-        # st_ksp.setType("preonly")
-        # st_pc = st_ksp.getPC()
-        # st_pc.setType("cholesky")
-        # st_pc.setFactorSolverType("mumps")
-        eigensolver.setTarget(0.0)
-        eigensolver.setDimensions(nev=total_nev)
-        eigensolver.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
-        eigensolver.setTolerances(tol=self._tol)
-
-        if self._petsc_options is not None:
-            opts = PETSc.Options()
-            for key, val in self._petsc_options.items():
-                opts[key] = val
-
-        eigensolver.setFromOptions()
+        eigensolver, n_conv = solve_smallest_eigenpairs(
+            K, self._comm, nev=total_nev, tol=self._tol,
+            petsc_options=self._petsc_options,
+        )
         try:
-            eigensolver.solve()
-
-            n_conv = eigensolver.getConverged()
             all_eigenvalues = np.array([
                 eigensolver.getEigenvalue(i).real
                 for i in range(min(n_conv, total_nev))

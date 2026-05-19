@@ -24,7 +24,6 @@ import numpy as np
 import ufl
 from dolfinx import fem, io
 from petsc4py import PETSc
-from slepc4py import SLEPc
 
 from .averages import (
     EffectiveAbar,
@@ -36,6 +35,7 @@ from .averages import (
 )
 from .forms import basis_tensor_ufl
 from .solver import PeriodicHyperelasticHomogenizationSolver
+from .stability import solve_smallest_eigenpairs
 
 logger = logging.getLogger(__name__)
 
@@ -326,23 +326,11 @@ class MicromorphicHyperelasticHomogenizationSolver(
         # 2. Assemble K and solve the eigenproblem.
         K = self._newton.assemble_stiffness()
         try:
-            eps = SLEPc.EPS().create(self.comm)
-            eps.setOperators(K)
-            eps.setProblemType(SLEPc.EPS.ProblemType.HEP)
-            st = eps.getST()
-            st.setType(SLEPc.ST.Type.SINVERT)
-            eps.setTarget(0.0)
-            eps.setDimensions(nev=n_modes)
-            eps.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
-            eps.setTolerances(tol=tol)
-            if slepc_options is not None:
-                opts = PETSc.Options()
-                for key, val in slepc_options.items():
-                    opts[key] = val
-            eps.setFromOptions()
-            eps.solve()
+            eps, n_conv = solve_smallest_eigenpairs(
+                K, self.comm, nev=n_modes, tol=tol,
+                petsc_options=slepc_options,
+            )
 
-            n_conv = eps.getConverged()
             if n_conv < n_modes:
                 logger.warning(
                     "Linear buckling: requested %d modes, SLEPc converged %d",

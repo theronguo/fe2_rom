@@ -52,7 +52,7 @@ os.makedirs(output_dir, exist_ok=True)
 
 
 # --- Solver ---------------------------------------------------------------
-N_MODES = 5
+N_MODES = 1
 solver = MicromorphicHyperelasticHomogenizationSolver(
     mesh_path=RVE_MESH,
     comm=comm,
