@@ -22,7 +22,6 @@ from .forms import basis_tensor_ufl, build_homogenization_weak_form, build_weak_
 from .logging_utils import broadcast_logger, qp_context, setup_logging, silence_c_stdout
 from .material import LambdaMaterial, MaterialModel, NeoHookean
 from .output import ReactionForceLogger, VTXManager
-from .saddle_point import SaddlePointNewtonSolver
 from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
 from .solver_micromorphic import MicromorphicHyperelasticHomogenizationSolver
 from .solvers import (
@@ -41,7 +40,7 @@ __all__ = [
     "ReactionProbe",
     "build_weak_forms", "build_homogenization_weak_form", "basis_tensor_ufl",
     # Solvers
-    "NewtonSolver", "NewtonSolverFE2", "SaddlePointNewtonSolver",
+    "NewtonSolver", "NewtonSolverFE2",
     "ArcLengthSolver", "CylindricalArcLength",
     "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
     "MicromorphicHyperelasticHomogenizationSolver",

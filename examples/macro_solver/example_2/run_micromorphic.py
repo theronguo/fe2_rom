@@ -40,7 +40,7 @@ logger.addFilter(lambda r: comm.rank == 0)
 # --- RVE setup --------------------------------------------------------------
 HERE = os.path.dirname(__file__)
 RVE_MESH = os.path.abspath(
-    os.path.join(HERE, "..", "..", "periodic_solver", "example_1", "rve.msh")
+    os.path.join(HERE, "rve.msh")
 )
 
 E_micro, nu_micro = 3000.0, 0.30

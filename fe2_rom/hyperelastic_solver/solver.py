@@ -384,10 +384,10 @@ class HyperelasticStabilitySolver:
 class PeriodicHyperelasticHomogenizationSolver:
     """Periodic hyperelastic homogenization with pluggable effective quantities.
 
-    Rigid-body modes are removed by Dirichlet-pinning the corner nodes (the
-    original gauge fix) and the periodic ties are enforced via ``dolfinx_mpc``.
-    The Newton step is the standard ``NewtonSolverFE2`` path with CG/MINRES
-    + GAMG (no saddle-point augmentation).
+    Periodic ties are enforced via ``dolfinx_mpc`` for faces and corners
+    (all non-max corners are slaved to the max corner). The Newton step is
+    the standard ``NewtonSolverFE2`` path with CG/MINRES + GAMG
+    (no saddle-point augmentation).
 
     Effective quantities and tangent moduli are computed through the modular
     ``AverageQuantity`` interface; ``__call__`` returns
@@ -413,6 +413,7 @@ class PeriodicHyperelasticHomogenizationSolver:
                  timestepper_options: dict | None = None,
                  save_snapshots: list[str] | None = None,
                  averages_only_final: bool = False,
+                 corner_periodic: bool = False,
                  ) -> None:
 
         newton_options = newton_options if newton_options is not None else {
@@ -469,7 +470,8 @@ class PeriodicHyperelasticHomogenizationSolver:
         self.F_bar_conv = np.eye(self.gdim, dtype=PETSc.ScalarType)
         logger.debug("Functions set up with %d global DOFs", n_dofs)
 
-        # ---- Periodic BCs + MPC (corner-pinning makes K SPD) ----
+        # ---- Periodic BCs + MPC ----
+        self._corner_periodic = corner_periodic
         bcs, self.mpc = self._setup_periodic_bcs_and_mpc()
         self._bcs = bcs
         logger.debug("Periodic BCs set up with %d slave points",
@@ -481,8 +483,8 @@ class PeriodicHyperelasticHomogenizationSolver:
 
         # ---- Stability analyzer (optional) ----
         if check_stability:
-            # With corner-pinning K is SPD (no zero modes); subclasses that
-            # introduce additional zero modes override ``_count_zero_modes``.
+            # With purely periodic constraints, rigid translations remain as
+            # near-zero modes; subclasses can override ``_count_zero_modes``.
             n_skip_default = self._count_zero_modes()
             n_skip = stability_options.pop("n_skip_eigenvalues", n_skip_default)
             self._stability = StabilityAnalyzer(
@@ -508,7 +510,7 @@ class PeriodicHyperelasticHomogenizationSolver:
         # ---- Adjoint-RHS forms per macro variable (subclass extends) ----
         self._macro_var_rhs_forms = self._build_macro_var_rhs_forms(build_tangent_rhs_forms)
 
-        # ---- Newton solver (NewtonSolverFE2 with corner-pinning BCs) ----
+        # ---- Newton solver (NewtonSolverFE2 with periodic MPC ties) ----
         self._newton = NewtonSolverFE2(
             self.comm, R_form, J_form, self.u, self._du, self._bcs, self.mpc,
             **newton_options,
@@ -594,12 +596,14 @@ class PeriodicHyperelasticHomogenizationSolver:
     def _count_zero_modes(self) -> int:
         """Number of near-zero modes of K that the stability check should skip.
 
-        With corner-pinning Dirichlet BCs (this base class), K is SPD and has
-        no zero modes — return 0. Subclasses that swap corner-pinning for an
-        integral gauge or otherwise introduce gauge directions in K's null
-        space must override; e.g. for ``⟨w⟩=0`` the value is ``gdim``.
+        With ``corner_periodic=True``, the corner MPC (3 slave corners → 1
+        master in 2D; 7 → 1 in 3D) produces ``gdim`` rigid-body translations
+        plus one spurious numerical mode from the dolfinx_mpc assembly, giving
+        ``gdim + 1`` modes to skip.  With ``corner_periodic=False``
+        (Dirichlet-pinned corners) K is SPD so skip 0.
+        Subclasses with additional gauges should override.
         """
-        return 0
+        return self.gdim + 1 if self._corner_periodic else 0
 
     # ------------------------------------------------------------------
     # Mesh / MPC helpers
@@ -629,15 +633,57 @@ class PeriodicHyperelasticHomogenizationSolver:
 
     @staticmethod
     def _make_periodic_slave_selector(axis: int, mins: np.ndarray, maxs: np.ndarray,
-                                      tol: float, exclude_axes: tuple[int, ...]) -> Callable:
+                                      tol: float, exclude_axes: tuple[int, ...],
+                                      corners: list[np.ndarray]) -> Callable:
         def selector(x):
             mask = np.isclose(x[axis], mins[axis], atol=tol, rtol=0.0)
             for ex_axis in exclude_axes:
                 mask &= (x[ex_axis] > mins[ex_axis] + tol)
                 mask &= (x[ex_axis] < maxs[ex_axis] - tol)
+            for corner in corners:
+                on_corner = np.ones(x.shape[1], dtype=bool)
+                for ax in range(len(corner)):
+                    on_corner &= np.isclose(x[ax], corner[ax], atol=tol, rtol=0.0)
+                mask &= ~on_corner
             return mask
         return selector
 
+    @staticmethod
+    def _make_corner_selector(corner_coords: np.ndarray, tol: float) -> Callable:
+        """Select the single geometric corner at ``corner_coords``."""
+
+        def selector(x):
+            mask = np.ones(x.shape[1], dtype=bool)
+            for axis, value in enumerate(corner_coords):
+                mask &= np.isclose(x[axis], value, atol=tol, rtol=0.0)
+            return mask
+
+        return selector
+
+    @staticmethod
+    def _make_corner_map(master_coords: np.ndarray) -> Callable:
+        """Map any selected slave corner to the master-corner coordinates."""
+
+        def corner_map(x):
+            y = x.copy()
+            for axis, value in enumerate(master_coords):
+                y[axis] = value
+            return y
+
+        return corner_map
+
+    @staticmethod
+    def _corner_coordinates(mins: np.ndarray, maxs: np.ndarray) -> list[np.ndarray]:
+        """Enumerate all domain corners (2**dim)."""
+        dim = len(mins)
+        corners: list[np.ndarray] = []
+        for bits in range(1 << dim):
+            coord = np.empty(dim, dtype=float)
+            for axis in range(dim):
+                coord[axis] = maxs[axis] if (bits >> axis) & 1 else mins[axis]
+            corners.append(coord)
+        return corners
+    
     @staticmethod
     def _locate_corner_dofs(V, mins: np.ndarray, maxs: np.ndarray, tol: float) -> np.ndarray:
         """Locate all corner DOFs (4 in 2D, 8 in 3D; times vector components)."""
@@ -654,13 +700,13 @@ class PeriodicHyperelasticHomogenizationSolver:
         return fem.locate_dofs_geometrical(V, corner_selector)
 
     def _setup_periodic_bcs_and_mpc(self) -> tuple[list, dolfinx_mpc.MultiPointConstraint]:
-        """Build periodic-tie MPC and corner-pinning Dirichlet BCs for a
-        rectangular / cuboid domain.
+        """Build periodic-tie MPC for a rectangular / cuboid domain.
 
-        Corner-pinning removes the rigid-body translation null space so K is
-        SPD and CG + GAMG works out of the box. The Lagrange-multiplier
-        gauge alternative (``⟨w⟩=0`` etc.) lives in ``SaddlePointNewtonSolver``
-        and is used by the micromorphic subclass.
+        If ``corner_periodic=True`` (default), all non-max corners are
+        slaved to the max corner via MPC, giving 3 constraints in 2D and
+        7 in 3D (fully periodic, no Dirichlet pins).  If
+        ``corner_periodic=False``, all corners are Dirichlet-pinned to zero
+        instead, making K SPD without any gauge near-zero modes.
         """
         if self.gdim not in (2, 3):
             raise ValueError(
@@ -668,18 +714,31 @@ class PeriodicHyperelasticHomogenizationSolver:
             )
         tol = 1e-8 * max(1.0, float(np.max(self.maxs - self.mins)))
 
-        corner = self._locate_corner_dofs(self.V, self.mins, self.maxs, tol)
-        u_zero = fem.Constant(self._mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
-        bcs = [fem.dirichletbc(u_zero, corner, self.V)]
+        if self._corner_periodic:
+            bcs: list = []
+        else:
+            corner_dofs = self._locate_corner_dofs(self.V, self.mins, self.maxs, tol)
+            u_zero = fem.Constant(self._mesh, np.zeros(self.gdim, dtype=PETSc.ScalarType))
+            bcs = [fem.dirichletbc(u_zero, corner_dofs, self.V)]
 
         mpc = dolfinx_mpc.MultiPointConstraint(self.V)
         for axis in range(self.gdim):
             selector = self._make_periodic_slave_selector(
                 axis=axis, mins=self.mins, maxs=self.maxs, tol=tol,
-                exclude_axes=tuple(range(axis)),
+                exclude_axes=tuple(range(axis)), corners=self._corner_coordinates(self.mins, self.maxs)
             )
             axis_map = self._make_axis_map(axis, self.maxs[axis])
             mpc.create_periodic_constraint_geometrical(self.V, selector, axis_map, bcs)
+
+        if self._corner_periodic:
+            master_corner = self.maxs.copy()
+            corner_map = self._make_corner_map(master_corner)
+            for corner_coords in self._corner_coordinates(self.mins, self.maxs):
+                if np.allclose(corner_coords, master_corner, atol=tol, rtol=0.0):
+                    continue
+                selector = self._make_corner_selector(corner_coords, tol)
+                mpc.create_periodic_constraint_geometrical(self.V, selector, corner_map, bcs)
+
         mpc.finalize()
 
         return bcs, mpc

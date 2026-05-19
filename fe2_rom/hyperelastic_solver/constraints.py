@@ -34,8 +34,8 @@ class LinearConstraint(ABC):
         """
 
     def validate(self, V, mpc, tol: float = 1e-10) -> None:
-        """Optional sanity check at setup. Default: no-op."""
-        return
+        _check_function_on_space(self._phi, V)
+        _check_periodic(self._phi, mpc, tol)
 
 
 def _check_function_on_space(phi: fem.Function, V) -> None:
@@ -74,6 +74,9 @@ class ZeroVolumeAverage(LinearConstraint):
         forms = [fem.form(v[d] * dx) for d in range(gdim)]
         rhs = np.zeros(gdim)
         return forms, rhs
+    
+    def validate(self, V, mpc, tol: float = 1e-10) -> None:
+        return
 
 
 class ZeroVolumeAverageDot(LinearConstraint):
@@ -90,10 +93,6 @@ class ZeroVolumeAverageDot(LinearConstraint):
         forms = [fem.form(ufl.inner(v, self._phi) * dx)]
         rhs = np.zeros(1)
         return forms, rhs
-
-    def validate(self, V, mpc, tol: float = 1e-10) -> None:
-        _check_function_on_space(self._phi, V)
-        _check_periodic(self._phi, mpc, tol)
 
 
 class ZeroVolumeAverageOuter(LinearConstraint):
@@ -114,7 +113,3 @@ class ZeroVolumeAverageOuter(LinearConstraint):
         forms = [fem.form(ufl.inner(v, self._phi) * X[b] * dx) for b in range(gdim)]
         rhs = np.zeros(gdim)
         return forms, rhs
-
-    def validate(self, V, mpc, tol: float = 1e-10) -> None:
-        _check_function_on_space(self._phi, V)
-        _check_periodic(self._phi, mpc, tol)

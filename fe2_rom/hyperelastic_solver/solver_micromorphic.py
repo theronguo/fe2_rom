@@ -283,6 +283,7 @@ class MicromorphicHyperelasticHomogenizationSolver(
         slepc_options: "dict | None" = None,
         visualize_modes: bool = False,
         modes_filename: str = "buckling_modes.bp",
+        n_skip: "int | None" = None,
     ) -> np.ndarray:
         """Linear buckling analysis: load the first ``n_modes`` eigenmodes of
         the tangent ``K`` at a reference macro state into ``self._phi``.
@@ -293,16 +294,23 @@ class MicromorphicHyperelasticHomogenizationSolver(
            ``Fbar=I``, ``v=0``, ``g=0`` (undeformed); pass an ``Fbar`` close
            to (or past) the critical load to capture true buckling modes.
         2. Assemble ``K`` at that state and solve ``K φ = λ φ`` for the
-           ``n_modes`` smallest-magnitude eigenpairs (SLEPc shift-invert at
-           ``σ = 0``, ``TARGET_REAL``).
-        3. Apply the periodic MPC backsubstitution to each eigenvector, scale
-           to unit ``ℓ²`` norm, and store it in ``self._phi[i]``.
+           ``n_modes + n_skip`` smallest-magnitude eigenpairs (SLEPc
+           shift-invert at ``σ = 0``, ``TARGET_REAL``).
+        3. Skip the first ``n_skip`` eigenpairs (null-space / gauge modes),
+           apply periodic MPC backsubstitution to the remaining ones, scale to
+           unit ``ℓ²`` norm, and store in ``self._phi[i]``.
+
+        ``n_skip`` defaults to ``self._count_zero_modes()``.  With
+        ``corner_periodic=True`` the dolfinx_mpc corner constraint introduces
+        one extra spurious near-zero mode beyond the ``gdim`` rigid-body
+        translations; pass ``n_skip`` explicitly to override the default count.
 
         After this call the reference solve has *not* been committed (the
         converged restart in ``F_bar_conv``/``_u_conv`` is unchanged), so the
         next ``self(F̄, v, g)`` ramps from the same baseline as before.
 
-        Returns the ``n_modes`` eigenvalues as a NumPy array.
+        Returns the ``n_modes`` physical eigenvalues as a NumPy array (NaN for
+        any slots where SLEPc did not converge).
         """
         if n_modes <= 0:
             raise ValueError(f"n_modes must be positive, got {n_modes}")
@@ -311,40 +319,52 @@ class MicromorphicHyperelasticHomogenizationSolver(
                 f"Requested {n_modes} modes but solver was constructed with "
                 f"N={self._N_modes}. Build the solver with N >= n_modes."
             )
+        if n_skip is None:
+            n_skip = self._count_zero_modes()
 
         # 1. Reference solve at the chosen macro state.
-        if Fbar is None:
-            Fbar = np.eye(self.gdim, dtype=PETSc.ScalarType)
-        logger.info("Linear buckling: reference solve at F̄ = \n%s", Fbar)
         # Reset φ to zero so the reference state is the standard hyperelastic
         # one (no φ-contribution mixing into K).
         for phi in self._phi:
             phi.x.array[:] = 0.0
             phi.x.scatter_forward()
-        self(Fbar, v, g, pert_amplitude_init=0.0)
+        if Fbar is not None:
+            logger.info("Linear buckling: reference solve at F̄ = \n%s", Fbar)
+            self(Fbar, v, g)
 
         # 2. Assemble K and solve the eigenproblem.
         K = self._newton.assemble_stiffness()
         try:
+            nev_total = n_modes + n_skip
             eps, n_conv = solve_smallest_eigenpairs(
-                K, self.comm, nev=n_modes, tol=tol,
+                K, self.comm, nev=nev_total, tol=tol,
                 petsc_options=slepc_options,
             )
 
-            if n_conv < n_modes:
+            if n_conv < nev_total:
                 logger.warning(
-                    "Linear buckling: requested %d modes, SLEPc converged %d",
-                    n_modes, n_conv,
+                    "Linear buckling: requested %d modes (%d physical + %d skipped), "
+                    "SLEPc converged %d",
+                    nev_total, n_modes, n_skip, n_conv,
                 )
 
-            # 3. Load eigenvectors into self._phi.
-            eigvals = np.zeros(n_modes)
-            n_load = min(n_modes, n_conv)
+            skipped_eigvals = [eps.getEigenvalue(i).real for i in range(min(n_skip, n_conv))]
+            logger.info(
+                "Linear buckling: skipping %d null-space/gauge modes with λ = %s",
+                n_skip,
+                np.array2string(np.array(skipped_eigvals), precision=3),
+            )
+
+            # 3. Load physical eigenvectors (indices n_skip .. n_skip+n_modes-1).
+            eigvals = np.full(n_modes, np.nan)
+            n_phys_conv = max(0, n_conv - n_skip)
+            n_load = min(n_modes, n_phys_conv)
             for i in range(n_load):
-                lam = eps.getEigenvalue(i).real
+                idx = n_skip + i
+                lam = eps.getEigenvalue(idx).real
                 eigvals[i] = lam
                 phi_vec = self._phi[i].x.petsc_vec
-                eps.getEigenvector(i, phi_vec)
+                eps.getEigenvector(idx, phi_vec)
                 if self.mpc is not None:
                     self.mpc.backsubstitution(phi_vec)
                 self._phi[i].x.scatter_forward()
@@ -356,10 +376,9 @@ class MicromorphicHyperelasticHomogenizationSolver(
             for i in range(n_load, n_modes):
                 self._phi[i].x.array[:] = 0.0
                 self._phi[i].x.scatter_forward()
-                eigvals[i] = np.nan
 
             logger.info(
-                "Linear buckling eigenvalues (smallest |λ|): %s",
+                "Linear buckling eigenvalues (physical, smallest |λ|): %s",
                 np.array2string(eigvals, precision=4),
             )
 
