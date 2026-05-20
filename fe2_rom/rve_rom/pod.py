@@ -284,7 +284,8 @@ class ECM:
     def __init__(self, basis_u, basis_P, V, S,
                  degree: int = 1,
                  sigma_u=None, sigma_P=None,
-                 ratio_uP=1.0, ratio_P=1.0):
+                 ratio_uP=1.0, ratio_P=1.0,
+                 kwargs: dict | None = None):
         self.basis_u = basis_u
         self.basis_P = basis_P
         self.N = basis_u.shape[1]
@@ -300,6 +301,20 @@ class ECM:
         self.sigma_P = np.ones(self.M) if sigma_P is None else np.asarray(sigma_P, dtype=float)
         self.ratio_uP = ratio_uP
         self.ratio_P = ratio_P
+        # Extra volume-integral-only bases.  Each entry is
+        #   name -> {"basis", "space", "sigma" (optional), "ratio" (optional)}
+        self.extras: dict = {}
+        for name, spec in (kwargs or {}).items():
+            basis = spec["basis"]
+            sigma = spec.get("sigma")
+            self.extras[name] = {
+                "basis": basis,
+                "space": spec["space"],
+                "M": basis.shape[1],
+                "sigma": (np.ones(basis.shape[1]) if sigma is None
+                          else np.asarray(sigma, dtype=float)),
+                "ratio": float(spec.get("ratio", 1.0)),
+            }
         self.magic_points = None
         self.magic_weights = None
 
@@ -371,8 +386,46 @@ class ECM:
         mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
         mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
 
-        A = np.vstack([mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0), self._weights])
-        b = np.concatenate([mat_int_w.reshape(-1), mat_P_int_w.reshape(-1), [self._volume]])
+        A_blocks = [mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0)]
+        b_blocks = [mat_int_w.reshape(-1), mat_P_int_w.reshape(-1)]
+
+        # Extra volume-integral-only blocks from `kwargs`.
+        for entry in self.extras.values():
+            basis = entry["basis"]
+            space = entry["space"]
+            M_x = entry["M"]
+            sigma = entry["sigma"]
+            ratio = entry["ratio"]
+            sx = sigma / sigma[0]                          # (M_x,), sx[0] == 1
+
+            basis_func_x = fem.Function(space)
+            x_shape = basis_func_x.ufl_shape
+            x_component_forms = []
+            for idx in (np.ndindex(*x_shape) if x_shape else [()]):
+                if not idx:
+                    comp = basis_func_x
+                elif len(idx) == 1:
+                    comp = basis_func_x[idx[0]]
+                else:
+                    comp = basis_func_x[idx]
+                x_component_forms.append(fem.form(comp * cell_avg * dx))
+            n_x_components = len(x_component_forms)
+
+            mat_x = np.zeros((M_x, n_x_components, dofs_Q0))
+            for j in range(M_x):
+                basis_func_x.x.array[:] = basis[:, j]
+                for c, form_xc in enumerate(x_component_forms):
+                    mat_x[j, c, :] = petsc.assemble_vector(form_xc).array.copy()
+            mat_x_int = mat_x.sum(axis=2)
+
+            w_x         = ratio * sx                                          # (M_x,)
+            mat_x_w     = mat_x     * w_x[:, np.newaxis, np.newaxis]
+            mat_x_int_w = mat_x_int * w_x[:, np.newaxis]
+            A_blocks.append(mat_x_w.reshape(-1, dofs_Q0))
+            b_blocks.append(mat_x_int_w.reshape(-1))
+
+        A = np.vstack(A_blocks + [self._weights])
+        b = np.concatenate(b_blocks + [[self._volume]])
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 

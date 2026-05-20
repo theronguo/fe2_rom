@@ -340,6 +340,7 @@ class MicromorphicHyperelasticHomogenizationSolver(
         slepc_options: "dict | None" = None,
         visualize_modes: bool = False,
         modes_filename: str = "buckling_modes.bp",
+        save_modes: bool = False,
         n_skip: "int | None" = None,
     ) -> np.ndarray:
         """Linear buckling analysis: load the first ``n_modes`` eigenmodes of
@@ -460,6 +461,20 @@ class MicromorphicHyperelasticHomogenizationSolver(
             # Optional ParaView output — one timestep per mode (t = mode index).
             # The file contains a single vector field ``phi``; scrubbing the
             # time slider in ParaView walks through φ₀, φ₁, …, φ_{N−1}.
+            if save_modes and n_load > 0:
+                snap_dir = f"{self.output_dir}/snapshots"
+                if self.comm.rank == 0:
+                    os.makedirs(snap_dir, exist_ok=True)
+                self.comm.barrier()
+                for i in range(n_load):
+                    self._save_snapshot("phi", self._phi[i], int(i))
+                if self.comm.rank == 0:
+                    np.save(f"{snap_dir}/buckling_eigvals.npy", eigvals)
+                logger.info(
+                    "Saved %d buckling mode(s) as numpy arrays to %s",
+                    n_load, snap_dir,
+                )
+
             if visualize_modes and n_load > 0:
                 out_path = os.path.join(self.output_dir, modes_filename)
                 os.makedirs(self.output_dir, exist_ok=True)

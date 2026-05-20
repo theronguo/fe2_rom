@@ -66,9 +66,10 @@ solver = MicromorphicHyperelasticHomogenizationSolver(
     newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                     "max_iter": 50, "div_rel_tol": 10,
                     "switch_to_minres": True},
-    timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5,
-                         "dt_max": 1.0, "good_newton_steps": 5},
-    averages_only_final=True
+    timestepper_options={"t_end": 1.0, "dt_init": 1e-2, "dt_min": 1e-5,
+                         "dt_max": 1e-2, "good_newton_steps": 5},
+    averages_only_final=True,
+    save_snapshots=["u_fluc", "P"],
 )
 
 
@@ -77,7 +78,7 @@ solver = MicromorphicHyperelasticHomogenizationSolver(
 # global modes. With Fbar=I (default) K is SPD and you get the softest
 # deformation modes; pass an Fbar closer to the critical load to recover
 # true buckling modes.
-eigvals = solver.compute_linear_buckling_modes(N_MODES, visualize_modes=True)
+eigvals = solver.compute_linear_buckling_modes(N_MODES, visualize_modes=True, save_modes=True)
 logger.info("Buckling eigenvalues: %s", eigvals)
 
 
