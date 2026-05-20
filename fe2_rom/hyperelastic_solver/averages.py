@@ -41,6 +41,10 @@ class HomogenizationContext:
     u_total: Any
     macro_vars: dict
     phi: list = field(default_factory=list)
+    # Optional integration weight (used by the ECM-reduced ROM averages: ω(x)
+    # such that ∫_Ω f dx ≈ ∫_submesh f ω dx). UFL-multiplicable: a Function,
+    # Constant, or plain float. Defaults to 1.0 (no reweighting) for the FOM.
+    weight: Any = 1.0
 
 
 def _avg_scalar(form, comm, vol_global) -> float:
@@ -79,7 +83,7 @@ class EffectiveW(AverageQuantity):
     name = "Wbar"
 
     def setup(self, context):
-        self._form = fem.form(context.W_ufl * context.dx)
+        self._form = fem.form(context.W_ufl * context.weight * context.dx)
 
     def compute(self, context, adjoints=None):
         return _avg_scalar(self._form, context.comm, context.vol_global)
@@ -94,7 +98,7 @@ class EffectivePbar(AverageQuantity):
         gdim = context.mesh.geometry.dim
         self._gdim = gdim
         self._forms = [
-            [fem.form(context.P_ufl[i, j] * context.dx) for j in range(gdim)]
+            [fem.form(context.P_ufl[i, j] * context.weight * context.dx) for j in range(gdim)]
             for i in range(gdim)
         ]
 
@@ -129,13 +133,13 @@ class EffectiveAbar(AverageQuantity):
             [fem.Function(context.V) for _ in range(gdim)] for _ in range(gdim)
         ]
         self._A_avg_forms = [[[[
-            fem.form(context.A_ufl[i, j, k, l] * context.dx)
+            fem.form(context.A_ufl[i, j, k, l] * context.weight * context.dx)
             for l in range(gdim)] for k in range(gdim)]
             for j in range(gdim)] for i in range(gdim)]
         self._A_fluc_forms = [[[[
             fem.form(
                 ufl.inner(context.A_ufl[i, j, :, :],
-                          ufl.grad(self._adjoint_slots[k][l])) * context.dx
+                          ufl.grad(self._adjoint_slots[k][l])) * context.weight * context.dx
             )
             for l in range(gdim)] for k in range(gdim)]
             for j in range(gdim)] for i in range(gdim)]
@@ -177,7 +181,7 @@ class EffectivePi(AverageQuantity):
 
     def setup(self, context):
         self._forms = [
-            fem.form(ufl.inner(context.P_ufl, ufl.grad(phi)) * context.dx)
+            fem.form(ufl.inner(context.P_ufl, ufl.grad(phi)) * context.weight * context.dx)
             for phi in self._phi
         ]
 
@@ -210,7 +214,7 @@ class EffectiveLambda(AverageQuantity):
                         ufl.dot(self._phi[i], context.P_ufl)[d]
                         + X[d] * ufl.inner(context.P_ufl, ufl.grad(self._phi[i]))
                     )
-                    * context.dx
+                    * context.weight * context.dx
                 )
                 for d in range(gdim)
             ]
@@ -278,7 +282,7 @@ class TangentBlock(AverageQuantity):
             for mi in range(n_mu):
                 dF_total = dF_list[mi] + ufl.grad(self._adj_slots[mi])
                 A_dF = ufl.as_tensor(A[i, j, k, l] * dF_total[k, l], (i, j))
-                self._forms[qi][mi] = fem.form(ufl.inner(M, A_dF) * context.dx)
+                self._forms[qi][mi] = fem.form(ufl.inner(M, A_dF) * context.weight * context.dx)
         self._n_q = n_q
         self._n_mu = n_mu
 
