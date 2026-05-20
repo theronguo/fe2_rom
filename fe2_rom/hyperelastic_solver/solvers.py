@@ -407,6 +407,10 @@ class NewtonSolverFE2(NewtonSolver):
         """Solve ``K p_k = rhs_k`` for every scalar component ``k`` of every
         named macro variable in ``rhs_forms_dict``.
 
+        When constraints are active the projected formulation is used:
+        ``P K P p_k = P rhs_k``, where ``P = I - C^T (C C^T)^{-1} C`` is the
+        same orthogonal projector used by the Newton loop.
+
         Parameters
         ----------
         rhs_forms_dict
@@ -425,7 +429,40 @@ class NewtonSolverFE2(NewtonSolver):
         else:
             K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
         K.assemble()
-        ksp = self._make_ksp(K)
+
+        use_projected = bool(self._constraint_vecs)
+        if use_projected:
+            _, apply_P = self._make_projector()
+            sizes = K.getSizes()
+            n_global = sizes[0][1]
+
+            class _PKP:
+                def mult(self_inner, mat, x, y):
+                    Px = x.copy()
+                    apply_P(Px)
+                    Px.ghostUpdate(addv=PETSc.InsertMode.INSERT,
+                                   mode=PETSc.ScatterMode.FORWARD)
+                    K.mult(Px, y)
+                    PETSc.Vec.destroy(Px)
+                    apply_P(y)
+
+                def multTranspose(self_inner, mat, x, y):
+                    self_inner.mult(mat, x, y)
+
+            K_proj = PETSc.Mat().create(self._comm)
+            K_proj.setSizes(sizes)
+            K_proj.setType(PETSc.Mat.Type.PYTHON)
+            K_proj.setPythonContext(_PKP())
+            K_proj.setUp()
+            ksp = PETSc.KSP().create(self._comm)
+            ksp.setOperators(K_proj, K)
+            ksp.setType(PETSc.KSP.Type.MINRES)
+            ksp.getPC().setType(PETSc.PC.Type.GAMG)
+            ksp.setTolerances(rtol=1e-10, atol=1e-12, max_it=min(n_global, 50_000))
+            ksp.setFromOptions()
+        else:
+            K_proj = None
+            ksp = self._make_ksp(K)
 
         results: dict[str, list[fem.Function]] = {}
         for name, forms in rhs_forms_dict.items():
@@ -440,8 +477,21 @@ class NewtonSolverFE2(NewtonSolver):
                 rhs.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
                 fem_petsc.set_bc(rhs, self._bcs)
 
+                if use_projected:
+                    apply_P(rhs)
+
                 X = self._du.x.petsc_vec.duplicate()
                 ksp.solve(rhs, X)
+
+                if use_projected:
+                    reason = ksp.getConvergedReason()
+                    if reason < 0:
+                        logger.warning(
+                            "Projected MINRES for sensitivity '%s' did not converge (reason %d)",
+                            name, reason,
+                        )
+                    apply_P(X)
+
                 X.ghostUpdate(
                     addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD,
                 )
@@ -458,6 +508,8 @@ class NewtonSolverFE2(NewtonSolver):
             results[name] = sensitivities
 
         ksp.destroy()
+        if K_proj is not None:
+            K_proj.destroy()
         PETSc.Mat.destroy(K)
         return results
 

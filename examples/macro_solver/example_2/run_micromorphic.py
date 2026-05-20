@@ -82,10 +82,10 @@ logger.info("Buckling eigenvalues: %s", eigvals)
 
 
 # --- Macro inputs -----------------------------------------------------------
-Fbar_target = np.array([[1.0, 0.0],
+Fbar_target = np.array([[0.9, 0.0],
                         [0.0,  1.0]])
-v_target = np.array([0.00])
-g_target = np.array([[0.1, 0.0]])
+v_target = np.array([1])
+g_target = np.array([[-0.2, 0.1]])
 
 logger.info("Calling micromorphic solver with N=%d modes …", N_MODES)
 results = solver(Fbar_target, v_target, g_target, pert_amplitude_init=0.1)
