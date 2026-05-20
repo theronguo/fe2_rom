@@ -92,6 +92,17 @@ results = solver(Fbar_target, v_target, g_target, pert_amplitude_init=0.1)
 final = results[-1]
 
 
+# --- Constraint violation check ---------------------------------------------
+w_vec = solver.u.x.petsc_vec
+c_vecs = solver._newton._constraint_vecs
+if c_vecs:
+    viols = [abs(c.dot(w_vec)) for c in c_vecs]
+    logger.info("Constraint violations (should be ~0): max=%.3e  per-row=%s",
+                max(viols), np.array2string(np.array(viols), precision=2))
+else:
+    logger.info("No constraints active.")
+
+
 # --- Report -----------------------------------------------------------------
 if comm.rank == 0:
     logger.info("── Effective quantities (final load) ──")
