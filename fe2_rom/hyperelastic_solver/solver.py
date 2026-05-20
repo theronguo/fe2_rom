@@ -17,6 +17,7 @@ from .averages import (
     resolve_average_quantities,
 )
 from .boundary import ReactionProbe
+from .constraints import LinearConstraint, ZeroVolumeAverage
 from .exceptions import RVEConvergenceError
 from .forms import basis_tensor_ufl, build_homogenization_weak_form, build_weak_forms
 from .logging_utils import silence_c_stdout
@@ -414,6 +415,7 @@ class PeriodicHyperelasticHomogenizationSolver:
                  save_snapshots: list[str] | None = None,
                  averages_only_final: bool = False,
                  corner_periodic: bool = False,
+                 constraints: "list[LinearConstraint] | None" = None,
                  ) -> None:
 
         newton_options = newton_options if newton_options is not None else {
@@ -510,9 +512,13 @@ class PeriodicHyperelasticHomogenizationSolver:
         # ---- Adjoint-RHS forms per macro variable (subclass extends) ----
         self._macro_var_rhs_forms = self._build_macro_var_rhs_forms(build_tangent_rhs_forms)
 
+        # ---- Constraint forms (projected Newton solve) ----
+        constraint_forms = self._build_constraint_forms(constraints)
+
         # ---- Newton solver (NewtonSolverFE2 with periodic MPC ties) ----
         self._newton = NewtonSolverFE2(
             self.comm, R_form, J_form, self.u, self._du, self._bcs, self.mpc,
+            constraint_forms=constraint_forms,
             **newton_options,
         )
         logger.debug("Newton solver initialized with options: %s", newton_options)
@@ -580,6 +586,26 @@ class PeriodicHyperelasticHomogenizationSolver:
     def _make_default_average_quantities(self) -> list:
         """Default effective quantities. Base: F̄ (echo), P̄, dP̄/dF̄."""
         return [EffectiveFbar(), EffectivePbar(), EffectiveAbar()]
+
+    def _build_constraint_forms(self, constraints: "list[LinearConstraint] | None") -> list:
+        """Build compiled constraint forms for the projected Newton solver.
+
+        When ``corner_periodic=True`` and ``constraints`` is ``None``, defaults
+        to ``[ZeroVolumeAverage()]`` which contributes ``gdim`` rows (one per
+        translation null mode).  Pass ``constraints=[]`` to disable entirely.
+        Subclasses can override to inject extra rows (e.g. ⟨w·φ⟩ = 0).
+        """
+        if constraints is None:
+            constraints = [ZeroVolumeAverage()] if self._corner_periodic else []
+        if not constraints:
+            return []
+        forms = []
+        for c in constraints:
+            c_forms, _ = c.build(self.V, self.dx, self._mesh, self.mpc)
+            forms.extend(c_forms)
+        logger.debug("Constraint forms: %d rows from %d constraint object(s)",
+                     len(forms), len(constraints))
+        return forms
 
     def _restore_trial_state(self) -> None:
         """Hook: restore subclass-specific trial state from converged. Base: no-op."""

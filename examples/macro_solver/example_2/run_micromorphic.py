@@ -66,8 +66,9 @@ solver = MicromorphicHyperelasticHomogenizationSolver(
     newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                     "max_iter": 50, "div_rel_tol": 10,
                     "switch_to_minres": True},
-    timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-4,
+    timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5,
                          "dt_max": 1.0, "good_newton_steps": 5},
+    averages_only_final=True
 )
 
 

@@ -10,9 +10,20 @@ with extra macro variables ``v ∈ R^N`` and ``g ∈ R^{N×gdim}``. Reports the
 3×3 grid of effective quantity / macro-variable tangents (``dPbar``, ``dPi``,
 ``dLambda``) × (``dFbar``, ``dv``, ``dg``).
 
-This first cut keeps the parent's corner-pinning gauge. Periodicity /
-integral gauges on ``φ`` and the corresponding Lagrange-multiplier
-constraints (``⟨w·φᵢ⟩ = 0``, ``⟨(w·φᵢ) X⟩ = 0``) are not added here.
+Constraints on the fluctuation field ``w``
+------------------------------------------
+The decomposition is unique only if the three families of integral constraints
+hold:
+
+    ⟨w⟩            = 0   (gdim rows, ZeroVolumeAverage)
+    ⟨w · φᵢ⟩       = 0   (N rows,    ZeroVolumeAverageDot)
+    ⟨(w · φᵢ) X_b⟩ = 0   (N·gdim rows, ZeroVolumeAverageOuter)
+
+These are built in ``_build_constraint_forms`` and enforced via the projected
+Newton solver (P K P x = P b).  Because the φᵢ are zero at construction and
+populated later by ``compute_linear_buckling_modes``, the projected solver
+must be told to rebuild its constraint vectors — call ``rebuild_constraints()``
+(or let ``compute_linear_buckling_modes`` do it automatically).
 """
 
 from __future__ import annotations
@@ -23,6 +34,7 @@ import os
 import numpy as np
 import ufl
 from dolfinx import fem, io
+from mpi4py import MPI
 from petsc4py import PETSc
 
 from .averages import (
@@ -33,6 +45,7 @@ from .averages import (
     EffectivePi,
     TangentBlock,
 )
+from .constraints import ZeroVolumeAverage, ZeroVolumeAverageDot, ZeroVolumeAverageOuter
 from .forms import basis_tensor_ufl
 from .solver import PeriodicHyperelasticHomogenizationSolver
 from .stability import solve_smallest_eigenpairs
@@ -125,9 +138,53 @@ class MicromorphicHyperelasticHomogenizationSolver(
         self._mm_target_g: np.ndarray | None = None
         self._mm_prev_v: np.ndarray | None = None
         self._mm_prev_g: np.ndarray | None = None
+        kwargs["corner_periodic"] = True
         super().__init__(mesh_path, comm, gdim, material, **kwargs)
 
     # ---- subclass hooks ----
+
+    def _build_constraint_forms(self, constraints):
+        """Build constraint forms for the projected Newton solver.
+
+        When ``constraints`` is ``None`` and ``corner_periodic=True``, builds
+        the full micromorphic constraint set:
+
+            ⟨w⟩ = 0              (gdim rows — ZeroVolumeAverage)
+            ⟨w · φᵢ⟩ = 0         (N rows    — ZeroVolumeAverageDot)
+            ⟨(w · φᵢ) X_b⟩ = 0   (N·gdim   — ZeroVolumeAverageOuter)
+
+        The φ-dependent forms capture ``self._phi[i]`` by reference so that
+        ``rebuild_constraints()`` (called after LBA) assembles correct vectors.
+        Pass an explicit ``constraints`` list to override entirely.
+        """
+        all_constraints = [ZeroVolumeAverage()]
+        for phi in self._phi:
+            all_constraints.append(ZeroVolumeAverageDot(phi))
+            all_constraints.append(ZeroVolumeAverageOuter(phi))
+
+        forms = []
+        for c in all_constraints:
+            c_forms, _ = c.build(self.V, self.dx, self._mesh, self.mpc)
+            forms.extend(c_forms)
+
+        n_base = self.gdim
+        n_dot = self._N_modes
+        n_outer = self._N_modes * self.gdim
+        logger.debug(
+            "Micromorphic constraint forms: %d total "
+            "(%d mean + %d dot + %d outer)",
+            len(forms), n_base, n_dot, n_outer,
+        )
+        return forms
+
+    def rebuild_constraints(self) -> None:
+        """Reassemble constraint vectors after φ-modes change.
+
+        Call this (or let ``compute_linear_buckling_modes`` call it) whenever
+        ``self._phi`` is updated so the projected Newton solver sees the
+        correct ⟨w·φᵢ⟩ = 0 and ⟨(w·φᵢ)X⟩ = 0 rows.
+        """
+        self._newton.rebuild_constraint_vecs()
 
     def _setup_phi(self):
         self._phi = [
@@ -298,7 +355,7 @@ class MicromorphicHyperelasticHomogenizationSolver(
            shift-invert at ``σ = 0``, ``TARGET_REAL``).
         3. Skip the first ``n_skip`` eigenpairs (null-space / gauge modes),
            apply periodic MPC backsubstitution to the remaining ones, scale to
-           unit ``ℓ²`` norm, and store in ``self._phi[i]``.
+           unit H1 norm (``∫ φ·φ + ∇φ:∇φ dx = 1``), and store in ``self._phi[i]``.
 
         ``n_skip`` defaults to ``self._count_zero_modes()``.  With
         ``corner_periodic=True`` the dolfinx_mpc corner constraint introduces
@@ -329,8 +386,16 @@ class MicromorphicHyperelasticHomogenizationSolver(
             phi.x.array[:] = 0.0
             phi.x.scatter_forward()
         if Fbar is not None:
+            # phi=0 here, so the phi-dependent constraint rows are zero vectors and
+            # G = C C^T would be singular.  Temporarily restrict to the gdim base rows
+            # (ZeroVolumeAverage only) for this reference solve, then restore.
+            all_forms = self._newton._constraint_forms_raw
+            self._newton._constraint_forms_raw = all_forms[: self.gdim]
+            self.rebuild_constraints()
             logger.info("Linear buckling: reference solve at F̄ = \n%s", Fbar)
             self(Fbar, v, g)
+            self._newton._constraint_forms_raw = all_forms
+            # (rebuild with full phi-dependent rows happens below after LBA)
 
         # 2. Assemble K and solve the eigenproblem.
         K = self._newton.assemble_stiffness()
@@ -368,9 +433,15 @@ class MicromorphicHyperelasticHomogenizationSolver(
                 if self.mpc is not None:
                     self.mpc.backsubstitution(phi_vec)
                 self._phi[i].x.scatter_forward()
-                nrm = phi_vec.norm()
-                if nrm > 0.0:
-                    phi_vec.scale(1.0 / nrm)
+                phi_fn = self._phi[i]
+                h1_sq_local = fem.assemble_scalar(fem.form(
+                    (ufl.inner(phi_fn, phi_fn)
+                     + ufl.inner(ufl.grad(phi_fn), ufl.grad(phi_fn))) * self.dx
+                ))
+                h1_sq = self._mesh.comm.allreduce(h1_sq_local, op=MPI.SUM)
+                h1_norm = np.sqrt(h1_sq)
+                if h1_norm > 0.0:
+                    phi_vec.scale(1.0 / h1_norm)
                     self._phi[i].x.scatter_forward()
             # Zero any remaining slots (if SLEPc didn't converge enough).
             for i in range(n_load, n_modes):
@@ -381,6 +452,10 @@ class MicromorphicHyperelasticHomogenizationSolver(
                 "Linear buckling eigenvalues (physical, smallest |λ|): %s",
                 np.array2string(eigvals, precision=4),
             )
+
+            # Rebuild constraint vectors so the projected Newton solver uses
+            # the freshly-populated φᵢ rather than the zero functions at init.
+            self.rebuild_constraints()
 
             # Optional ParaView output — one timestep per mode (t = mode index).
             # The file contains a single vector field ``phi``; scrubbing the
