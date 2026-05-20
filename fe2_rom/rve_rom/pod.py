@@ -233,7 +233,7 @@ class POD:
         C = S @ HS                         # (n_snapshots, n_snapshots) correlation matrix
         eigenvalues, eigenvectors = np.linalg.eigh(C)
         idx = np.argsort(eigenvalues)[::-1]
-        basis = S.T @ eigenvectors[:, idx]
+        basis = S.T @ eigenvectors[:, idx] / np.sqrt(eigenvalues[idx])
         return basis, eigenvalues[idx]
 
     def plot_eigenvalues(self):

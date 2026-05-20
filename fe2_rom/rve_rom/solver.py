@@ -17,6 +17,7 @@ from ..hyperelastic_solver.averages import (
 )
 from ..hyperelastic_solver.forms import basis_tensor_ufl
 from dolfinx import io, fem, mesh as dmesh
+from dolfinx.fem.petsc import assemble_vector as _assemble_vector_petsc
 from mpi4py import MPI
 from petsc4py import PETSc
 import ufl
@@ -113,8 +114,6 @@ class RVESolver:
 
         self.u_fluc = fem.Function(V_sub)
         self.u_full = fem.Function(V_full, name="u_fluc")
-        self._v     = fem.Function(V_sub)
-        self._w     = fem.Function(V_sub)
 
         # --- Macro variables (hook) ---
         self.F_bar = fem.Constant(submesh, np.eye(gdim, dtype=PETSc.ScalarType))
@@ -133,14 +132,21 @@ class RVESolver:
         self._P_ufl = material.first_pk_stress(F_ufl)
         self.A_ufl  = material.tangent_moduli(F_ufl)
 
-        # --- Residual / Jacobian (ROM coefficients) ---
+        # --- Residual / Jacobian (FOM forms on submesh, projected to ROM) ---
+        # Assemble once per Newton iter as full vector/matrix on V_sub, then
+        # contract with the POD basis Φ:  r_rom = Φᵀ r,  J_rom = Φᵀ K Φ.
+        # Avoids the N²+N scalar-assembly blow-up of the previous coefficient
+        # stamping approach.
+        u_tr = ufl.TrialFunction(V_sub)
+        v_te = ufl.TestFunction(V_sub)
+        self._v_te = v_te
         ii, jj, kk, ll = ufl.indices(4)
-        A_grad_v = ufl.as_tensor(self.A_ufl[ii, jj, kk, ll] * ufl.grad(self._v)[kk, ll], (ii, jj))
+        A_grad_tr = ufl.as_tensor(self.A_ufl[ii, jj, kk, ll] * ufl.grad(u_tr)[kk, ll], (ii, jj))
         self._r_form = fem.form(
-            ufl.inner(self._P_ufl, ufl.grad(self._v)) * self._omega_func * self._dx_sub
+            ufl.inner(self._P_ufl, ufl.grad(v_te)) * self._omega_func * self._dx_sub
         )
         self._j_form = fem.form(
-            ufl.inner(A_grad_v, ufl.grad(self._w)) * self._omega_func * self._dx_sub
+            ufl.inner(A_grad_tr, ufl.grad(v_te)) * self._omega_func * self._dx_sub
         )
 
         # ECM volume
@@ -173,18 +179,18 @@ class RVESolver:
             for name, factory in self._dF_dmu_factories.items()
         }
 
-        # Compile ROM adjoint RHS forms:
-        #   D[p, mi] = ∫ inner(A : ∂F/∂μ_mi, grad(φ_p)) ω dx
-        # parameterised at assembly time by overwriting self._v.x.array with
-        # the p-th submesh POD basis vector. Convention matches FOM
-        # ``TangentBlock`` (last two indices of A contract with ∂F/∂μ).
+        # Compile ROM adjoint RHS forms as linear forms in TestFunction:
+        #   d_mi = ∫ A : ∂F/∂μ_mi · ∇v_te ω dx     (vector on V_sub)
+        #   D[:, mi] = Φᵀ d_mi
+        # Convention matches FOM ``TangentBlock`` (last two indices of A
+        # contract with ∂F/∂μ).
         self._D_forms: dict[str, list] = {}
         for name, dF_list in self._dF_dmu_lists.items():
             forms_mi = []
             for dF in dF_list:
                 A_dF = ufl.as_tensor(self.A_ufl[ii, jj, kk, ll] * dF[kk, ll], (ii, jj))
                 forms_mi.append(fem.form(
-                    ufl.inner(A_dF, ufl.grad(self._v)) * self._omega_func * self._dx_sub
+                    ufl.inner(A_dF, ufl.grad(v_te)) * self._omega_func * self._dx_sub
                 ))
             self._D_forms[name] = forms_mi
 
@@ -296,17 +302,33 @@ class RVESolver:
 
     def _restore_state(self, coeffs: np.ndarray) -> None:
         self.coeffs[:] = coeffs
-        self.u_fluc.x.array[:] = sum(
-            self.coeffs[ii] * self.basis_u_sub[:, ii] for ii in range(self.N)
-        )
+        self.u_fluc.x.array[:] = self.basis_u_sub @ self.coeffs
+
+    # --- FOM-assembly helpers (projected to ROM via Φ) ------------------------
+
+    def _assemble_fom_residual(self) -> np.ndarray:
+        b = _assemble_vector_petsc(self._r_form)
+        b.assemble()
+        arr = b.array.copy()
+        b.destroy()
+        return arr
+
+    def _assemble_fom_jacobian(self):
+        K = fem.assemble_matrix(self._j_form).to_scipy()
+        return K
+
+    def _assemble_fom_linear(self, form) -> np.ndarray:
+        b = _assemble_vector_petsc(form)
+        b.assemble()
+        arr = b.array.copy()
+        b.destroy()
+        return arr
 
     # --- Visualization --------------------------------------------------------
 
     def _write_fields(self, t: float) -> None:
         if self.vtx is not None:
-            self.u_full.x.array[:] = sum(
-                self.coeffs[ii] * self.basis_u[:, ii] for ii in range(self.N)
-            )
+            self.u_full.x.array[:] = self.basis_u @ self.coeffs
             if self._u_total_expr is not None:
                 self._F_bar_full.value[:] = self.F_bar.value
                 self._sync_full_mesh_constants()
@@ -316,14 +338,9 @@ class RVESolver:
     # --- Averaging / adjoints -------------------------------------------------
 
     def _assemble_jacobian(self) -> np.ndarray:
-        N = self.N
-        J = np.zeros((N, N))
-        for ii in range(N):
-            self._v.x.array[:] = self.basis_u_sub[:, ii]
-            for jj in range(N):
-                self._w.x.array[:] = self.basis_u_sub[:, jj]
-                J[ii, jj] = fem.assemble_scalar(self._j_form)
-        return J
+        K = self._assemble_fom_jacobian()
+        Phi = self.basis_u_sub
+        return Phi.T @ (K @ Phi)
 
     def _solve_adjoints(self) -> None:
         """Compute forward sensitivities p_μ_k = ∂u_fluc/∂μ_k and store as
@@ -342,18 +359,18 @@ class RVESolver:
         Dldl[Dldl < -1e-8] = -Dldl[Dldl < -1e-8]
         J_sym = L @ Dldl @ L.T
 
+        Phi = self.basis_u_sub
         for name in self._adjoint_macro_vars:
             forms_mi = self._D_forms[name]
             n_mu = len(forms_mi)
             D = np.zeros((N, n_mu))
-            for p in range(N):
-                self._v.x.array[:] = self.basis_u_sub[:, p]
-                for mi in range(n_mu):
-                    D[p, mi] = fem.assemble_scalar(forms_mi[mi])
+            for mi in range(n_mu):
+                d_vec = self._assemble_fom_linear(forms_mi[mi])
+                D[:, mi] = Phi.T @ d_vec
             alpha = np.linalg.solve(J_sym, -D)  # (N, n_mu)
             slots = self._adjoint_funcs[name]
             for mi in range(n_mu):
-                slots[mi].x.array[:] = self.basis_u_sub @ alpha[:, mi]
+                slots[mi].x.array[:] = Phi @ alpha[:, mi]
 
     def _collect_averages(self, with_tangents: bool = True) -> dict:
         if with_tangents:
@@ -373,20 +390,14 @@ class RVESolver:
 
     def _newton_solve(self, rel_tol: float, abs_tol: float, max_iter: int) -> int:
         """Newton solve assuming macro-var Constants are already set."""
-        N = self.N
+        Phi = self.basis_u_sub
         it = 0
         res_norm = np.inf
         res_norm_0 = None
         rel_res = np.inf
-        residual = np.zeros(N)
-        jacobian = np.zeros((N, N))
         while it < max_iter:
-            for ii in range(N):
-                self._v.x.array[:] = self.basis_u_sub[:, ii]
-                residual[ii] = fem.assemble_scalar(self._r_form)
-                for jj in range(N):
-                    self._w.x.array[:] = self.basis_u_sub[:, jj]
-                    jacobian[ii, jj] = fem.assemble_scalar(self._j_form)
+            r_full = self._assemble_fom_residual()
+            residual = Phi.T @ r_full
 
             res_norm = np.linalg.norm(residual)
             if res_norm_0 is None:
@@ -404,6 +415,9 @@ class RVESolver:
             if it > 0 and rel_res > self._newton_options["div_rel_tol"]:
                 raise RuntimeError(f"Newton diverging: |r|/|r0| = {rel_res:.3e}")
 
+            K = self._assemble_fom_jacobian()
+            jacobian = Phi.T @ (K @ Phi)
+
             try:
                 L, D, _ = scipy.linalg.ldl(jacobian)
                 if not np.isfinite(L).all() or not np.isfinite(D).all():
@@ -416,9 +430,7 @@ class RVESolver:
                 raise RuntimeError(f"LDL factorisation failed: {e}") from e
 
             self.coeffs += dcoeffs
-            self.u_fluc.x.array[:] = sum(
-                self.coeffs[ii] * self.basis_u_sub[:, ii] for ii in range(N)
-            )
+            self.u_fluc.x.array[:] = Phi @ self.coeffs
             it += 1
 
         if rel_res >= rel_tol and res_norm >= abs_tol:

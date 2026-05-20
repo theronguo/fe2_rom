@@ -7,16 +7,22 @@ import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+from glob import glob
+
 import numpy as np
 import ufl
 from dolfinx import io, fem
 from mpi4py import MPI
+from scipy.spatial import cKDTree
+
 from fe2_rom.rve_rom.pod import POD, ECM
 
 comm = MPI.COMM_WORLD
 gdim = 2
 degree = 2
 snapshot_dir = "output"
+pool_dir = f"{snapshot_dir}/snapshots_pool"
+phi_dir = f"{snapshot_dir}/snapshots"
 ecm_dir = "ecm"
 mesh_file = "rve.msh"
 ecm_tol = 1e-6
@@ -30,19 +36,60 @@ mesh = io.gmsh.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim).mesh
 V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
 S  = fem.functionspace(mesh, ("DG", 1, (gdim, gdim)))
 
-snapshots_u = POD.load_and_align_snapshots(f"{snapshot_dir}/snapshots/u_fluc_*.npy", V)
-pod_u = POD(snapshots_u, V, inner_product="H1")
+
+def load_pool_snapshots(field: str, V_space):
+    """Load all ``{field}_s*_*.npy`` snapshots from the merged pool and align
+    DOFs to ``V_space``'s serial ordering using the shared
+    ``{field}_dof_coords.npy`` written by the sampler.
+    """
+    files = sorted(
+        f for f in glob(f"{pool_dir}/{field}_s*_*.npy")
+        if "dof_coords" not in f
+    )
+    if not files:
+        raise FileNotFoundError(f"No snapshots for field '{field}' in {pool_dir}")
+    snaps = np.array([np.load(f) for f in files])
+
+    coords_path = f"{pool_dir}/{field}_dof_coords.npy"
+    try:
+        saved_coords = np.load(coords_path)
+    except FileNotFoundError:
+        return snaps
+
+    serial_coords = V_space.tabulate_dof_coordinates()
+    bs = V_space.dofmap.index_map_bs
+    _, perm = cKDTree(saved_coords).query(serial_coords, k=1)
+    dof_perm = (perm[:, None] * bs + np.arange(bs)).ravel()
+    return snaps[:, dof_perm]
+
+
+snapshots_u = load_pool_snapshots("u_fluc", V)
+print(f"[snapshots] u_fluc: {snapshots_u.shape}")
+pod_u = POD(snapshots_u, V, inner_product="L2")
 N = pod_u.n_modes(energy_tol)
 
-snapshots_P = POD.load_and_align_snapshots(f"{snapshot_dir}/snapshots/P_*.npy", S)
+u_proj = snapshots_u @ pod_u._ip_matrix @ pod_u.basis[:, :N] @ pod_u.basis[:, :N].T
+h1_err = np.sqrt(np.diagonal((snapshots_u - u_proj) @ pod_u._ip_matrix @ (snapshots_u - u_proj).T))
+h1_norm = np.sqrt(np.diagonal(snapshots_u @ pod_u._ip_matrix @ snapshots_u.T))
+reconstruction_error = h1_err / h1_norm
+print(f"Max reconstruction error among snapshots: {reconstruction_error.max():.2%}, mean: {reconstruction_error.mean():.2%}")
+
+snapshots_P = load_pool_snapshots("P", S)
+print(f"[snapshots] P:      {snapshots_P.shape}")
 pod_P = POD(snapshots_P, S, inner_product="L2")
 M = pod_P.n_modes(energy_tol)
+
+P_proj = snapshots_P @ pod_P._ip_matrix @ pod_P.basis[:, :M] @ pod_P.basis[:, :M].T
+l2_err = np.sqrt(np.diagonal((snapshots_P - P_proj) @ pod_P._ip_matrix @ (snapshots_P - P_proj).T))
+l2_norm = np.sqrt(np.diagonal(snapshots_P @ pod_P._ip_matrix @ snapshots_P.T))
+reconstruction_error = l2_err / l2_norm
+print(f"Max reconstruction error among snapshots: {reconstruction_error.max():.2%}, mean: {reconstruction_error.mean():.2%}")
 
 # --- Pi and Lambda density snapshots, built from phi modes ----------------
 # phi modes were saved by compute_linear_buckling_modes(save_modes=True) as
 # phi_<i>.npy in the same snapshots/ folder; they live on V.
 phi_snapshots = POD.load_and_align_snapshots(
-    f"{snapshot_dir}/snapshots/phi_*.npy", V,
+    f"{phi_dir}/phi_*.npy", V,
 )
 N_modes = phi_snapshots.shape[0]
 phi_fns = []
