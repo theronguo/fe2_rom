@@ -27,7 +27,7 @@ from fe2_rom.hyperelastic_solver import (
     setup_logging,
     broadcast_logger,
 )
-from fe2_rom.macro_solver import MacroSolver
+from fe2_rom.ch1 import MacroSolver
 
 
 # --- Logging ----------------------------------------------------------------
@@ -41,7 +41,8 @@ _RVE_LOGGERS = (
     "fe2_rom.hyperelastic_solver.solver",
     "fe2_rom.hyperelastic_solver.solvers",
     "fe2_rom.hyperelastic_solver.stability",
-    "fe2_rom.rve_rom.solver",
+    "fe2_rom.ch1.microsolver",
+    "fe2_rom.rom.solver_ch1"
 )
 if VERBOSE_RVE:
     broadcast_logger(*_RVE_LOGGERS, level=logging.DEBUG)
@@ -61,6 +62,9 @@ domain = dmesh.create_unit_cube(
 # --- RVE setup (matches legacy run_macro.py) --------------------------------
 HERE = os.path.dirname(__file__)
 RVE_MESH = os.path.join(HERE, "mesh.msh")
+# ROM artifacts are reused from examples/ch1/example_2 — run its build_rom.py
+# first if you intend to switch to full=False (ROM-backed FE²).
+ROM_DIR = os.path.join(HERE, "..", "example_2", "ecm")
 
 E_micro, nu_micro = 3000.0, 0.30
 mu_micro  = E_micro / (2.0 * (1.0 + nu_micro))
@@ -68,18 +72,19 @@ lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 
 
 # --- Macro solver -----------------------------------------------------------
+output_dir = "output"
 solver = MacroSolver(
     mesh=domain,
     full=True,
-    n_qp=1,
+    n_qp=2,
     rve_mesh_path=RVE_MESH,
     rve_material=NeoHookean(mu=mu_micro, lmbda=lam_micro),
     rve_check_stability=True,
     gdim=3,
     rve_degree=1,
-    rve_output_dir="output",
+    rve_output_dir=output_dir,
     rve_visualize_fields=[""],
-    rve_average_fields=["P", "A"],
+    rve_average_quantities=["P", "A"],
     rve_newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                         "max_iter": 50, "div_rel_tol": 10},
     rve_timestepper_options={"t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-3,
@@ -87,6 +92,7 @@ solver = MacroSolver(
     rve_averages_only_final=True,
     degree=1,
     check_stability=True,
+    rom_dir=ROM_DIR,
 )
 
 
@@ -112,7 +118,7 @@ timestepper = TimeStepper(
 reaction_logger = ReactionForceLogger()
 
 solver.solve(
-    output_dir="output",
+    output_dir=output_dir,
     timestepper=timestepper,
     loadhistory=loadhistory,
     output_variables=[solver.u],
@@ -120,7 +126,6 @@ solver.solve(
     pert_amplitude_init=0.1
 )
 
-output_dir = "output"
 reaction_logger.save(
     comm,
     os.path.join(output_dir, "reaction.png"),

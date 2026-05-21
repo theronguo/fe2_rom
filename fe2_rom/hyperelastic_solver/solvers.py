@@ -38,6 +38,7 @@ class NewtonSolver:
                  div_rel_tol=10.0,
                  petsc_options: dict | None = None,
                  switch_to_minres=False,
+                 constraint_forms: "list | None" = None,
                  ):
         self._comm = comm
         self._R_form = R_form
@@ -60,6 +61,163 @@ class NewtonSolver:
         self._using_minres_fallback = False
         self.effective_max_iter = max_iter
         self._abs_b_norm_init = 1.0
+
+        # Rows of the constraint matrix C.  Forms are stored so they can be
+        # reassembled later (e.g. after φ-modes are updated in the micromorphic
+        # solver).  Call rebuild_constraint_vecs() to refresh after any change.
+        self._constraint_forms_raw: list = list(constraint_forms or [])
+        self._constraint_vecs: list[PETSc.Vec] = []
+        self.rebuild_constraint_vecs()
+
+    def _make_projector(self):
+        """Build and return (G_inv, apply_P) from the current constraint vecs.
+
+        G = C C^T (m×m, m = number of constraints).
+        apply_P(v) projects v in-place: v <- P v = v - C^T G^{-1} (C v).
+        """
+        c_vecs = self._constraint_vecs
+        m = len(c_vecs)
+        G = np.empty((m, m))
+        for i, ci in enumerate(c_vecs):
+            for j, cj in enumerate(c_vecs):
+                G[i, j] = ci.dot(cj)
+        try:
+            G_inv = np.linalg.inv(G)
+        except np.linalg.LinAlgError as exc:
+            raise RuntimeError(
+                "Constraint Gram matrix G = C C^T is singular — "
+                "constraints may be linearly dependent."
+            ) from exc
+
+        def apply_P(v: PETSc.Vec) -> None:
+            Cv = np.array([ci.dot(v) for ci in c_vecs])
+            alpha = G_inv @ Cv
+            for i, ci in enumerate(c_vecs):
+                v.axpy(-alpha[i], ci)
+
+        return G_inv, apply_P
+
+    def _solve_projected(self, K: PETSc.Mat, residual: PETSc.Vec) -> int:
+        """Solve P K P du = -P R via MINRES on a shell matrix; recover λ.
+
+        Implements the projected formulation for the constrained Newton step:
+
+            [K   C^T] [du]   [-R]
+            [C    0 ] [λ ] = [ 0]
+
+        without forming the KKT matrix.  The orthogonal projector
+            P = I - C^T (C C^T)^{-1} C
+        is applied matrix-free.  G = C C^T is tiny (m×m, m ≤ gdim) and
+        inverted with numpy.
+
+        Steps:
+          1. Build G and G_inv once.
+          2. Define apply_P(v) as a closure: v -= C^T G^{-1} (C v).
+          3. Compute b = P(-R) (projected RHS).
+          4. Wrap K_proj(v) = P(K(Pv)) as a PETSc shell matrix.
+          5. Solve K_proj du = b with MINRES + PC=NONE.
+          6. Re-project du for numerical precision.
+          7. Recover λ = G^{-1} C(-R - K du).
+
+        Writes result into self._du.x.petsc_vec.
+        Returns the KSP convergence reason (positive = converged).
+        """
+        c_vecs = self._constraint_vecs
+        G_inv, apply_P = self._make_projector()
+
+        # b = P(-R)
+        b = residual.copy()
+        b.scale(-1.0)
+        apply_P(b)
+
+        # Shell matrix: K_proj(v) = P(K(Pv))
+        # The inner ghost update propagates the P-modified values across
+        # MPI ranks before K.mult reads ghost DOFs.
+        class _PKP:
+            def mult(self_inner, mat, x, y):
+                Px = x.copy()
+                apply_P(Px)
+                Px.ghostUpdate(addv=PETSc.InsertMode.INSERT,
+                               mode=PETSc.ScatterMode.FORWARD)
+                K.mult(Px, y)
+                PETSc.Vec.destroy(Px)
+                apply_P(y)
+
+            def multTranspose(self_inner, mat, x, y):
+                self_inner.mult(mat, x, y)  # K_proj is symmetric
+
+        sizes = K.getSizes()
+        K_proj = PETSc.Mat().create(self._comm)
+        K_proj.setSizes(sizes)
+        K_proj.setType(PETSc.Mat.Type.PYTHON)
+        K_proj.setPythonContext(_PKP())
+        K_proj.setUp()
+
+        du_vec = self._du.x.petsc_vec
+        n_global = sizes[0][1]  # global rows
+        ksp_proj = PETSc.KSP().create(self._comm)
+        # Use K as the PC matrix so AMG-type preconditioners (e.g. GAMG) can
+        # build their hierarchy from the assembled operator even though the
+        # matvec operator K_proj is a shell matrix.
+        ksp_proj.setOperators(K_proj, K)
+        if self._petsc_options is not None:
+            opts = PETSc.Options()
+            for key, val in self._petsc_options.items():
+                opts[key] = val
+        else:
+            ksp_proj.setType(PETSc.KSP.Type.MINRES)
+            ksp_proj.getPC().setType(PETSc.PC.Type.GAMG)
+        ksp_proj.setTolerances(
+            rtol=min(self._rel_tol * 1e-2, 1e-10),
+            atol=min(self._abs_tol * 1e-2, 1e-12),
+            max_it=min(n_global, 50_000),
+        )
+        ksp_proj.setFromOptions()
+        ksp_proj.solve(b, du_vec)
+        reason = ksp_proj.getConvergedReason()
+        n_iter = ksp_proj.getIterationNumber()
+        ksp_proj.destroy()
+        K_proj.destroy()
+
+        logger.debug("Projected MINRES: reason=%d  n_iter=%d  |du|=%.3e",
+                     reason, n_iter, du_vec.norm())
+
+        # Re-project for numerical precision
+        apply_P(du_vec)
+
+        # Recover λ: G λ = C(-R - K du)
+        Kdu = residual.duplicate()
+        K.mult(du_vec, Kdu)
+        r_kkt = residual.copy()
+        r_kkt.scale(-1.0)       # -R
+        r_kkt.axpy(-1.0, Kdu)  # -R - K du
+        PETSc.Vec.destroy(Kdu)
+        Cr = np.array([ci.dot(r_kkt) for ci in c_vecs])
+        lam = G_inv @ Cr
+        PETSc.Vec.destroy(r_kkt)
+        PETSc.Vec.destroy(b)
+
+        logger.debug("Lagrange multipliers: %s", np.array2string(lam, precision=4))
+        return reason
+
+    def rebuild_constraint_vecs(self) -> None:
+        """Reassemble constraint vectors from stored forms.
+
+        Must be called collectively on all MPI ranks.  The micromorphic solver
+        calls this after ``compute_linear_buckling_modes()`` updates the φ
+        functions so that ⟨w·φᵢ⟩ and ⟨(w·φᵢ)X⟩ rows reflect the new modes.
+        """
+        for c in self._constraint_vecs:
+            PETSc.Vec.destroy(c)
+        self._constraint_vecs = []
+        for form in self._constraint_forms_raw:
+            if self.mpc is not None:
+                c = dolfinx_mpc.assemble_vector(form, self.mpc)
+            else:
+                c = fem_petsc.assemble_vector(form)
+            c.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+            self._constraint_vecs.append(c)
+        logger.debug("Constraint vecs rebuilt: %d rows", len(self._constraint_vecs))
 
     def reset_for_new_timestep(self):
         """Reset solver state for a fresh time step."""
@@ -121,7 +279,16 @@ class NewtonSolver:
             residual.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
             fem_petsc.set_bc(residual, self._bcs, x0=self._u.x.petsc_vec, alpha=-1.0)
 
-            abs_b_norm = residual.norm()
+            if self._constraint_vecs:
+                # KKT convergence: check ||P R|| — the C^T λ component of R
+                # is balanced by the Lagrange multiplier and must not count.
+                _, apply_P_conv = self._make_projector()
+                pr = residual.copy()
+                apply_P_conv(pr)
+                abs_b_norm = pr.norm()
+                PETSc.Vec.destroy(pr)
+            else:
+                abs_b_norm = residual.norm()
             if iter_newton == 0:
                 self._abs_b_norm_init = abs_b_norm
 
@@ -146,35 +313,47 @@ class NewtonSolver:
             else:
                 K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
             K.assemble()
-            ksp = self._make_ksp(K)
-            ksp.solve(-residual, self._du.x.petsc_vec)
 
-            logger.debug("du norm: %.3e", self._du.x.petsc_vec.norm())
-
-            reason = ksp.getConvergedReason()
-            if reason < 0 and not self._using_minres_fallback:
-                if self._switch_to_minres:
-                    logger.warning("Primary solver did not converge (reason %d) — switching to MINRES+GAMG", reason)
-                    self._using_minres_fallback = True
-                    self.effective_max_iter = self._max_iter_instab
-                    ksp.destroy()
-                    PETSc.Vec.destroy(residual)
-                    PETSc.Mat.destroy(K)
-                    continue
-                else:
-                    logger.warning("Primary solver did not converge (reason %d)", reason)
-                    ksp.destroy()
-                    PETSc.Vec.destroy(residual)
-                    PETSc.Mat.destroy(K)
-                    return is_converged, iter_newton
-            elif reason < 0 and self._using_minres_fallback:
-                logger.warning("MINRES did not converge (reason %d) — reducing time step", reason)
-                ksp.destroy()
-                PETSc.Vec.destroy(residual)
+            if self._constraint_vecs:
+                # Projected constrained solve: P K P du = -P R via MINRES shell.
+                # _switch_to_minres / fallback logic does not apply here because
+                # we always use MINRES on the projected (symmetric) system.
+                reason = self._solve_projected(K, residual)
                 PETSc.Mat.destroy(K)
-                break
+                if reason < 0:
+                    logger.warning("Projected MINRES did not converge (reason %d)", reason)
+                    PETSc.Vec.destroy(residual)
+                    return is_converged, iter_newton
             else:
-                ksp.destroy()
+                # Standard unconstrained solve (CG/MINRES + GAMG).
+                ksp = self._make_ksp(K)
+                ksp.solve(-residual, self._du.x.petsc_vec)
+                logger.debug("du norm: %.3e", self._du.x.petsc_vec.norm())
+                reason = ksp.getConvergedReason()
+                if reason < 0 and not self._using_minres_fallback:
+                    if self._switch_to_minres:
+                        logger.warning("Primary solver did not converge (reason %d) — switching to MINRES+GAMG", reason)
+                        self._using_minres_fallback = True
+                        self.effective_max_iter = self._max_iter_instab
+                        ksp.destroy()
+                        PETSc.Vec.destroy(residual)
+                        PETSc.Mat.destroy(K)
+                        continue
+                    else:
+                        logger.warning("Primary solver did not converge (reason %d)", reason)
+                        ksp.destroy()
+                        PETSc.Vec.destroy(residual)
+                        PETSc.Mat.destroy(K)
+                        return is_converged, iter_newton
+                elif reason < 0 and self._using_minres_fallback:
+                    logger.warning("MINRES did not converge (reason %d) — reducing time step", reason)
+                    ksp.destroy()
+                    PETSc.Vec.destroy(residual)
+                    PETSc.Mat.destroy(K)
+                    break
+                else:
+                    ksp.destroy()
+                PETSc.Mat.destroy(K)
 
             self._du.x.petsc_vec.ghostUpdate(
                 addv=PETSc.InsertMode.INSERT,  # type: ignore
@@ -202,53 +381,6 @@ class NewtonSolver:
             K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
         K.assemble()
         return K
-
-class NewtonSolverFE2(NewtonSolver):
-    """Newton solver variant for FE2 homogenization with adjoint solves."""
-
-    def __init__(self, comm, R_form, J_form, Jij_forms, u, du, bcs, mpc=None, **kwargs):
-        super().__init__(comm, R_form, J_form, u, du, bcs, mpc=mpc, **kwargs)
-        self._Jij_forms = Jij_forms
-
-    def solve_adjoint(self):
-        """Solve K * p_ij = rhs_ij for all ij and return adjoint fields p_ij."""
-        if self.mpc is not None:
-            K = dolfinx_mpc.assemble_matrix(self._J_form, self.mpc, bcs=self._bcs)
-        else:
-            K = fem_petsc.assemble_matrix(self._J_form, bcs=self._bcs)
-        K.assemble()
-
-        ksp = self._make_ksp(K)
-
-        adjoints = []
-        for i in range(len(self._Jij_forms)):
-            adjoint = []
-            for j in range(len(self._Jij_forms)):
-                rhs_form = self._Jij_forms[i][j]
-                if self.mpc is not None:
-                    rhs = dolfinx_mpc.assemble_vector(rhs_form, self.mpc)
-                    dolfinx_mpc.apply_lifting(rhs, [self._J_form], [self._bcs], self.mpc)
-                else:
-                    rhs = fem_petsc.assemble_vector(rhs_form)
-                    fem_petsc.apply_lifting(rhs, [self._J_form], [self._bcs])
-                rhs.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-                fem_petsc.set_bc(rhs, self._bcs)
-
-                ksp.solve(rhs, self._du.x.petsc_vec)
-                self._du.x.petsc_vec.ghostUpdate(
-                    addv=PETSc.InsertMode.INSERT,  # type: ignore
-                    mode=PETSc.ScatterMode.FORWARD,  # type: ignore
-                )
-                if self.mpc is not None:
-                    self.mpc.backsubstitution(self._du.x.petsc_vec)
-
-                adjoint.append(self._du.copy())
-                PETSc.Vec.destroy(rhs)
-            adjoints.append(adjoint)
-
-        ksp.destroy()
-        PETSc.Mat.destroy(K)
-        return adjoints
 
 # ---------------------------------------------------------------------------
 # Arc-length solvers

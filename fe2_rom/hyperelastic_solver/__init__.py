@@ -1,23 +1,30 @@
-from .material import MaterialModel, NeoHookean, LambdaMaterial
 from .boundary import ReactionProbe
-from .forms import build_weak_forms
-from .solvers import NewtonSolver, NewtonSolverFE2, ArcLengthSolver, CylindricalArcLength
+from .forms import basis_tensor_ufl, build_homogenization_weak_form, build_weak_forms
+from .logging_utils import broadcast_logger, qp_context, setup_logging, silence_c_stdout
+from .material import MaterialModel, NeoHookean
+from .output import ReactionForceLogger, VTXManager
+from .solver import HyperelasticStabilitySolver
+from .solvers import (
+    ArcLengthSolver,
+    CylindricalArcLength,
+    NewtonSolver,
+)
 from .stability import StabilityAnalyzer
 from .timestepping import TimeStepper
-from .output import VTXManager, ReactionForceLogger
-from .solver import HyperelasticStabilitySolver, PeriodicHyperelasticHomogenizationSolver
-from .logging_utils import setup_logging, silence_c_stdout, broadcast_logger, qp_context
-from .exceptions import RVEConvergenceError
 
 __all__ = [
-    "MaterialModel", "NeoHookean", "LambdaMaterial",
+    # Materials
+    "MaterialModel", "NeoHookean",
+    # Boundary / forms
     "ReactionProbe",
-    "build_weak_forms",
-    "NewtonSolver", "NewtonSolverFE2", "ArcLengthSolver", "CylindricalArcLength",
+    "build_weak_forms", "build_homogenization_weak_form", "basis_tensor_ufl",
+    # Solvers
+    "NewtonSolver",
+    "ArcLengthSolver", "CylindricalArcLength",
+    "HyperelasticStabilitySolver",
+    # Misc infrastructure
     "StabilityAnalyzer",
     "TimeStepper",
     "VTXManager", "ReactionForceLogger",
-    "HyperelasticStabilitySolver", "PeriodicHyperelasticHomogenizationSolver",
     "setup_logging", "silence_c_stdout", "broadcast_logger", "qp_context",
-    "RVEConvergenceError",
 ]

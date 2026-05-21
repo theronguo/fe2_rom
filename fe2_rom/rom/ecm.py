@@ -2,7 +2,6 @@ from dolfinx import io, fem, mesh as dmesh
 from dolfinx.fem import petsc
 from dolfinx.io import XDMFFile
 from mpi4py import MPI
-from glob import glob
 from time import time
 import numpy as np
 import scipy.sparse as sp
@@ -13,6 +12,7 @@ from scipy.linalg import lstsq
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import gmsh
+
 
 # ── Sparse helper ─────────────────────────────────────────────────────────────
 
@@ -157,109 +157,6 @@ def _write_submesh_to_gmsh(submesh, filename, comm, gdim):
     return io.gmsh.read_from_msh(filename, comm, 0, gdim=gdim).mesh
 
 
-# ── POD ───────────────────────────────────────────────────────────────────────
-
-class POD:
-    """Proper Orthogonal Decomposition via correlation matrix and eigendecomposition.
-
-    Parameters
-    ----------
-    snapshots     : (n_snapshots, n_dofs) ndarray
-    V             : dolfinx FunctionSpace the snapshots live in
-    inner_product : "L2" or "H1"
-    """
-
-    def __init__(self, snapshots, V, inner_product="L2"):
-        self.snapshots = snapshots
-        self.V = V
-        self.mesh = V.mesh
-        self._ip_matrix = self._assemble_inner_product_matrix(inner_product)
-        self.basis, self.eigenvalues = self._compute()
-
-    @staticmethod
-    def load_snapshots(pattern):
-        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
-        return np.array([np.load(f) for f in files])
-
-    @staticmethod
-    def load_and_align_snapshots(pattern, V):
-        """Load snapshots and permute DOFs to match V's serial DOF ordering.
-
-        When snapshots are saved from a parallel run (mpirun -np N), the DOF
-        ordering in each .npy file follows the parallel global-DOF-index
-        assignment, which differs from the serial DOF ordering used by V.
-
-        If a companion *_dof_coords.npy file was written alongside the
-        snapshots (by the solver's _save_snapshot method), this function reads
-        those coordinates, matches them to V's DOF coordinates via a KD-tree,
-        and permutes the snapshot arrays accordingly.  If no coords file is
-        found the snapshots are returned as-is (correct for serial saves).
-        """
-        import os, re
-        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
-        snapshots = np.array([np.load(f) for f in files])
-        if not files:
-            return snapshots
-
-        # Derive coords filename: strip trailing _<timestamp>.npy
-        first = files[0]
-        coords_basename = re.sub(r'_[\d]+\.[\d]+\.npy$', '_dof_coords.npy',
-                                  os.path.basename(first))
-        coords_path = os.path.join(os.path.dirname(first), coords_basename)
-        if not os.path.exists(coords_path):
-            return snapshots
-
-        saved_coords = np.load(coords_path)       # (n_nodes, gdim) — parallel ordering
-        serial_coords = V.tabulate_dof_coordinates()  # (n_nodes, gdim) — serial ordering
-        bs = V.dofmap.index_map_bs
-
-        _, perm = cKDTree(saved_coords).query(serial_coords, k=1)
-        dof_perm = (perm[:, None] * bs + np.arange(bs)).ravel()
-        return snapshots[:, dof_perm]
-
-    def _assemble_inner_product_matrix(self, inner_product):
-        u = ufl.TrialFunction(self.V)
-        v = ufl.TestFunction(self.V)
-        dx = ufl.dx(domain=self.mesh)
-        if inner_product == "H1":
-            expr = ufl.inner(u, v) * dx + ufl.inner(ufl.grad(u), ufl.grad(v)) * dx
-        else:
-            expr = ufl.inner(u, v) * dx
-        return fem.assemble_matrix(fem.form(expr)).to_scipy()
-
-    def _compute(self):
-        S = self.snapshots
-        HS = self._ip_matrix @ S.T        # (n_dofs, n_snapshots)
-        C = S @ HS                         # (n_snapshots, n_snapshots) correlation matrix
-        eigenvalues, eigenvectors = np.linalg.eigh(C)
-        idx = np.argsort(eigenvalues)[::-1]
-        basis = S.T @ eigenvectors[:, idx]
-        return basis, eigenvalues[idx]
-
-    def plot_eigenvalues(self):
-        plt.semilogy(self.eigenvalues, marker="o")
-        plt.xlabel("Mode")
-        plt.ylabel("Eigenvalue")
-        plt.title("POD Eigenvalues")
-        plt.show()
-
-    def n_modes(self, energy_fraction=0.9999):
-        """Return the number of modes needed to capture *energy_fraction* of total energy."""
-        cumsum = np.cumsum(self.eigenvalues)
-        return int(np.searchsorted(cumsum, energy_fraction * cumsum[-1])) + 1
-
-    def visualize_modes(self, n_modes, filename, visualization_space, interpolation_space=None):
-        fn = fem.Function(visualization_space)
-        fn_out = fem.Function(interpolation_space) if interpolation_space is not None else fn
-        with XDMFFile(self.mesh.comm, filename, "w") as xdmf:
-            xdmf.write_mesh(self.mesh)
-            for i in range(n_modes):
-                fn.x.array[:] = self.basis[:, i]
-                if interpolation_space is not None:
-                    fn_out.interpolate(fn)
-                xdmf.write_function(fn_out, i)
-
-
 # ── ECM ───────────────────────────────────────────────────────────────────────
 
 class ECM:
@@ -284,7 +181,8 @@ class ECM:
     def __init__(self, basis_u, basis_P, V, S,
                  degree: int = 1,
                  sigma_u=None, sigma_P=None,
-                 ratio_uP=1.0, ratio_P=1.0):
+                 ratio_uP=1.0, ratio_P=1.0,
+                 kwargs: dict | None = None):
         self.basis_u = basis_u
         self.basis_P = basis_P
         self.N = basis_u.shape[1]
@@ -300,6 +198,20 @@ class ECM:
         self.sigma_P = np.ones(self.M) if sigma_P is None else np.asarray(sigma_P, dtype=float)
         self.ratio_uP = ratio_uP
         self.ratio_P = ratio_P
+        # Extra volume-integral-only bases.  Each entry is
+        #   name -> {"basis", "space", "sigma" (optional), "ratio" (optional)}
+        self.extras: dict = {}
+        for name, spec in (kwargs or {}).items():
+            basis = spec["basis"]
+            sigma = spec.get("sigma")
+            self.extras[name] = {
+                "basis": basis,
+                "space": spec["space"],
+                "M": basis.shape[1],
+                "sigma": (np.ones(basis.shape[1]) if sigma is None
+                          else np.asarray(sigma, dtype=float)),
+                "ratio": float(spec.get("ratio", 1.0)),
+            }
         self.magic_points = None
         self.magic_weights = None
 
@@ -324,7 +236,7 @@ class ECM:
         cell_avg = ufl.TestFunction(self._Q0)
         basis_func_u = fem.Function(self.V)
         basis_func_P = fem.Function(self.S)
-        
+
         mat = np.zeros((self.N, self.M, dofs_Q0))
         form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
         for i in range(self.N):
@@ -371,8 +283,46 @@ class ECM:
         mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
         mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
 
-        A = np.vstack([mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0), self._weights])
-        b = np.concatenate([mat_int_w.reshape(-1), mat_P_int_w.reshape(-1), [self._volume]])
+        A_blocks = [mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0)]
+        b_blocks = [mat_int_w.reshape(-1), mat_P_int_w.reshape(-1)]
+
+        # Extra volume-integral-only blocks from `kwargs`.
+        for entry in self.extras.values():
+            basis = entry["basis"]
+            space = entry["space"]
+            M_x = entry["M"]
+            sigma = entry["sigma"]
+            ratio = entry["ratio"]
+            sx = sigma / sigma[0]                          # (M_x,), sx[0] == 1
+
+            basis_func_x = fem.Function(space)
+            x_shape = basis_func_x.ufl_shape
+            x_component_forms = []
+            for idx in (np.ndindex(*x_shape) if x_shape else [()]):
+                if not idx:
+                    comp = basis_func_x
+                elif len(idx) == 1:
+                    comp = basis_func_x[idx[0]]
+                else:
+                    comp = basis_func_x[idx]
+                x_component_forms.append(fem.form(comp * cell_avg * dx))
+            n_x_components = len(x_component_forms)
+
+            mat_x = np.zeros((M_x, n_x_components, dofs_Q0))
+            for j in range(M_x):
+                basis_func_x.x.array[:] = basis[:, j]
+                for c, form_xc in enumerate(x_component_forms):
+                    mat_x[j, c, :] = petsc.assemble_vector(form_xc).array.copy()
+            mat_x_int = mat_x.sum(axis=2)
+
+            w_x         = ratio * sx                                          # (M_x,)
+            mat_x_w     = mat_x     * w_x[:, np.newaxis, np.newaxis]
+            mat_x_int_w = mat_x_int * w_x[:, np.newaxis]
+            A_blocks.append(mat_x_w.reshape(-1, dofs_Q0))
+            b_blocks.append(mat_x_int_w.reshape(-1))
+
+        A = np.vstack(A_blocks + [self._weights])
+        b = np.concatenate(b_blocks + [[self._volume]])
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 
@@ -388,8 +338,6 @@ class ECM:
             ecm_func = my_ecm
         A, b = self._build_matrices()
         self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol)
-        # self.magic_points = np.array(list(range(len(self.weights)))) if self.magic_points is None else self.magic_points
-        # self.magic_weights = 1 if self.magic_weights is None else self.magic_weights
 
     def show_active_cells(self, filename="active.xdmf"):
         assert self.magic_points is not None, "Call compute_magic first"
@@ -540,7 +488,7 @@ class ECM:
                 assert np.isclose(
                     fem.assemble_scalar(form_full),
                     fem.assemble_scalar(form_ecm_sub),
-                )        
+                )
 
         t0 = time()
         for _ in tqdm(range(n_trials), desc="Variant 2 full"):
@@ -638,6 +586,8 @@ class ECM:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    from fe2_rom.rom.pod import POD
+
     comm = MPI.COMM_WORLD
     gdim = 2
     degree = 2
@@ -652,14 +602,10 @@ if __name__ == "__main__":
     snapshots_u = POD.load_snapshots("output/snapshots/u_fluc_*.npy")
     pod_u = POD(snapshots_u, V, inner_product="H1")
     N = pod_u.n_modes(energy_tol)
-    # pod_u.plot_eigenvalues()
-    # pod_u.visualize_modes(N, "pod_mode_u.xdmf", V)
 
     snapshots_P = POD.load_snapshots("output/snapshots/P_*.npy")
     pod_P = POD(snapshots_P, S, inner_product="L2")
     M = pod_P.n_modes(energy_tol)
-    # pod_P.plot_eigenvalues()
-    # pod_P.visualize_modes(M, "pod_mode_P.xdmf", S, S0)
 
     print(f"Energy criterion ({energy_tol:.4%}): N={N} u-modes, M={M} P-modes")
 
@@ -668,12 +614,5 @@ if __name__ == "__main__":
               sigma_u=np.sqrt(pod_u.eigenvalues[:N]), sigma_P=np.sqrt(pod_P.eigenvalues[:M]),
               ratio_uP=2.0, ratio_P=1.0)
     ecm.compute_magic(tol=1e-6)
-    # ecm.show_active_cells("active.xdmf")
-
-    # ecm.test_variant1(10000)
-    # ecm.test_variant2(10000)
-    # ecm.test_variant3(10000)
 
     print("Number of magic points:", len(ecm.magic_points))
-
-    ecm.save_variant2("ecm_variant2_data")

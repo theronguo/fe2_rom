@@ -29,13 +29,3 @@ class NeoHookean(MaterialModel):
         J = ufl.det(F)
         C = F.T * F
         return (mu / 2) * (ufl.tr(C) - 3) - mu * ufl.ln(J) + (lmbda / 2) * (ufl.ln(J)) ** 2
-
-
-class LambdaMaterial(MaterialModel):
-    """Adapter so a plain callable W(F) can be used as a MaterialModel."""
-
-    def __init__(self, fn: Callable):
-        self._fn = fn
-
-    def strain_energy(self, F):
-        return self._fn(F)

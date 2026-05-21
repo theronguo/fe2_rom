@@ -7,10 +7,9 @@ quadrature point we run an RVE solve and read back its volume-averaged first
 Piola-Kirchhoff stress and tangent moduli.
 
 The class is RVE-agnostic — both
-:class:`fe2_rom.hyperelastic_solver.PeriodicHyperelasticHomogenizationSolver`
-and :class:`fe2_rom.rve_rom.RVESolver` work, provided they are constructed with
-``average_fields=["P", "A"]`` so the trailing entry of their per-call output is
-``[Pbar, Abar]``.
+:class:`fe2_rom.hyperelastic_solver.MicroSolver`
+and :class:`fe2_rom.rom.ReducedMicroSolver` work, provided their per-call dict
+output exposes ``Pbar`` (3×3) and ``dPbar_dFbar`` (3×3×3×3).
 
 Each macro qp owns its own RVE instance.  The RVEs are created lazily on the
 first ``integrate()`` call (when the QuadratureMap reports its quadrature-point
@@ -29,7 +28,7 @@ import numpy as np
 from dolfinx_materials.generic import Material
 
 from fe2_rom.hyperelastic_solver.logging_utils import qp_context
-from fe2_rom.hyperelastic_solver.exceptions import RVEConvergenceError
+from fe2_rom.ch1.exceptions import RVEConvergenceError
 
 logger = logging.getLogger(__name__)
 
@@ -73,9 +72,11 @@ class RVEMaterial(Material):
         Zero-argument callable returning a fresh RVE solver.  The RVE must
         (a) expose ``F_bar.value`` of shape ``(3, 3)`` and (b) be callable as
         ``out = rve(Fbar)`` advancing its internal state to ``Fbar`` and
-        returning a list with one entry per accepted load step; the final
-        entry is ``[Pbar, Abar]`` (3×3 stress, 3×3×3×3 tangent).  Configure
-        the RVE with ``average_fields=["P", "A"]``.
+        returning a list with one entry (a dict) per accepted load step; the
+        final entry must contain keys ``"Pbar"`` (3×3 stress) and
+        ``"dPbar_dFbar"`` (3×3×3×3 tangent).  Configure the RVE with
+        ``average_quantities=["P", "A"]`` (or include ``EffectivePbar`` and
+        ``EffectiveAbar`` instances).
     """
 
     def __init__(self, rve_factory: Callable[[int, int], object]):
@@ -163,7 +164,7 @@ class RVEMaterial(Material):
                         F_qp, getattr(rve, "F_bar").value,
                     )
                     raise
-            P_qp, A_qp = out[-1][0], out[-1][1]
+            P_qp, A_qp = out[-1]["Pbar"], out[-1]["dPbar_dFbar"]
             P_flat[i] = _tensor3_to_vec9(P_qp)
             A_flat[i] = _tangent4_to_mat99(A_qp)
 

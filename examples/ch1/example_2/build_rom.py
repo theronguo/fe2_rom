@@ -1,6 +1,7 @@
 """
 Run:
     python build_rom.py
+    mpirun -n 4 python build_rom.py
 """
 import os
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -9,18 +10,19 @@ os.environ["MKL_NUM_THREADS"] = "1"
 import numpy as np
 from dolfinx import io, fem
 from mpi4py import MPI
-from fe2_rom.rve_rom.pod import POD, ECM
+from fe2_rom.rom.pod import POD
+from fe2_rom.rom.ecm import ECM
 
 comm = MPI.COMM_WORLD
-gdim = 2
-degree = 2
+gdim = 3
+degree = 1
 snapshot_dir = "output"
 ecm_dir = "ecm"
-mesh_file = "rve.msh"
+mesh_file = "mesh.msh"
 ecm_tol = 1e-6
-ratio_uP = 10.0
-ratio_P = 3.0
-energy_tol = 0.9999
+ratio_uP = 1.0
+ratio_P = 2.0
+energy_tol = 0.999999
 
 mesh = io.gmsh.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim).mesh
 V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
