@@ -62,6 +62,9 @@ domain = dmesh.create_unit_cube(
 # --- RVE setup (matches legacy run_macro.py) --------------------------------
 HERE = os.path.dirname(__file__)
 RVE_MESH = os.path.join(HERE, "mesh.msh")
+# ROM artifacts are reused from examples/ch1/example_2 — run its build_rom.py
+# first if you intend to switch to full=False (ROM-backed FE²).
+ROM_DIR = os.path.join(HERE, "..", "example_2", "ecm")
 
 E_micro, nu_micro = 3000.0, 0.30
 mu_micro  = E_micro / (2.0 * (1.0 + nu_micro))
@@ -89,7 +92,7 @@ solver = MacroSolver(
     rve_averages_only_final=True,
     degree=1,
     check_stability=True,
-    rom_dir="ecm"
+    rom_dir=ROM_DIR,
 )
 
 

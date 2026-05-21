@@ -138,7 +138,7 @@ examples/
 ├── ch1/                # first-order computational homogenization
 │   ├── example_1/      # 2D perforated RVE — FOM and ROM
 │   ├── example_2/      # 3D periodic RVE — FOM and ROM
-│   └── example_3/      # FE² — single-element macro cube × 3D periodic RVE
+│   └── example_3/      # FE² — single-element macro cube × 3D periodic RVE (reuses example_2's ECM)
 └── mm/                 # micromorphic homogenization
     ├── example_1/      # standalone micromorphic RVE + snapshot sampling + ROM build
     ├── example_2/      # FE² macro micromorphic with dummy constitutive law (3D)
@@ -286,6 +286,12 @@ Run the full example (single hex element, 3D RVE inside):
 cd examples/ch1/example_3
 python run_macro.py
 ```
+
+The example runs with `full=True` (FOM RVE) out of the box. To switch the
+inner driver to the ROM (`full=False`), first build the ECM artifacts in
+`examples/ch1/example_2` (`python build_rom.py`) — `run_macro.py` reads
+`rom_dir=../example_2/ecm` so the ROM is shared with that example rather
+than duplicated on disk.
 
 Each accepted macro step commits every RVE's state so nested solves
 warm-start from their previous converged configuration. On RVE non-convergence
