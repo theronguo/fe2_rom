@@ -1,7 +1,7 @@
 from .boundary import ReactionProbe
 from .forms import basis_tensor_ufl, build_homogenization_weak_form, build_weak_forms
 from .logging_utils import broadcast_logger, qp_context, setup_logging, silence_c_stdout
-from .material import LambdaMaterial, MaterialModel, NeoHookean
+from .material import MaterialModel, NeoHookean
 from .output import ReactionForceLogger, VTXManager
 from .solver import HyperelasticStabilitySolver
 from .solvers import (
@@ -14,7 +14,7 @@ from .timestepping import TimeStepper
 
 __all__ = [
     # Materials
-    "MaterialModel", "NeoHookean", "LambdaMaterial",
+    "MaterialModel", "NeoHookean",
     # Boundary / forms
     "ReactionProbe",
     "build_weak_forms", "build_homogenization_weak_form", "basis_tensor_ufl",
