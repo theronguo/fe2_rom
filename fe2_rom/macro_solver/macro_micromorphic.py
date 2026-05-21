@@ -19,6 +19,9 @@ Usage pattern::
     solver.add_bc((0, 0), lambda x: np.isclose(x[0], 1.0), disp_const,
                   measure_reaction=True)
     solver.add_bc((1,),   lambda x: np.ones(x.shape[1], dtype=bool), zero_v)
+
+Works for 2D and 3D meshes; the material classes must be constructed with the
+matching ``gdim``.
     solver.setup()
     solver.solve(output_dir="output", timestepper=..., loadhistory=...)
 """
@@ -70,9 +73,6 @@ class MacroMicromorphicSolver:
         check_stability: bool = False,
         stability_options: dict | None = None,
     ):
-        if mesh.geometry.dim != 2:
-            raise ValueError("MacroMicromorphicSolver currently requires a 2D mesh.")
-
         self._mesh = mesh
         self.comm = mesh.comm
         self.gdim = mesh.geometry.dim
@@ -191,23 +191,20 @@ class MacroMicromorphicSolver:
 
     def add_bc(
         self,
-        subspace_path: tuple,
+        component,
         locate_fn: Callable,
         value: fem.Constant,
         *,
         measure_reaction: bool = False,
-        reaction_direction: tuple = (1.0, 0.0),
+        reaction_direction: tuple | None = None,
     ) -> None:
         """Register a Dirichlet BC on any component of the mixed space.
 
         Parameters
         ----------
-        subspace_path
-            Tuple of subspace indices traversed from ``self.V``:
-            ``(0, 0)`` → ``V.sub(0).sub(0)`` (u_x),
-            ``(0, 1)`` → u_y,
-            ``(1,)``   → v_1,
-            ``(i+1,)`` → v_{i+1}.
+        component
+            ``int`` (0, 1, 2, …) → displacement component u_x, u_y, u_z.
+            ``tuple`` → enrichment amplitude: ``(i+1,)`` pins v_{i+1}.
         locate_fn
             Callable ``x -> bool array`` for geometric detection.
         value
@@ -216,8 +213,12 @@ class MacroMicromorphicSolver:
             If True, residual is summed at the constrained DOFs after each
             accepted step.
         """
+        if isinstance(component, int):
+            path = (0, component)
+        else:
+            path = tuple(component)
         self._bc_specs.append(
-            (subspace_path, locate_fn, value, measure_reaction, reaction_direction)
+            (path, locate_fn, value, measure_reaction, reaction_direction)
         )
 
     # ------------------------------------------------------------------

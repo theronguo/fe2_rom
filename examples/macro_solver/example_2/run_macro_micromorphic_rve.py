@@ -55,7 +55,7 @@ USE_ROM    = True     # True → MicromorphicRVESolver, False → FOM homogeniza
 N_ELEM     = 4        # macro mesh divisions per direction
 N_QP       = 2        # quadrature degree for dolfinx_materials
 MAX_DISP   = -0.02     # total applied u_x displacement (keep small for linear regime)
-N_STEPS    = 3        # number of macro load steps
+N_STEPS    = 4        # number of macro load steps
 
 # RVE micro material parameters
 E_MICRO, NU_MICRO = 3000.0, 0.30
@@ -124,6 +124,7 @@ if USE_ROM:
             degree=2,
             comm=MPI.COMM_SELF,
             output_dir=out_dir,
+            visualize_fields=[],
             newton_options={
                 "rel_tol": 1e-8, "abs_tol": 1e-6,
                 "max_iter": 50, "div_rel_tol": 10.0,
@@ -150,6 +151,7 @@ else:
             N=N_MODES,
             degree=2,
             output_dir=out_dir,
+            visualize_fields=[],
             newton_options={
                 "rel_tol": 1e-8, "abs_tol": 1e-6,
                 "max_iter": 50, "div_rel_tol": 10.0,

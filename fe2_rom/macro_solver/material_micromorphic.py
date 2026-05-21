@@ -16,11 +16,16 @@ Two classes are provided:
 Both classes expose the same ``gradients``, ``fluxes``, and ``tangent_blocks``
 so they are drop-in substitutes for the :class:`QuadratureMap`.
 
-Gradient / flux convention (2D, following dolfinx_materials
-``nonsymmetric_tensor_to_vector`` for a 2×2 tensor):
-    F_vec  = [F00, F11, 0, F01, F10]          → F_dim = 5
-    v_vec  = [v_1, ..., v_N]                  → shape N
-    g_vec  = [g_1[0], g_1[1], ..., g_N[1]]   → shape N*gdim (mode-major)
+Gradient / flux convention (following dolfinx_materials
+``nonsymmetric_tensor_to_vector`` / MFront conventions):
+
+  2D (gdim=2), F_dim=5:
+    F_vec = [F00, F11, 0, F01, F10]
+  3D (gdim=3), F_dim=9:
+    F_vec = [F00, F11, F22, F01, F10, F02, F20, F12, F21]
+
+  v_vec = [v_1, ..., v_N]                    shape N
+  g_vec = [g_1[0], ..., g_1[d-1], g_2[0], ...]  shape N*gdim (mode-major)
 
 Tangent blocks (3 × 3 grid):
     ("P",      "F"), ("P",      "v"), ("P",      "g")
@@ -43,36 +48,56 @@ from fe2_rom.hyperelastic_solver.exceptions import RVEConvergenceError
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 2D tensor ↔ 5-vector helpers
-# F5 ordering: [F00, F11, F22(=0), F01, F10]
-# Index 2 is always zero (out-of-plane), column/row 2 of any tangent is zero.
+# MFront ordering: vector index → (row, col) of the tensor.
+# None marks a placeholder that is always zero (2D out-of-plane slot).
 # ---------------------------------------------------------------------------
 
-_F5_ORDER_2D: tuple[tuple[int, int] | None, ...] = (
-    (0, 0), (1, 1), None, (0, 1), (1, 0)
+_F_ORDER_2D: tuple = ((0, 0), (1, 1), None, (0, 1), (1, 0))
+_F_ORDER_3D: tuple = (
+    (0, 0), (1, 1), (2, 2),
+    (0, 1), (1, 0),
+    (0, 2), (2, 0),
+    (1, 2), (2, 1),
 )
 
-
-def _f5_to_2x2(v: np.ndarray) -> np.ndarray:
-    """5-vector → 2×2 F.  Entry v[2] (F22) is ignored."""
-    return np.array([[v[0], v[3]], [v[4], v[1]]], dtype=float)
-
-
-def _tensor2x2_to_f5(T: np.ndarray) -> np.ndarray:
-    """2×2 tensor → 5-vector.  Entry [2] (F22) set to 0."""
-    return np.array([T[0, 0], T[1, 1], 0.0, T[0, 1], T[1, 0]], dtype=float)
+_F_DIM = {2: 5, 3: 9}
+_F_ORDER = {2: _F_ORDER_2D, 3: _F_ORDER_3D}
+_I_VEC = {
+    2: np.array([1.0, 1.0, 0.0, 0.0, 0.0]),
+    3: np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+}
 
 
-def _tangent2x2x2x2_to_mat55(A: np.ndarray) -> np.ndarray:
-    """(2,2,2,2) tangent → 5×5 matrix in F5 convention.
-    Rows/cols corresponding to the out-of-plane (index 2) entry remain zero.
-    """
-    M = np.zeros((5, 5), dtype=float)
-    for p, ij in enumerate(_F5_ORDER_2D):
+# ---------------------------------------------------------------------------
+# Generic F-vector ↔ matrix conversion helpers
+# ---------------------------------------------------------------------------
+
+def _fvec_to_mat(v: np.ndarray, order: tuple, gdim: int) -> np.ndarray:
+    """F-vector (MFront ordering) → gdim×gdim matrix."""
+    M = np.zeros((gdim, gdim), dtype=float)
+    for idx, ij in enumerate(order):
+        if ij is not None:
+            M[ij] = v[idx]
+    return M
+
+
+def _mat_to_fvec(T: np.ndarray, order: tuple, F_dim: int) -> np.ndarray:
+    """gdim×gdim matrix → F-vector (MFront ordering). None slots → 0."""
+    v = np.zeros(F_dim, dtype=float)
+    for idx, ij in enumerate(order):
+        if ij is not None:
+            v[idx] = T[ij]
+    return v
+
+
+def _tangent_FF(A: np.ndarray, order: tuple, F_dim: int) -> np.ndarray:
+    """(gdim,gdim,gdim,gdim) dP/dF → (F_dim,F_dim)."""
+    M = np.zeros((F_dim, F_dim), dtype=float)
+    for p, ij in enumerate(order):
         if ij is None:
             continue
         i, j = ij
-        for q, kl in enumerate(_F5_ORDER_2D):
+        for q, kl in enumerate(order):
             if kl is None:
                 continue
             k, l = kl
@@ -80,10 +105,10 @@ def _tangent2x2x2x2_to_mat55(A: np.ndarray) -> np.ndarray:
     return M
 
 
-def _pbar_v_tangent_to_mat5N(A: np.ndarray, N: int) -> np.ndarray:
-    """(2,2,N) dPbar/dv → (5, N) matrix in F5 convention."""
-    M = np.zeros((5, N), dtype=float)
-    for p, ij in enumerate(_F5_ORDER_2D):
+def _tangent_PbarV(A: np.ndarray, order: tuple, F_dim: int, N: int) -> np.ndarray:
+    """(gdim,gdim,N) dPbar/dv → (F_dim,N)."""
+    M = np.zeros((F_dim, N), dtype=float)
+    for p, ij in enumerate(order):
         if ij is None:
             continue
         i, j = ij
@@ -91,10 +116,10 @@ def _pbar_v_tangent_to_mat5N(A: np.ndarray, N: int) -> np.ndarray:
     return M
 
 
-def _pbar_g_tangent_to_mat5Ng(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
-    """(2,2,N,gdim) dPbar/dg → (5, N*gdim) matrix in F5 convention."""
-    M = np.zeros((5, N * gdim), dtype=float)
-    for p, ij in enumerate(_F5_ORDER_2D):
+def _tangent_PbarG(A: np.ndarray, order: tuple, F_dim: int, N: int, gdim: int) -> np.ndarray:
+    """(gdim,gdim,N,gdim) dPbar/dg → (F_dim,N*gdim)."""
+    M = np.zeros((F_dim, N * gdim), dtype=float)
+    for p, ij in enumerate(order):
         if ij is None:
             continue
         i, j = ij
@@ -104,10 +129,10 @@ def _pbar_g_tangent_to_mat5Ng(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
     return M
 
 
-def _pi_fbar_tangent_to_matN5(A: np.ndarray, N: int) -> np.ndarray:
-    """(N,2,2) dPi/dFbar → (N, 5) matrix in F5 convention."""
-    M = np.zeros((N, 5), dtype=float)
-    for q, kl in enumerate(_F5_ORDER_2D):
+def _tangent_PiF(A: np.ndarray, order: tuple, F_dim: int, N: int) -> np.ndarray:
+    """(N,gdim,gdim) dPi/dFbar → (N,F_dim)."""
+    M = np.zeros((N, F_dim), dtype=float)
+    for q, kl in enumerate(order):
         if kl is None:
             continue
         k, l = kl
@@ -115,32 +140,17 @@ def _pi_fbar_tangent_to_matN5(A: np.ndarray, N: int) -> np.ndarray:
     return M
 
 
-def _pi_g_tangent_to_matNNg(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
-    """(N,N,gdim) dPi/dg → (N, N*gdim) matrix."""
-    return A.reshape(N, N * gdim)
-
-
-def _lambda_fbar_tangent_to_matNg5(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
-    """(N,gdim,2,2) dLambda/dFbar → (N*gdim, 5) matrix in F5 convention."""
-    M = np.zeros((N * gdim, 5), dtype=float)
+def _tangent_LambdaF(A: np.ndarray, order: tuple, F_dim: int, N: int, gdim: int) -> np.ndarray:
+    """(N,gdim,gdim,gdim) dLambda/dFbar → (N*gdim,F_dim)."""
+    M = np.zeros((N * gdim, F_dim), dtype=float)
     for n in range(N):
         for d in range(gdim):
-            for q, kl in enumerate(_F5_ORDER_2D):
+            for q, kl in enumerate(order):
                 if kl is None:
                     continue
                 k, l = kl
                 M[n * gdim + d, q] = A[n, d, k, l]
     return M
-
-
-def _lambda_v_tangent_to_matNgN(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
-    """(N,gdim,N) dLambda/dv → (N*gdim, N) matrix."""
-    return A.reshape(N * gdim, N)
-
-
-def _lambda_g_tangent_to_matNgNg(A: np.ndarray, N: int, gdim: int) -> np.ndarray:
-    """(N,gdim,N,gdim) dLambda/dg → (N*gdim, N*gdim) matrix."""
-    return A.reshape(N * gdim, N * gdim)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +191,7 @@ class DummyMicromorphicMaterial(Material):
     N_modes : int
         Number of enrichment modes (must match the macro solver).
     gdim : int
-        Geometric dimension (2 or 3; currently only 2 is implemented).
+        Geometric dimension (2 or 3).
     mu : float
         Elastic modulus for P = mu * (F_vec - I_vec).
     alpha : float
@@ -192,16 +202,16 @@ class DummyMicromorphicMaterial(Material):
 
     def __init__(self, N_modes: int, gdim: int = 2, mu: float = 1.0,
                  alpha: float = 1.0, beta: float = 1.0):
-        if gdim != 2:
-            raise NotImplementedError("DummyMicromorphicMaterial only supports gdim=2.")
+        if gdim not in (2, 3):
+            raise ValueError(f"gdim must be 2 or 3, got {gdim}.")
         self._N = N_modes
         self._gdim = gdim
-        self._F_dim = 5  # nonsymmetric_tensor_to_vector for 2D → 5-vector
+        self._F_dim = _F_DIM[gdim]
+        self._order = _F_ORDER[gdim]
         self._mu = mu
         self._alpha = alpha
         self._beta = beta
-        # I_vec: identity deformation gradient as 5-vector [1, 1, 0, 0, 0]
-        self._I_vec = np.array([1.0, 1.0, 0.0, 0.0, 0.0])
+        self._I_vec = _I_VEC[gdim].copy()
         self.step_failed: bool = False
         self.failure_reason: str = ""
         super().__init__()
@@ -233,12 +243,11 @@ class DummyMicromorphicMaterial(Material):
         Ng = N * gdim
         n_qp = gradients.shape[0]
 
-        F_all = gradients[:, :F_dim]                     # (n_qp, 5)
+        F_all = gradients[:, :F_dim]
         v_all = gradients[:, F_dim:F_dim + N] if N > 0 else np.zeros((n_qp, 0))
-        g_all = gradients[:, F_dim + N:] if N > 0 else np.zeros((n_qp, 0))
+        g_all = gradients[:, F_dim + N:]      if N > 0 else np.zeros((n_qp, 0))
 
-        # Fluxes
-        P_flat = self._mu * (F_all - self._I_vec)   # (n_qp, 5)
+        P_flat = self._mu * (F_all - self._I_vec)
         flux_parts = [P_flat]
         if N > 0:
             Pi_flat     = self._alpha * v_all
@@ -246,7 +255,6 @@ class DummyMicromorphicMaterial(Material):
             flux_parts.extend([Pi_flat, Lambda_flat])
         flux_vals = np.concatenate(flux_parts, axis=1)
 
-        # Tangents — constant, broadcast over qps
         dP_dF = np.broadcast_to(
             self._mu * np.eye(F_dim), (n_qp, F_dim, F_dim)).copy()
         ct_blocks = [dP_dF]
@@ -263,17 +271,16 @@ class DummyMicromorphicMaterial(Material):
             ])
         Ct_vals = _pack_ct(ct_blocks, n_qp)
 
-        # Keep data_manager in sync so qmap.advance() propagates correct values.
         self.data_manager.s1.fluxes[:] = flux_vals
         self.data_manager.s0.fluxes[:] = flux_vals
 
         return flux_vals, np.zeros((n_qp, 0)), Ct_vals
 
     def constitutive_update(self, gradients, state, dt):
-        pass  # unused — we override integrate()
+        pass
 
     def commit(self) -> None:
-        pass  # stateless
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -300,17 +307,18 @@ class MicromorphicRVEMaterial(Material):
     N_modes : int
         Number of enrichment modes.
     gdim : int
-        Geometric dimension (currently only 2 supported).
+        Geometric dimension (2 or 3).
     """
 
     def __init__(self, rve_factory: Callable[[int, int], object],
                  N_modes: int, gdim: int = 2):
-        if gdim != 2:
-            raise NotImplementedError("MicromorphicRVEMaterial only supports gdim=2.")
+        if gdim not in (2, 3):
+            raise ValueError(f"gdim must be 2 or 3, got {gdim}.")
         self._rve_factory = rve_factory
         self._N = N_modes
         self._gdim = gdim
-        self._F_dim = 5
+        self._F_dim = _F_DIM[gdim]
+        self._order = _F_ORDER[gdim]
         self._rves: list | None = None
         self._n_qp: int | None = None
         self._rank = MPI.COMM_WORLD.Get_rank()
@@ -360,6 +368,7 @@ class MicromorphicRVEMaterial(Material):
         N = self._N
         gdim = self._gdim
         Ng = N * gdim
+        order = self._order
         n_qp = gradients.shape[0]
         self._ensure_rves(n_qp)
 
@@ -385,9 +394,9 @@ class MicromorphicRVEMaterial(Material):
         failed_qp = -1
 
         for i, rve in enumerate(self._rves):
-            F_qp = _f5_to_2x2(F_all[i])
-            v_qp = v_all[i]                              # (N,)
-            g_qp = g_all[i].reshape(N, gdim)             # (N, gdim)
+            F_qp = _fvec_to_mat(F_all[i], order, gdim)
+            v_qp = v_all[i]
+            g_qp = g_all[i].reshape(N, gdim)
             with qp_context(i):
                 try:
                     out = rve(F_qp, v=v_qp, g=g_qp)
@@ -407,19 +416,19 @@ class MicromorphicRVEMaterial(Material):
                     raise
 
             d = out[-1]
-            P_flat[i]      = _tensor2x2_to_f5(d["Pbar"])
+            P_flat[i]      = _mat_to_fvec(d["Pbar"], order, F_dim)
             Pi_flat[i]     = np.asarray(d["Pi"]).ravel()
             Lambda_flat[i] = np.asarray(d["Lambda"]).ravel()
 
-            dP_dF[i]   = _tangent2x2x2x2_to_mat55(d["dPbar_dFbar"])
-            dP_dv[i]   = _pbar_v_tangent_to_mat5N(d["dPbar_dv"], N)
-            dP_dg[i]   = _pbar_g_tangent_to_mat5Ng(d["dPbar_dg"], N, gdim)
-            dPi_dF[i]  = _pi_fbar_tangent_to_matN5(d["dPi_dFbar"], N)
+            dP_dF[i]   = _tangent_FF(d["dPbar_dFbar"], order, F_dim)
+            dP_dv[i]   = _tangent_PbarV(d["dPbar_dv"], order, F_dim, N)
+            dP_dg[i]   = _tangent_PbarG(d["dPbar_dg"], order, F_dim, N, gdim)
+            dPi_dF[i]  = _tangent_PiF(d["dPi_dFbar"], order, F_dim, N)
             dPi_dv[i]  = np.asarray(d["dPi_dv"]).reshape(N, N)
-            dPi_dg[i]  = _pi_g_tangent_to_matNNg(d["dPi_dg"], N, gdim)
-            dLam_dF[i] = _lambda_fbar_tangent_to_matNg5(d["dLambda_dFbar"], N, gdim)
-            dLam_dv[i] = _lambda_v_tangent_to_matNgN(d["dLambda_dv"], N, gdim)
-            dLam_dg[i] = _lambda_g_tangent_to_matNgNg(d["dLambda_dg"], N, gdim)
+            dPi_dg[i]  = np.asarray(d["dPi_dg"]).reshape(N, Ng)
+            dLam_dF[i] = _tangent_LambdaF(d["dLambda_dFbar"], order, F_dim, N, gdim)
+            dLam_dv[i] = np.asarray(d["dLambda_dv"]).reshape(Ng, N)
+            dLam_dg[i] = np.asarray(d["dLambda_dg"]).reshape(Ng, Ng)
 
         any_failure = MPI.COMM_WORLD.allreduce(local_failure, op=MPI.LOR)
         if any_failure:
@@ -444,7 +453,6 @@ class MicromorphicRVEMaterial(Material):
         flux_vals = np.concatenate(flux_parts, axis=1)
         Ct_vals = _pack_ct(ct_blocks, n_qp)
 
-        # Keep data_manager in sync so qmap.advance() propagates correct values.
         self.data_manager.s1.fluxes[:] = flux_vals
         self.data_manager.s0.fluxes[:] = flux_vals
 
