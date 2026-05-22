@@ -1,10 +1,110 @@
 import logging
 
 import numpy as np
+from mpi4py import MPI
 from petsc4py import PETSc
 from slepc4py import SLEPc
 
 logger = logging.getLogger(__name__)
+
+
+def mesh_characteristic_length(mesh) -> float:
+    """Return the max coordinate extent of ``mesh``, reduced across ranks.
+
+    Used as a fallback length scale for eigenmode perturbations when the
+    current displacement is still ~0 (e.g. at the first load step).
+    """
+    coords = mesh.geometry.x
+    local_extent = float(np.ptp(coords, axis=0).max()) if coords.size else 0.0
+    return mesh.comm.allreduce(local_extent, op=MPI.MAX)
+
+
+def apply_eigenmode_perturbation(
+    target,
+    mode,
+    factor: float,
+    comm,
+    *,
+    blocks=None,
+    dofs: np.ndarray | None = None,
+    char_length: float = 1.0,
+) -> tuple[float, list[tuple[float, float]]]:
+    """In-place perturbation ``target += scale·mode``.
+
+    The amplitude ``scale`` is chosen as the smallest value that respects a
+    per-block cap on ``‖scale·mode‖_∞``. For each block specified in
+    ``blocks`` as ``(dof_indices, fallback_ref)``:
+
+        ref_block   = max(max|target|_block, fallback_ref)
+        cap_block   = factor * ref_block / max|mode|_block
+        scale       = min over blocks of cap_block
+
+    so the perturbation magnitude in every block stays at most
+    ``factor * ref_block`` while the direction of ``mode`` is preserved.
+    ``fallback_ref`` is a *floor* on the reference magnitude — values of
+    ``max|target|_block`` below it (e.g. numerical noise around zero) are
+    clamped up to ``fallback_ref`` rather than used directly, otherwise a
+    drifting near-zero ``target`` block would shrink the cap toward zero
+    and stall the retry doubling.
+
+    Parameters
+    ----------
+    target, mode
+        ``dolfinx.fem.Function`` instances sharing a function space.
+    factor
+        Dimensionless perturbation factor.
+    comm
+        MPI communicator for the global max reductions.
+    blocks
+        Sequence of ``(dof_indices, fallback_ref)``. ``dof_indices=None``
+        means all owned dofs of ``target``. Indices beyond the owned range
+        are filtered out automatically. If ``blocks`` is ``None`` a single
+        block ``[(dofs, char_length)]`` is used (back-compat single-block
+        API for non-mixed spaces).
+    dofs, char_length
+        Legacy single-block convenience kwargs, used only when
+        ``blocks is None``.
+
+    Returns
+    -------
+    (scale, info)
+        ``scale`` is the chosen amplitude. ``info`` is a list of
+        ``(ref_block, phi_max_block)`` tuples in the same order as
+        ``blocks`` — useful for logging per-block reference magnitudes
+        and the resulting ``scale * phi_max_block`` perturbation norms.
+    """
+    if blocks is None:
+        blocks = [(dofs, char_length)]
+
+    n_local = (target.function_space.dofmap.index_map.size_local
+               * target.function_space.dofmap.index_map_bs)
+
+    info: list[tuple[float, float]] = []
+    scale = float("inf")
+    for block_dofs, fallback_ref in blocks:
+        if block_dofs is None:
+            u_local = target.x.array[:n_local]
+            phi_local = mode.x.array[:n_local]
+        else:
+            owned = block_dofs[block_dofs < n_local]
+            u_local = target.x.array[owned] if owned.size else np.empty(0)
+            phi_local = mode.x.array[owned] if owned.size else np.empty(0)
+        u_max = comm.allreduce(
+            float(np.max(np.abs(u_local))) if u_local.size else 0.0, op=MPI.MAX,
+        )
+        phi_max = comm.allreduce(
+            float(np.max(np.abs(phi_local))) if phi_local.size else 0.0, op=MPI.MAX,
+        )
+        ref = max(u_max, fallback_ref)
+        cap = factor * ref / max(phi_max, 1e-300)
+        scale = min(scale, cap)
+        info.append((ref, phi_max))
+
+    if not np.isfinite(scale):
+        scale = 0.0
+    target.x.petsc_vec.axpy(scale, mode.x.petsc_vec)
+    target.x.scatter_forward()
+    return scale, info
 
 
 def solve_smallest_eigenpairs(
@@ -134,7 +234,12 @@ class StabilityAnalyzer:
             is_stable = True
             negatives = np.where(eigenvalues < self._neg_tol)[0]
             if negatives.size > 0:
-                global_idx = int(physical_indices[negatives[0]])
+                # Pick the most negative eigenvalue (deepest into instability),
+                # not just the first in |λ| order, to avoid perturbing a
+                # near-zero numerical artefact when a genuinely negative mode
+                # is also present.
+                most_negative_local = negatives[np.argmin(eigenvalues[negatives])]
+                global_idx = int(physical_indices[most_negative_local])
                 eigensolver.getEigenvector(global_idx, eigenfunction.x.petsc_vec)
                 eigenfunction.x.scatter_forward()
                 is_stable = False

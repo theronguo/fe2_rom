@@ -38,7 +38,11 @@ from dolfinx_materials.utils import nonsymmetric_tensor_to_vector
 from fe2_rom.ch1.averages import AverageQuantity, STRING_KEY_MAP
 from fe2_rom.hyperelastic_solver.output import ReactionForceLogger, VTXManager
 from fe2_rom.ch1.microsolver import MicroSolver
-from fe2_rom.hyperelastic_solver.stability import StabilityAnalyzer
+from fe2_rom.hyperelastic_solver.stability import (
+    StabilityAnalyzer,
+    apply_eigenmode_perturbation,
+    mesh_characteristic_length,
+)
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 from fe2_rom.ch1.material import RVEMaterial
 
@@ -314,6 +318,8 @@ class MacroSolver:
         self._Jac_form = fem.form(self.Jac)
         self._Res_form = fem.form(self.Res)
 
+        self._char_length = mesh_characteristic_length(mesh)
+
         logger.debug(
             "Setup complete — %d BCs, %d reaction probe(s), stability=%s",
             len(self._bcs), len(self._reaction_specs),
@@ -332,7 +338,8 @@ class MacroSolver:
         loadhistory: Callable[[float], None],
         output_variables: list | None = None,
         reaction_logger: ReactionForceLogger | None = None,
-        pert_amplitude_init: float = 1e1,
+        pert_amplitude_init: float = 1e-2,
+        max_iter_per_step: int = 25,
     ) -> None:
         """Run the adaptive load-stepping outer loop.
 
@@ -344,9 +351,17 @@ class MacroSolver:
         halves dt, and the step is retried until dt < dt_min.
 
         On macro instability (smallest tangent eigenvalue < neg_tol), the
-        displacement is perturbed along the eigenvector and SNES is re-driven;
-        ``pert_amplitude_init`` is the starting amplitude and doubles on each
+        displacement is perturbed along the eigenvector and SNES is re-driven.
+        ``pert_amplitude_init`` is a dimensionless factor: the actual
+        perturbation magnitude on the first retry is
+        ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
+        char_length`` if ``|u|`` is still ~0). The factor doubles on each
         unstable iteration within a step.
+
+        ``max_iter_per_step`` caps the *total* number of Newton iterations
+        spent across all perturb-and-retry SNES calls within a single load
+        step. When exceeded, the step is rejected like a SNES failure and
+        the timestepper halves dt.
         """
         if self._problem is None:
             raise RuntimeError("Call setup() before solve().")
@@ -366,11 +381,12 @@ class MacroSolver:
         try:
             while not timestepper.finished:
                 trial_t = timestepper.step_forward()
-                logger.info("── Step  t=%.5f  dt=%.2e", trial_t, timestepper.dt)
+                logger.info("── Step  t=%.8f  dt=%.2e", trial_t, timestepper.dt)
                 loadhistory(trial_t)
 
                 stable_configuration = False
                 pert_amplitude = pert_amplitude_init
+                iters_in_step = 0
 
                 while not stable_configuration:
                     self.material.step_failed = False
@@ -385,6 +401,8 @@ class MacroSolver:
                     if self.material.step_failed:
                         logger.warning("%s", self.material.failure_reason)
                         reason = -1
+
+                    iters_in_step += max(n_iters, 0)
 
                     if reason <= 0:
                         # SNES or RVE failure → reject and shrink dt.
@@ -430,16 +448,45 @@ class MacroSolver:
                                     n_iters, reason, timestepper.dt,
                                 )
                             break
+                        logger.info(
+                            "   λ = [%s]",
+                            ", ".join(f"{ev:.4e}" for ev in eigenvalues),
+                        )
                     else:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
-                        u.x.scatter_forward()
+                        if iters_in_step >= max_iter_per_step:
+                            ok = timestepper.reject()
+                            u.x.array[:] = self._u_last.x.array
+                            u.x.scatter_forward()
+                            if not ok:
+                                logger.error(
+                                    "Iteration budget exhausted (%d ≥ %d) "
+                                    "and dt=%.2e at dt_min — stopping.",
+                                    iters_in_step, max_iter_per_step,
+                                    timestepper.dt_min,
+                                )
+                                simulation_finished = True
+                            else:
+                                logger.warning(
+                                    "Iteration budget exhausted (%d ≥ %d) "
+                                    "within step — halving dt to %.2e",
+                                    iters_in_step, max_iter_per_step,
+                                    timestepper.dt,
+                                )
+                            break
+                        scale, info = apply_eigenmode_perturbation(
+                            u, self._eigenfunction, pert_amplitude, self.comm,
+                            char_length=self._char_length,
+                        )
+                        u_ref, phi_max = info[0]
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing with eigenvector (amplitude=%.2e)",
-                            eigenvalues[0], pert_amplitude,
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues.min(), pert_amplitude, u_ref,
+                            scale * phi_max,
                         )
                         pert_amplitude *= 2
                         continue

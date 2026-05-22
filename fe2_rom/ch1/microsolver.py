@@ -24,7 +24,11 @@ from fe2_rom.hyperelastic_solver.forms import basis_tensor_ufl, build_homogeniza
 from fe2_rom.hyperelastic_solver.logging_utils import silence_c_stdout
 from fe2_rom.hyperelastic_solver.material import MaterialModel
 from fe2_rom.hyperelastic_solver.output import VTXManager
-from fe2_rom.hyperelastic_solver.stability import StabilityAnalyzer
+from fe2_rom.hyperelastic_solver.stability import (
+    StabilityAnalyzer,
+    apply_eigenmode_perturbation,
+    mesh_characteristic_length,
+)
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,10 @@ class MicroSolver:
         # ---- Subclass hooks: φᵢ and the macro-variable dict ----
         self._setup_phi()
         self._setup_macro_vars()
+
+        # Characteristic mesh extent — fallback length scale for the
+        # eigenmode perturbation when |u| is ~0 (e.g. first load step).
+        self._char_length = mesh_characteristic_length(self._mesh)
 
         # ---- Stability analyzer (optional) ----
         if check_stability:
@@ -474,7 +482,7 @@ class MicroSolver:
         return out
 
     def __call__(self, Fbar: np.ndarray, *,
-                 pert_amplitude_init: float = 1e1,
+                 pert_amplitude_init: float = 1e-2,
                  plot_time_start: float = 0.0) -> list[dict]:
         assert self._newton is not None, "Setup not complete."
 
@@ -549,14 +557,19 @@ class MicroSolver:
 
                     if not is_stable:
                         target = np.where(eigenvalues < self._stability._neg_tol)[0]
-                        u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
-                        u.x.scatter_forward()
-                        pert_amplitude *= 2
+                        scale, info = apply_eigenmode_perturbation(
+                            u, self._eigenfunction, pert_amplitude, self.comm,
+                            char_length=self._char_length,
+                        )
+                        u_ref, phi_max = info[0]
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing with eigenvector (amplitude=%.2e)",
-                            eigenvalues[target[0]], pert_amplitude,
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues[target[0]], pert_amplitude, u_ref,
+                            scale * phi_max,
                         )
+                        pert_amplitude *= 2
                     else:
                         stable_configuration = True
                         self._timestepper.accept(iter_newton)

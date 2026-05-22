@@ -12,7 +12,11 @@ from .forms import build_weak_forms
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
 from .solvers import CylindricalArcLength, NewtonSolver
-from .stability import StabilityAnalyzer
+from .stability import (
+    StabilityAnalyzer,
+    apply_eigenmode_perturbation,
+    mesh_characteristic_length,
+)
 from .timestepping import TimeStepper
 
 logger = logging.getLogger(__name__)
@@ -89,13 +93,19 @@ class HyperelasticStabilitySolver:
                                 measure_reaction, reaction_direction))
 
     def setup(self, check_stability: bool = True,
-              newton_options: dict | None = None) -> None:
+              newton_options: dict | None = None,
+              stability_options: dict | None = None) -> None:
         """Freeze BCs, compile UFL forms, and instantiate sub-solvers.
 
         Must be called once after all add_bc() calls and before run().
         Collective: calls fem.form() on all MPI ranks.
+
+        stability_options: kwargs forwarded to StabilityAnalyzer (nev, neg_tol,
+            tol, petsc_options, n_skip_eigenvalues).  Ignored when
+            check_stability=False.
         """
         newton_options = newton_options if newton_options is not None else {}
+        stability_options = stability_options if stability_options is not None else {}
 
         mesh = self._mesh
         fdim = mesh.topology.dim - 1
@@ -136,8 +146,10 @@ class HyperelasticStabilitySolver:
             self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points)
             self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points)
 
+        self._char_length = mesh_characteristic_length(mesh)
+
         if check_stability:
-            self._stability = StabilityAnalyzer(self.comm)
+            self._stability = StabilityAnalyzer(self.comm, **stability_options)
             if "switch_to_minres" in newton_options:
                 if newton_options["switch_to_minres"] is False:
                     logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
@@ -162,15 +174,17 @@ class HyperelasticStabilitySolver:
             timestepper: TimeStepper | None = None,
             output_manager: VTXManager | None = None,
             reaction_logger: ReactionForceLogger | None = None,
-            pert_amplitude_init: float = 1e1) -> None:
+            pert_amplitude_init: float = 1e-2) -> None:
         """Main time-stepping loop.
 
         load_schedule(t) is called once per trial time step to update any
         time-varying fem.Constants (e.g. prescribed displacements).
 
-        pert_amplitude_init: initial eigenvector perturbation amplitude.
-        Doubles on each stability retry; reset to this value each new time step.
-        TODO: improve by normalising eigenvector relative to mesh size h.
+        pert_amplitude_init: dimensionless eigenvector-perturbation factor.
+        First perturbation magnitude on instability is
+        ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
+        char_length`` if ``|u|`` is still ~0). Doubles on each stability
+        retry; reset to this value each new time step.
         """
         assert self._newton is not None, "Call setup() before run()"
 
@@ -187,7 +201,7 @@ class HyperelasticStabilitySolver:
         simulation_finished = False
         while not timestepper.finished:
             trial_time = timestepper.step_forward()
-            logger.info("── Step  t=%.5f  dt=%.2e", trial_time, timestepper.dt)
+            logger.info("── Step  t=%.8f  dt=%.2e", trial_time, timestepper.dt)
 
             load_schedule(trial_time)
 
@@ -208,15 +222,19 @@ class HyperelasticStabilitySolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        target = np.where(eigenvalues < 1e-12)[0]
-                        u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
-                        u.x.scatter_forward()
-                        pert_amplitude *= 2
+                        scale, info = apply_eigenmode_perturbation(
+                            u, self._eigenfunction, pert_amplitude, comm,
+                            char_length=self._char_length,
+                        )
+                        u_ref, phi_max = info[0]
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing with eigenvector (amplitude=%.2e)",
-                            eigenvalues[target[0]], pert_amplitude,
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues.min(), pert_amplitude, u_ref,
+                            scale * phi_max,
                         )
+                        pert_amplitude *= 2
                     else:
                         stable_configuration = True
                         timestepper.accept(iter_newton)

@@ -70,7 +70,6 @@ solver.run(
     ),
     output_manager=vtx,
     reaction_logger=rf_logger,
-    pert_amplitude_init=1e1,
 )
 
 # from fe2_rom.hyperelastic_solver.solvers import CylindricalArcLength

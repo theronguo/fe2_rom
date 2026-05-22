@@ -86,7 +86,7 @@ v_target = np.array([1])
 g_target = np.array([[-0.2, 0.1]])
 
 logger.info("Calling micromorphic solver with N=%d modes …", N_MODES)
-results = solver(Fbar_target, v_target, g_target, pert_amplitude_init=0.1)
+results = solver(Fbar_target, v_target, g_target)
 final = results[-1]
 
 
