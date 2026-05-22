@@ -79,7 +79,7 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # Analytical φ₁ (Eq. 56) and its in-place normalisation.
 # ---------------------------------------------------------------------------
-def _populate_phi(rve):
+def _populate_phi(rve, vol_global=None):
     """Write the analytical patterning mode φ₁ into ``rve._phi[0]`` and
     renormalise so that (1/|Q|) ∫_Q ‖φ₁‖ dX = 1, then call rebuild_constraints.
     """
@@ -102,23 +102,23 @@ def _populate_phi(rve):
     # Numerical normalisation: C1 = ∫ ‖φ_raw‖ dX / |Q|.
     phi = rve._phi[0]
     norm_form = fem.form(ufl.sqrt(ufl.dot(phi, phi)) * rve.dx)
-    vol_form  = fem.form(fem.Constant(rve._mesh, 1.0) * rve.dx)
     int_local = fem.assemble_scalar(norm_form)
-    vol_local = fem.assemble_scalar(vol_form)
     int_global = rve.comm.allreduce(int_local, op=MPI.SUM)
-    vol_global = rve.comm.allreduce(vol_local, op=MPI.SUM)
-    C_norm = int_global / vol_global                   # mean ‖φ_raw‖
+    if vol_global is not None:
+        vol_form  = fem.form(fem.Constant(rve._mesh, 1.0) * rve.dx)
+        vol_local = fem.assemble_scalar(vol_form)
+        vol_global = rve.comm.allreduce(vol_local, op=MPI.SUM)
 
+    C_norm = int_global / vol_global
     arr[:] /= C_norm
     rve._phi[0].x.scatter_forward()
-
     rve.rebuild_constraints()
-    return C_norm
 
 
 # ---------------------------------------------------------------------------
 # RVE factory (one fresh FOM per macro Gauss point).
 # ---------------------------------------------------------------------------
+rve_vol=(2.0 * ELL) ** 2
 def make_rve_factory(rve_mesh_path: str, output_root: str):
     def rve_factory(rank: int, index: int):
         out_dir = os.path.join(output_root, f"rve_{rank}_{index}")
@@ -134,17 +134,24 @@ def make_rve_factory(rve_mesh_path: str, output_root: str):
             visualize_fields=[],
             newton_options={
                 "rel_tol": 1e-8, "abs_tol": 1e-6,
-                "max_iter": 50, "div_rel_tol": 10.0,
-                "switch_to_minres": True,
+                "max_iter": 30, "div_rel_tol": 10.0
             },
             timestepper_options={
                 "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5,
                 "dt_max": 1.0, "good_newton_steps": 5,
             },
+            stability_options={
+                "nev": 5,
+                "neg_tol": -1e-8,
+                "petsc_options": {
+                    "st_ksp_type": "preonly",
+                    "st_pc_type": "lu",
+                },
+            },
             averages_only_final=True,
-            rve_volume=(2.0 * ELL) ** 2,    # |Q| of the square periodic cell
+            rve_volume=rve_vol,    # |Q| of the square periodic cell
         )
-        _populate_phi(rve)
+        _populate_phi(rve, rve_vol)
         return rve
     return rve_factory
 
@@ -159,7 +166,7 @@ def main():
     rve_mesh = os.path.join(HERE, "rve.msh")
     if not os.path.exists(rve_mesh):
         raise FileNotFoundError(
-            f"RVE mesh not found at {rve_mesh}. Run `python create_rve_mesh.py` first."
+            f"RVE mesh not found at {rve_mesh}."
         )
 
     if args.output_dir is None:

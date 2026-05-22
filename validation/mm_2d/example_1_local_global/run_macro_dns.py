@@ -192,7 +192,6 @@ def main():
         timestepper=timestepper,
         output_manager=vtx,
         reaction_logger=reaction_logger,
-        pert_amplitude_init=1e1,       # smaller than 3D-lattice default; 2D buckles softly
     )
     vtx.close()
     reaction_logger.save(

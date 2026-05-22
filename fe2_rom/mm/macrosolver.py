@@ -44,7 +44,11 @@ from dolfinx_materials.solvers import NonlinearMaterialProblem
 from dolfinx_materials.utils import nonsymmetric_tensor_to_vector
 
 from fe2_rom.hyperelastic_solver.output import ReactionForceLogger, VTXManager
-from fe2_rom.hyperelastic_solver.stability import StabilityAnalyzer
+from fe2_rom.hyperelastic_solver.stability import (
+    StabilityAnalyzer,
+    apply_eigenmode_perturbation,
+    mesh_characteristic_length,
+)
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 
 logger = logging.getLogger(__name__)
@@ -272,6 +276,14 @@ class MacroMicromorphicSolver:
         self._Jac_form = fem.form(self.Jac)
         self._Res_form = fem.form(self.Res)
 
+        # Parent-space dof indices of the u (displacement) subspace —
+        # used to scale the eigenmode perturbation against |u| alone,
+        # not against the enrichment-amplitude blocks.
+        _, u_collapse_map = self.V.sub(0).collapse()
+        self._u_parent_dofs = np.asarray(u_collapse_map, dtype=np.int32)
+
+        self._char_length = mesh_characteristic_length(mesh)
+
         logger.debug(
             "Setup complete — %d BCs, %d reaction probe(s), stability=%s",
             len(self._bcs), len(self._reaction_specs),
@@ -290,9 +302,16 @@ class MacroMicromorphicSolver:
         loadhistory: Callable[[float], None],
         output_variables: list | None = None,
         reaction_logger: ReactionForceLogger | None = None,
-        pert_amplitude_init: float = 1e1,
+        pert_amplitude_init: float = 1e-2,
     ) -> None:
-        """Run the adaptive load-stepping outer loop."""
+        """Run the adaptive load-stepping outer loop.
+
+        ``pert_amplitude_init`` is a dimensionless factor: the first
+        perturbation magnitude on instability is
+        ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
+        char_length`` if ``|u|`` is ~0), measured over the u-subspace only.
+        The factor doubles on each retry within a step.
+        """
         if self._problem is None:
             raise RuntimeError("Call setup() before solve().")
 
@@ -392,18 +411,25 @@ class MacroMicromorphicSolver:
                                     timestepper.dt,
                                 )
                             break
+                        logger.info(
+                            "   λ = [%s]",
+                            ", ".join(f"{ev:.4e}" for ev in eigenvalues),
+                        )
                     else:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        self.w.x.petsc_vec.axpy(
-                            pert_amplitude, self._eigenfunction.x.petsc_vec
+                        u_ref, abs_pert = apply_eigenmode_perturbation(
+                            self.w, self._eigenfunction, pert_amplitude,
+                            self.comm,
+                            dofs=self._u_parent_dofs,
+                            char_length=self._char_length,
                         )
-                        self.w.x.scatter_forward()
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing (amplitude=%.2e)",
-                            eigenvalues[0], pert_amplitude,
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues.min(), pert_amplitude, u_ref, abs_pert,
                         )
                         pert_amplitude *= 2
                         continue

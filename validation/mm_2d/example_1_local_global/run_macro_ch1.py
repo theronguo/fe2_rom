@@ -203,7 +203,6 @@ def main():
         loadhistory=loadhistory,
         output_variables=[solver.u],
         reaction_logger=reaction_logger,
-        pert_amplitude_init=1e-2,
     )
 
     reaction_logger.save(

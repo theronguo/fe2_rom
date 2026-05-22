@@ -12,7 +12,11 @@ from .forms import build_weak_forms
 from .material import MaterialModel
 from .output import ReactionForceLogger, VTXManager
 from .solvers import CylindricalArcLength, NewtonSolver
-from .stability import StabilityAnalyzer
+from .stability import (
+    StabilityAnalyzer,
+    apply_eigenmode_perturbation,
+    mesh_characteristic_length,
+)
 from .timestepping import TimeStepper
 
 logger = logging.getLogger(__name__)
@@ -142,6 +146,8 @@ class HyperelasticStabilitySolver:
             self._P_expr = fem.Expression(P_ufl, TT.element.interpolation_points)
             self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points)
 
+        self._char_length = mesh_characteristic_length(mesh)
+
         if check_stability:
             self._stability = StabilityAnalyzer(self.comm, **stability_options)
             if "switch_to_minres" in newton_options:
@@ -168,15 +174,17 @@ class HyperelasticStabilitySolver:
             timestepper: TimeStepper | None = None,
             output_manager: VTXManager | None = None,
             reaction_logger: ReactionForceLogger | None = None,
-            pert_amplitude_init: float = 1e1) -> None:
+            pert_amplitude_init: float = 1e-2) -> None:
         """Main time-stepping loop.
 
         load_schedule(t) is called once per trial time step to update any
         time-varying fem.Constants (e.g. prescribed displacements).
 
-        pert_amplitude_init: initial eigenvector perturbation amplitude.
-        Doubles on each stability retry; reset to this value each new time step.
-        TODO: improve by normalising eigenvector relative to mesh size h.
+        pert_amplitude_init: dimensionless eigenvector-perturbation factor.
+        First perturbation magnitude on instability is
+        ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
+        char_length`` if ``|u|`` is still ~0). Doubles on each stability
+        retry; reset to this value each new time step.
         """
         assert self._newton is not None, "Call setup() before run()"
 
@@ -214,14 +222,17 @@ class HyperelasticStabilitySolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
-                        u.x.scatter_forward()
-                        pert_amplitude *= 2
+                        u_ref, abs_pert = apply_eigenmode_perturbation(
+                            u, self._eigenfunction, pert_amplitude, comm,
+                            char_length=self._char_length,
+                        )
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing with eigenvector (amplitude=%.2e)",
-                            eigenvalues.min(), pert_amplitude,
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues.min(), pert_amplitude, u_ref, abs_pert,
                         )
+                        pert_amplitude *= 2
                     else:
                         stable_configuration = True
                         timestepper.accept(iter_newton)

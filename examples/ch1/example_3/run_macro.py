@@ -123,7 +123,6 @@ solver.solve(
     loadhistory=loadhistory,
     output_variables=[solver.u],
     reaction_logger=reaction_logger,
-    pert_amplitude_init=0.1
 )
 
 reaction_logger.save(

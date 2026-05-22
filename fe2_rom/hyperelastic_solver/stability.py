@@ -1,10 +1,82 @@
 import logging
 
 import numpy as np
+from mpi4py import MPI
 from petsc4py import PETSc
 from slepc4py import SLEPc
 
 logger = logging.getLogger(__name__)
+
+
+def mesh_characteristic_length(mesh) -> float:
+    """Return the max coordinate extent of ``mesh``, reduced across ranks.
+
+    Used as a fallback length scale for eigenmode perturbations when the
+    current displacement is still ~0 (e.g. at the first load step).
+    """
+    coords = mesh.geometry.x
+    local_extent = float(np.ptp(coords, axis=0).max()) if coords.size else 0.0
+    return mesh.comm.allreduce(local_extent, op=MPI.MAX)
+
+
+def apply_eigenmode_perturbation(
+    target,
+    mode,
+    factor: float,
+    comm,
+    *,
+    dofs: np.ndarray | None = None,
+    char_length: float = 1.0,
+) -> tuple[float, float]:
+    """In-place perturbation ``target += scale·mode``.
+
+    ``scale = factor * u_ref / max|mode|`` where ``u_ref = max|target|`` (over
+    the owned dofs in ``dofs``, or all owned dofs if ``dofs`` is ``None``),
+    falling back to ``char_length`` when ``|target|`` is ~0.
+
+    Parameters
+    ----------
+    target, mode
+        ``dolfinx.fem.Function`` instances sharing a function space.
+    factor
+        Dimensionless perturbation factor.
+    comm
+        MPI communicator for the global max reductions.
+    dofs
+        Optional parent-space dof indices to restrict the magnitude
+        reduction to (e.g. the displacement subspace of a mixed space).
+        Indices beyond the owned range are filtered out automatically.
+    char_length
+        Fallback length scale used when ``max|target|`` is 0.
+
+    Returns
+    -------
+    (u_ref, abs_pert)
+        ``u_ref`` is the reference magnitude (``max|target|`` or
+        ``char_length``). ``abs_pert = factor * u_ref`` is the resulting
+        ∞-norm of the applied perturbation, useful for logging.
+    """
+    n_local = (target.function_space.dofmap.index_map.size_local
+               * target.function_space.dofmap.index_map_bs)
+    if dofs is None:
+        u_local = target.x.array[:n_local]
+        phi_local = mode.x.array[:n_local]
+    else:
+        owned = dofs[dofs < n_local]
+        u_local = target.x.array[owned] if owned.size else np.empty(0)
+        phi_local = mode.x.array[owned] if owned.size else np.empty(0)
+
+    u_max = comm.allreduce(
+        float(np.max(np.abs(u_local))) if u_local.size else 0.0, op=MPI.MAX,
+    )
+    phi_max = comm.allreduce(
+        float(np.max(np.abs(phi_local))) if phi_local.size else 0.0, op=MPI.MAX,
+    )
+    u_ref = u_max if u_max > 0.0 else char_length
+    scale = factor * u_ref / max(phi_max, 1e-300)
+    target.x.petsc_vec.axpy(scale, mode.x.petsc_vec)
+    target.x.scatter_forward()
+    return u_ref, factor * u_ref
 
 
 def solve_smallest_eigenpairs(

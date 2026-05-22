@@ -41,9 +41,7 @@ solver = MicroSolver(
     save_snapshots=["u_fluc", "P"]
 )
 
-res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]),
-    pert_amplitude_init=1e-1,
-)
+res = solver(np.array([[0.8, 0.0], [0.0, 1.0]]))
 
 Fbar_conv = []
 Pbar_conv = []
