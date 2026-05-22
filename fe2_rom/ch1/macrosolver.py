@@ -45,8 +45,60 @@ from fe2_rom.hyperelastic_solver.stability import (
 )
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 from fe2_rom.ch1.material import RVEMaterial
+from fe2_rom.ch1 import restart as _restart
 
 logger = logging.getLogger(__name__)
+
+
+def _select_local_qps(qps, my_rank: int, n_local: int) -> list[int]:
+    """Resolve a user ``rve_history_qps`` spec to this rank's qps.
+
+    Accepted forms:
+      * ``[3, 5]`` — bare ints; every rank that has those local
+        indices picks them (legacy behaviour).
+      * ``[(0, 3), (2, 5)]`` — (rank, qp_local) tuples; only the
+        matching rank picks them.
+      * ``{0: [3, 5], 2: [1]}`` — dict form, same semantics as tuples.
+    """
+    if not qps:
+        return []
+    out: list[int] = []
+    if isinstance(qps, dict):
+        for qp in qps.get(my_rank, ()):
+            if 0 <= int(qp) < n_local:
+                out.append(int(qp))
+        return out
+    for item in qps:
+        if isinstance(item, (tuple, list)):
+            r, qp = item
+            if int(r) == my_rank and 0 <= int(qp) < n_local:
+                out.append(int(qp))
+        else:
+            qp = int(item)
+            if 0 <= qp < n_local:
+                out.append(qp)
+    return out
+
+
+def _vtx_segment_path(comm, output_dir: str, stem: str, segmented: bool) -> str:
+    """Return the .bp filename for the upcoming VTX segment.
+
+    When ``segmented`` is False the legacy single-file behaviour is kept
+    (``<stem>.bp``). When True, pick the next non-existing
+    ``<stem>_NNN.bp`` so a resumed run doesn't clobber prior frames; the
+    set of .bp files can be loaded together as one time series in
+    ParaView.
+    """
+    if not segmented:
+        return os.path.join(output_dir, f"{stem}.bp")
+    if comm.rank == 0:
+        i = 1
+        while os.path.exists(os.path.join(output_dir, f"{stem}_{i:03d}.bp")):
+            i += 1
+        pick = os.path.join(output_dir, f"{stem}_{i:03d}.bp")
+    else:
+        pick = None
+    return comm.bcast(pick, root=0)
 
 
 def _resolve_quantity_names(items) -> set[str]:
@@ -121,6 +173,8 @@ class MacroSolver:
         self._mesh = mesh
         self.comm = mesh.comm
         self.gdim = gdim
+        self._full = bool(full)
+        self._n_qp_per_cell = int(n_qp)
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
         # Function spaces and fields
@@ -340,6 +394,9 @@ class MacroSolver:
         reaction_logger: ReactionForceLogger | None = None,
         pert_amplitude_init: float = 1e-2,
         max_iter_per_step: int = 25,
+        save_macro_history: bool = False,
+        vtx_segment_per_resume: bool = False,
+        rve_history_qps: list[int] | None = None,
     ) -> None:
         """Run the adaptive load-stepping outer loop.
 
@@ -368,14 +425,30 @@ class MacroSolver:
 
         os.makedirs(output_dir, exist_ok=True)
         fields = output_variables if output_variables is not None else [self.u]
-        vtx = VTXManager(self.comm, os.path.join(output_dir, "macro.bp"), fields)
 
         u = self.u
 
-        loadhistory(0.0)
-        vtx.write(0.0)
-        if reaction_logger is not None:
-            reaction_logger.record(0.0, 0.0)
+        self._step_index = 0
+        resumed = False
+        if self._full and _restart.checkpoint_complete(self.comm, output_dir):
+            self._restore_checkpoint(output_dir, timestepper, reaction_logger,
+                                     loadhistory)
+            resumed = True
+
+        vtx_path = _vtx_segment_path(self.comm, output_dir, "macro",
+                                     resumed and vtx_segment_per_resume)
+        vtx = VTXManager(self.comm, vtx_path, fields)
+
+        if not resumed:
+            loadhistory(0.0)
+            vtx.write(0.0)
+            if reaction_logger is not None:
+                reaction_logger.record(0.0, 0.0)
+            if save_macro_history and self._full:
+                _restart.save_macro_snapshot(
+                    self.comm, u, output_dir, self._step_index, 0.0,
+                    self._fingerprint(),
+                )
 
         simulation_finished = False
         try:
@@ -506,6 +579,21 @@ class MacroSolver:
                     if self._reaction_specs:
                         self._record_reactions(reaction_logger)
 
+                    self._step_index += 1
+                    if self._full:
+                        if save_macro_history:
+                            _restart.save_macro_snapshot(
+                                self.comm, u, output_dir, self._step_index,
+                                trial_t, self._fingerprint(),
+                            )
+                        if rve_history_qps:
+                            self._dump_rve_history(
+                                output_dir, self._step_index, trial_t,
+                                rve_history_qps,
+                            )
+                        self._write_checkpoint(output_dir, timestepper,
+                                               reaction_logger)
+
                 if simulation_finished:
                     break
         finally:
@@ -548,3 +636,92 @@ class MacroSolver:
                     reaction_logger.record(disp, rxn)
         finally:
             b.destroy()
+
+    # ------------------------------------------------------------------
+    # Checkpoint / restart (full two-scale only)
+    # ------------------------------------------------------------------
+
+    def _local_n_qp(self) -> int:
+        # QuadratureMap takes a *quadrature degree*, not a point count —
+        # the actual number of qps per cell depends on the basix scheme.
+        # Read it off one of the qmap's quadrature Functions.
+        fn = next(iter(self.qmap.fluxes.values()))
+        return fn.function_space.dofmap.index_map.size_local
+
+    def _fingerprint(self) -> str:
+        if not hasattr(self, "_cached_fingerprint"):
+            self._cached_fingerprint = _restart.compute_partition_fingerprint(
+                self._mesh)
+        return self._cached_fingerprint
+
+    def quadrature_point_info(self, *, gather: bool = True):
+        """Inspect macro qp layout for choosing ``rve_history_qps``.
+
+        See :func:`fe2_rom.ch1.restart.quadrature_point_info`.
+        """
+        return _restart.quadrature_point_info(self.comm, self.qmap, gather=gather)
+
+    def _dump_rve_history(self, output_dir, step_index, t, qps):
+        rves = self.material._rves
+        if rves is None:
+            return
+        local_qps = _select_local_qps(qps, self.comm.rank, len(rves))
+        local = {qp: rves[qp].dump_state() for qp in local_qps}
+        _restart.save_rve_history(self.comm.rank, output_dir, step_index, t, local)
+
+    def _write_checkpoint(self, output_dir, timestepper, reaction_logger):
+        tmp = _restart.prepare_tmp(self.comm, output_dir)
+        fp = self._fingerprint()
+        _restart.save_meta(
+            self.comm, tmp,
+            t_current=float(timestepper.t_current),
+            dt=float(timestepper.dt),
+            step_index=int(getattr(self, "_step_index", 0)),
+            gdim=int(self.gdim),
+            kind="ch1",
+        )
+        _restart.save_reaction(self.comm, reaction_logger, tmp)
+        _restart.save_macro_field(self.comm, self.u, tmp, fp)
+        self.material.save_rves(tmp, fp)
+        _restart.atomic_finalize(self.comm, output_dir)
+
+    def _restore_checkpoint(self, output_dir, timestepper, reaction_logger,
+                            loadhistory):
+        ckpt_dir, _ = _restart.checkpoint_dirs(output_dir)
+        meta = _restart.load_meta(self.comm, ckpt_dir)
+        if int(meta.get("n_ranks", -1)) != self.comm.size:
+            raise RuntimeError(
+                f"Checkpoint was written with n_ranks={meta.get('n_ranks')}, "
+                f"current run uses {self.comm.size}. Restart requires the "
+                "same MPI rank count."
+            )
+        if int(meta.get("gdim", -1)) != self.gdim:
+            raise RuntimeError(
+                f"Checkpoint gdim={meta.get('gdim')} != current {self.gdim}."
+            )
+        timestepper.t_current = float(meta["t_current"])
+        self._step_index = int(meta.get("step_index", 0))
+        # Restore dt, but fall back to the user-configured dt if the
+        # saved value has been clamped to ~0 by the previous run ending
+        # at its t_end (so a resume to a larger t_end can make progress).
+        saved_dt = float(meta["dt"])
+        remaining = timestepper.t_end - timestepper.t_current
+        if saved_dt > 1e-15 and saved_dt <= remaining + 1e-15:
+            timestepper.dt = saved_dt
+        else:
+            timestepper.dt = min(timestepper.dt, max(remaining, 0.0))
+
+        fp = self._fingerprint()
+        _restart.load_macro_field(self.comm, self.u, ckpt_dir, fp)
+        self._u_last.x.array[:] = self.u.x.array
+        self._u_last.x.scatter_forward()
+
+        self.material.load_rves(ckpt_dir, self._local_n_qp(), fp)
+
+        _restart.load_reaction(self.comm, reaction_logger, ckpt_dir)
+
+        loadhistory(timestepper.t_current)
+        logger.info(
+            "Resumed from checkpoint at t=%.6f, dt=%.2e",
+            timestepper.t_current, timestepper.dt,
+        )

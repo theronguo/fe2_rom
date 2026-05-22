@@ -50,6 +50,9 @@ from fe2_rom.hyperelastic_solver.stability import (
     mesh_characteristic_length,
 )
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
+from fe2_rom.ch1 import restart as _restart
+from fe2_rom.ch1.macrosolver import _vtx_segment_path, _select_local_qps
+from fe2_rom.mm.material import MicromorphicRVEMaterial
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +79,20 @@ class MacroMicromorphicSolver:
         snes_options: dict | None = None,
         check_stability: bool = False,
         stability_options: dict | None = None,
+        enable_restart: bool = False,
     ):
         self._mesh = mesh
         self.comm = mesh.comm
         self.gdim = mesh.geometry.dim
         self.N_modes = N_modes
+        self._n_qp_per_cell = int(n_qp)
+        if enable_restart and not isinstance(material, MicromorphicRVEMaterial):
+            raise ValueError(
+                "enable_restart=True requires material to be "
+                "MicromorphicRVEMaterial (FOM inner). Dummy / ROM-inner runs "
+                "are not checkpointed."
+            )
+        self._full_two_scale = bool(enable_restart)
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
         # ---- Mixed function space: [Q_u (vector), Q_v1, ..., Q_vN] --------
@@ -310,6 +322,9 @@ class MacroMicromorphicSolver:
         reaction_logger: ReactionForceLogger | None = None,
         pert_amplitude_init: float = 1e-2,
         max_iter_per_step: int = 25,
+        save_macro_history: bool = False,
+        vtx_segment_per_resume: bool = False,
+        rve_history_qps: list[int] | None = None,
     ) -> None:
         """Run the adaptive load-stepping outer loop.
 
@@ -328,13 +343,18 @@ class MacroMicromorphicSolver:
             raise RuntimeError("Call setup() before solve().")
 
         os.makedirs(output_dir, exist_ok=True)
+
+        self._step_index = 0
+        resumed = False
+        if self._full_two_scale and _restart.checkpoint_complete(self.comm, output_dir):
+            self._restore_checkpoint(output_dir, timestepper, reaction_logger,
+                                     loadhistory)
+            resumed = True
+
+        seg = resumed and vtx_segment_per_resume
         # Default: collapse each sub-space into a separate named Function.
         # Pass output_variables=[] to suppress VTX output entirely.
         # VTXWriter does not support mixed Functions directly.
-        # VTXWriter does not support mixed Functions. Write each sub-field to
-        # its own .bp file, on a fresh (independent) function space, to avoid
-        # dofmap-layout issues that arise when multiple sub-collapsed spaces
-        # of the same mixed space share one VTX stream.
         self._vtxs: list = []
         if output_variables is None:
             cell = self._mesh.topology.cell_type.name
@@ -345,27 +365,45 @@ class MacroMicromorphicSolver:
             fn_u = fem.Function(Vu_out, name="u")
             fn_u.interpolate(self.w.sub(0))
             self._vtxs.append((
-                VTXManager(self.comm, os.path.join(output_dir, "macro_u.bp"), [fn_u]),
+                VTXManager(self.comm,
+                           _vtx_segment_path(self.comm, output_dir, "macro_u", seg),
+                           [fn_u]),
                 fn_u, 0,
             ))
             for i in range(1, 1 + self.N_modes):
                 fn_v = fem.Function(Vv_out, name=f"v{i}")
                 fn_v.interpolate(self.w.sub(i))
                 self._vtxs.append((
-                    VTXManager(self.comm, os.path.join(output_dir, f"macro_v{i}.bp"), [fn_v]),
+                    VTXManager(self.comm,
+                               _vtx_segment_path(self.comm, output_dir,
+                                                 f"macro_v{i}", seg),
+                               [fn_v]),
                     fn_v, i,
                 ))
         elif output_variables:
             self._vtxs.append((
-                VTXManager(self.comm, os.path.join(output_dir, "macro_micromorphic.bp"), output_variables),
+                VTXManager(self.comm,
+                           _vtx_segment_path(self.comm, output_dir,
+                                             "macro_micromorphic", seg),
+                           output_variables),
                 None, None,
             ))
 
-        loadhistory(0.0)
-        for vtx, fn, idx in self._vtxs:
-            if fn is not None:
-                fn.interpolate(self.w.sub(idx))
-            vtx.write(0.0)
+        if resumed:
+            for vtx, fn, idx in self._vtxs:
+                if fn is not None:
+                    fn.interpolate(self.w.sub(idx))
+        else:
+            loadhistory(0.0)
+            for vtx, fn, idx in self._vtxs:
+                if fn is not None:
+                    fn.interpolate(self.w.sub(idx))
+                vtx.write(0.0)
+            if save_macro_history and self._full_two_scale:
+                _restart.save_macro_snapshot(
+                    self.comm, self.w, output_dir, self._step_index, 0.0,
+                    self._fingerprint(),
+                )
 
         simulation_finished = False
         try:
@@ -505,6 +543,21 @@ class MacroMicromorphicSolver:
                     if self._reaction_specs:
                         self._record_reactions(reaction_logger, trial_t)
 
+                    self._step_index += 1
+                    if self._full_two_scale:
+                        if save_macro_history:
+                            _restart.save_macro_snapshot(
+                                self.comm, self.w, output_dir,
+                                self._step_index, trial_t, self._fingerprint(),
+                            )
+                        if rve_history_qps:
+                            self._dump_rve_history(
+                                output_dir, self._step_index, trial_t,
+                                rve_history_qps,
+                            )
+                        self._write_checkpoint(output_dir, timestepper,
+                                               reaction_logger)
+
                 if simulation_finished:
                     break
         finally:
@@ -538,3 +591,93 @@ class MacroMicromorphicSolver:
                     reaction_logger.record(disp, rxn)
         finally:
             b.destroy()
+
+    # ------------------------------------------------------------------
+    # Checkpoint / restart (full two-scale only)
+    # ------------------------------------------------------------------
+
+    def _local_n_qp(self) -> int:
+        # ``n_qp`` is a quadrature *degree*, not a point count — the
+        # per-cell point count depends on the basix scheme. Read the
+        # actual local qp count off one of the qmap's quadrature
+        # Functions.
+        fn = next(iter(self.qmap.fluxes.values()))
+        return fn.function_space.dofmap.index_map.size_local
+
+    def _fingerprint(self) -> str:
+        if not hasattr(self, "_cached_fingerprint"):
+            self._cached_fingerprint = _restart.compute_partition_fingerprint(
+                self._mesh)
+        return self._cached_fingerprint
+
+    def quadrature_point_info(self, *, gather: bool = True):
+        """See :func:`fe2_rom.ch1.restart.quadrature_point_info`."""
+        return _restart.quadrature_point_info(self.comm, self.qmap, gather=gather)
+
+    def _dump_rve_history(self, output_dir, step_index, t, qps):
+        rves = self.material._rves
+        if rves is None:
+            return
+        local_qps = _select_local_qps(qps, self.comm.rank, len(rves))
+        local = {qp: rves[qp].dump_state() for qp in local_qps}
+        _restart.save_rve_history(self.comm.rank, output_dir, step_index, t, local)
+
+    def _write_checkpoint(self, output_dir, timestepper, reaction_logger):
+        tmp = _restart.prepare_tmp(self.comm, output_dir)
+        fp = self._fingerprint()
+        _restart.save_meta(
+            self.comm, tmp,
+            t_current=float(timestepper.t_current),
+            dt=float(timestepper.dt),
+            step_index=int(getattr(self, "_step_index", 0)),
+            gdim=int(self.gdim),
+            N_modes=int(self.N_modes),
+            kind="mm",
+        )
+        _restart.save_reaction(self.comm, reaction_logger, tmp)
+        _restart.save_macro_field(self.comm, self.w, tmp, fp)
+        self.material.save_rves(tmp, fp)
+        _restart.atomic_finalize(self.comm, output_dir)
+
+    def _restore_checkpoint(self, output_dir, timestepper, reaction_logger,
+                            loadhistory):
+        ckpt_dir, _ = _restart.checkpoint_dirs(output_dir)
+        meta = _restart.load_meta(self.comm, ckpt_dir)
+        if int(meta.get("n_ranks", -1)) != self.comm.size:
+            raise RuntimeError(
+                f"Checkpoint was written with n_ranks={meta.get('n_ranks')}, "
+                f"current run uses {self.comm.size}. Restart requires the "
+                "same MPI rank count."
+            )
+        if int(meta.get("gdim", -1)) != self.gdim:
+            raise RuntimeError(
+                f"Checkpoint gdim={meta.get('gdim')} != current {self.gdim}."
+            )
+        if int(meta.get("N_modes", -1)) != self.N_modes:
+            raise RuntimeError(
+                f"Checkpoint N_modes={meta.get('N_modes')} != "
+                f"current {self.N_modes}."
+            )
+        timestepper.t_current = float(meta["t_current"])
+        self._step_index = int(meta.get("step_index", 0))
+        saved_dt = float(meta["dt"])
+        remaining = timestepper.t_end - timestepper.t_current
+        if saved_dt > 1e-15 and saved_dt <= remaining + 1e-15:
+            timestepper.dt = saved_dt
+        else:
+            timestepper.dt = min(timestepper.dt, max(remaining, 0.0))
+
+        fp = self._fingerprint()
+        _restart.load_macro_field(self.comm, self.w, ckpt_dir, fp)
+        self._w_last.x.array[:] = self.w.x.array
+        self._w_last.x.scatter_forward()
+
+        self.material.load_rves(ckpt_dir, self._local_n_qp(), fp)
+
+        _restart.load_reaction(self.comm, reaction_logger, ckpt_dir)
+
+        loadhistory(timestepper.t_current)
+        logger.info(
+            "Resumed from checkpoint at t=%.6f, dt=%.2e",
+            timestepper.t_current, timestepper.dt,
+        )

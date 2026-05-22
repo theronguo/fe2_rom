@@ -238,3 +238,53 @@ class RVEMaterial(Material):
     def constitutive_update(self, F_flat, state, dt):
         # Required by the Material API but unused — we override integrate().
         pass
+
+    # ------------------------------------------------------------------
+    # Checkpoint I/O for the FE² macro driver (full two-scale only).
+    # Each macro rank stacks its local RVEs' state into one file.
+    # ------------------------------------------------------------------
+
+    def save_rves(self, checkpoint_dir: str, fingerprint: str) -> None:
+        """Gather and write the converged state of every RVE on this rank.
+
+        Writes ``rves/rank_{r}.npz`` under ``checkpoint_dir``.
+        """
+        from fe2_rom.ch1 import restart as _restart
+
+        if self._rves is None or not self._rves:
+            stacked: dict = {"n_qp": np.int64(0)}
+        else:
+            per_qp = [rve.dump_state() for rve in self._rves]
+            keys = per_qp[0].keys()
+            stacked = {}
+            for k in keys:
+                stacked[k] = np.stack([d[k] for d in per_qp], axis=0)
+            stacked["n_qp"] = np.int64(len(per_qp))
+        _restart.write_rank_state(checkpoint_dir, self._rank, fingerprint, stacked)
+
+    def load_rves(self, checkpoint_dir: str, n_qp: int,
+                  expected_fingerprint: str) -> None:
+        """Read per-rank checkpoint, validate, instantiate RVEs if needed
+        and load each one's state."""
+        from fe2_rom.ch1 import restart as _restart
+
+        fp, stacked = _restart.read_rank_state(checkpoint_dir, self._rank)
+        if fp != expected_fingerprint:
+            raise RuntimeError(
+                f"RVE partition fingerprint mismatch on rank {self._rank} — "
+                "checkpoint was written with a different macro partitioning. "
+                "Rerun with the same MPI rank count, or delete the checkpoint."
+            )
+        ckpt_n_qp = int(stacked.pop("n_qp"))
+        if ckpt_n_qp != n_qp:
+            raise RuntimeError(
+                f"RVE count mismatch on rank {self._rank}: checkpoint has "
+                f"{ckpt_n_qp} qps, current run has {n_qp}."
+            )
+        if n_qp == 0:
+            return
+        self._ensure_rves(n_qp)
+        for i, rve in enumerate(self._rves):
+            sub = {k: v[i] for k, v in stacked.items()}
+            with qp_context(i):
+                rve.load_state(sub)

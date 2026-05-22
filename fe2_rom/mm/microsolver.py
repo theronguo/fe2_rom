@@ -324,6 +324,42 @@ class MicroSolver(
         self._v_conv[:] = self.v_const.value
         self._g_conv[:] = self.g_const.value
 
+    # ---- checkpoint hooks ----------------------------------------------
+
+    def _dump_extra_state(self) -> dict:
+        if self._N_modes == 0:
+            return {}
+        return {
+            "v_conv": np.asarray(self._v_conv, dtype=np.float64).copy(),
+            "g_conv": np.asarray(self._g_conv, dtype=np.float64).copy(),
+        }
+
+    def _load_extra_state(self, d) -> None:
+        if self._N_modes == 0:
+            return
+        v = np.asarray(d["v_conv"], dtype=PETSc.ScalarType)
+        g = np.asarray(d["g_conv"], dtype=PETSc.ScalarType)
+        if v.shape != self._v_conv.shape:
+            raise RuntimeError(
+                f"v_conv shape mismatch: got {v.shape}, expected "
+                f"{self._v_conv.shape}"
+            )
+        if g.shape != self._g_conv.shape:
+            raise RuntimeError(
+                f"g_conv shape mismatch: got {g.shape}, expected "
+                f"{self._g_conv.shape}"
+            )
+        self._v_conv[:] = v
+        self._g_conv[:] = g
+        # Seed trial values too so the next solve warm-starts.
+        self.v_const.value[:] = self._v_conv
+        self.g_const.value[:] = self._g_conv
+        # φ may have been populated after construction (LBA or external
+        # load) — refresh the constraint forms so the projected Newton
+        # sees the correct φ-dependent constraints. Safe to call even
+        # when no extra state is loaded.
+        self.rebuild_constraints()
+
     # ---- linear buckling basis -----------------------------------------
 
     def compute_linear_buckling_modes(
