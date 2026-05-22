@@ -620,3 +620,54 @@ class MicroSolver:
         self._u_conv.x.array[:] = self.u.x.array
         self._u_conv.x.scatter_forward()
         self._commit_extra_state()
+
+    # ------------------------------------------------------------------
+    # Checkpoint hooks (used by the FE² macro driver for full two-scale
+    # runs; per-RVE state, one COMM_SELF mesh per qp).
+    # ------------------------------------------------------------------
+
+    def dump_state(self) -> dict[str, np.ndarray]:
+        """Return the converged restart state of this RVE as a dict of
+        numpy arrays (single-rank, since RVEs live on COMM_SELF)."""
+        d = {
+            "F_bar_conv": np.asarray(self.F_bar_conv, dtype=np.float64).copy(),
+            "u_conv": np.asarray(self._u_conv.x.array, dtype=np.float64).copy(),
+        }
+        extra = self._dump_extra_state()
+        if extra:
+            d.update(extra)
+        return d
+
+    def load_state(self, d: dict[str, np.ndarray]) -> None:
+        """Load the converged restart state from a dict (inverse of
+        :meth:`dump_state`). Seeds the trial state from the converged one
+        so the next solve warm-starts correctly."""
+        F = np.asarray(d["F_bar_conv"], dtype=PETSc.ScalarType)
+        if F.shape != self.F_bar_conv.shape:
+            raise RuntimeError(
+                f"F_bar_conv shape mismatch: got {F.shape}, expected "
+                f"{self.F_bar_conv.shape}"
+            )
+        u = np.asarray(d["u_conv"])
+        if u.shape != self._u_conv.x.array.shape:
+            raise RuntimeError(
+                f"u_conv shape mismatch: got {u.shape}, expected "
+                f"{self._u_conv.x.array.shape}"
+            )
+        self.F_bar_conv[:] = F
+        self._u_conv.x.array[:] = u
+        self._u_conv.x.scatter_forward()
+        # Seed trial state from converged state so the next solve starts
+        # at the restart point.
+        self.F_bar.value[:] = self.F_bar_conv
+        self.u.x.array[:] = self._u_conv.x.array
+        self.u.x.scatter_forward()
+        self._load_extra_state(d)
+
+    def _dump_extra_state(self) -> dict[str, np.ndarray]:
+        """Subclass hook: extra per-RVE state for checkpoint."""
+        return {}
+
+    def _load_extra_state(self, d: dict[str, np.ndarray]) -> None:
+        """Subclass hook: consume extra state added by ``_dump_extra_state``."""
+        return

@@ -239,6 +239,7 @@ def main():
         material=material,
         degree=2,                # quadratic macro triangles (paper Section 4.1)
         check_stability=True,
+        enable_restart=True
     )
 
     # -----------------------------------------------------------------------
@@ -288,6 +289,9 @@ def main():
         timestepper=timestepper,
         loadhistory=loadhistory,
         reaction_logger=reaction_logger,
+        save_macro_history=True,
+        vtx_segment_per_resume=True,
+        rve_history_qps=[(0, 0)]
     )
     reaction_logger.save(
         comm,
