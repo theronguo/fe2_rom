@@ -484,7 +484,7 @@ class ReducedMicroSolver:
         self._timestepper.reset()
         while not self._timestepper.finished:
             trial_time = self._timestepper.step_forward()
-            logger.info("── Step  t=%.5f  dt=%.2e", trial_time, self._timestepper.dt)
+            logger.info("── Step  t=%.8f  dt=%.2e", trial_time, self._timestepper.dt)
             load_schedule(trial_time)
 
             coeffs_save = self.coeffs.copy()

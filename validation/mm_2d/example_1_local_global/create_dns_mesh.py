@@ -1,104 +1,148 @@
-"""Generate the DNS mesh for van Bree et al. (2020), Section 4.1.
+"""Generate a fully periodic DNS mesh for an nx·ℓ × ny·ℓ plate.
 
-Geometry:
-  - Rectangular specimen of width W = w·ℓ and height H = h·ℓ (defaults
-    w = 6, h = 30 to reproduce the reference 6ℓ × 30ℓ realization of Fig. 5a).
-  - Square stacking of circular holes (diameter d = 8.67 mm, spacing ℓ).
-    Holes are centred at ((k + 0.5)·ℓ, (j + 0.5)·ℓ) for k = 0..w−1, j = 0..h−1
-    — origin is the bottom-left corner.
+Construction:
+  1. Build a single ℓ × ℓ unit cell with one circular hole (diameter d = 8.67 mm).
+  2. Copy it nx × ny times to tile the full plate.
+  3. Fragment all tiles to merge shared internal edges (conformal interfaces).
+  4. Apply periodic mesh constraints: left ↔ right, bottom ↔ top.
 
-Mesh:
-  - Isoparametric quadratic (P2, 6-node) triangles.
-  - Element size h_m = ℓ/10 (same as the RVE mesh, paper Fig. 4b).
-  - Physical groups:
-        domain (surface, tag 1)
-        bottom (curve, tag 1) — y = 0
-        top    (curve, tag 2) — y = H
-  - Saved as Gmsh format 4.x (default), which the dolfinx `io.gmsh`
-    reader consumes; physical groups are required for facet tagging.
+By default the domain is [0, W] × [0, H].  Pass --center to shift it to
+[−W/2, W/2] × [−H/2, H/2], which is required when the mesh is used as an
+RVE in the micromorphic solver (the ansatz assumes X = 0 at the cell centre).
+With --nx 2 --ny 2 --center the domain is [−ℓ, ℓ]², matching create_rve_mesh.py.
+
+Physical groups:
+    domain (surface, tag 1)
+    bottom (curve, tag 1) — y = Y0
+    top    (curve, tag 2) — y = Y1
+    left   (curve, tag 3) — x = X0
+    right  (curve, tag 4) — x = X1
 
 Usage:
-    python create_dns_mesh.py                       # 6ℓ × 30ℓ, dns.msh
-    python create_dns_mesh.py --w 4 --h 8           # match macro spec (4ℓ × 8ℓ)
-    python create_dns_mesh.py --output mydns.msh
+    python create_dns_mesh.py
+    python create_dns_mesh.py --nx 6 --ny 30
+    python create_dns_mesh.py --nx 2 --ny 2 --center --output rve.msh
+    python create_dns_mesh.py --output myfile.msh
 """
 import argparse
 import os
 
 import gmsh
 
-# ---------------------------------------------------------------------------
-ELL = 9.97          # mm
-HOLE_D = 8.67       # mm
+ELL = 9.97      # mm   (unit-cell edge length, paper "ℓ")
+HOLE_D = 8.67   # mm   (hole diameter, paper "d")
 HOLE_R = 0.5 * HOLE_D
-LC = ELL / 10.0     # mm   (h_m = ℓ/10)
+
+
+def translation_matrix(tx, ty, tz=0.0):
+    """Row-major 4×4 affine matrix for a pure translation."""
+    return [1, 0, 0, tx,
+            0, 1, 0, ty,
+            0, 0, 1, tz,
+            0, 0, 0, 1]
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--w", type=int, default=6,
-                   help="specimen width in units of ℓ (default 6)")
-    p.add_argument("--h", type=int, default=30,
-                   help="specimen height in units of ℓ (default 30)")
+    p.add_argument("--nx", type=int, default=6,
+                   help="number of unit cells in x (default 6)")
+    p.add_argument("--ny", type=int, default=30,
+                   help="number of unit cells in y (default 30)")
+    p.add_argument("--center", action="store_true",
+                   help="centre the domain at the origin: [−W/2,W/2]×[−H/2,H/2]")
+    p.add_argument("--h", type=float, default=10.0,
+                   help="element size divisor: lc = ℓ/h (default 10, i.e. lc = ℓ/10)")
     p.add_argument("--output", type=str, default=None,
-                   help="output .msh path (default ./dns_<w>x<h>.msh)")
+                   help="output .msh path (default ./dns_periodic_<nx>x<ny>.msh)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    W = args.w * ELL
-    H = args.h * ELL
+    nx, ny = args.nx, args.ny
+    W = nx * ELL
+    H = ny * ELL
+    lc = ELL / args.h
+    X0 = -W / 2 if args.center else 0.0
+    Y0 = -H / 2 if args.center else 0.0
+    X1 = X0 + W
+    Y1 = Y0 + H
     out = args.output or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), f"dns_{args.w}x{args.h}.msh"
+        os.path.dirname(os.path.abspath(__file__)),
+        f"dns_{nx}x{ny}.msh",
     )
 
     gmsh.initialize()
-    gmsh.model.add(f"dns_{args.w}x{args.h}")
+    gmsh.model.add(f"dns_{nx}x{ny}")
     occ = gmsh.model.occ
 
-    rect_tag = occ.addRectangle(0.0, 0.0, 0.0, W, H)
-
-    hole_tags = []
-    for k in range(args.w):
-        for j in range(args.h):
-            cx = (k + 0.5) * ELL
-            cy = (j + 0.5) * ELL
-            hole_tags.append(occ.addDisk(cx, cy, 0.0, HOLE_R, HOLE_R))
-
-    # Cut all holes at once (boolean fragmentation is faster than sequential cuts).
-    out_ents, _ = occ.cut(
-        [(2, rect_tag)],
-        [(2, t) for t in hole_tags],
+    # --- Build the unit cell at the grid origin, then tile -------------------
+    # The unit cell always starts at (X0, Y0) so the full tiled domain spans
+    # [X0, X1] × [Y0, Y1] regardless of the --center flag.
+    cell_rect = occ.addRectangle(X0, Y0, 0.0, ELL, ELL)
+    cell_hole = occ.addDisk(X0 + ELL / 2, Y0 + ELL / 2, 0.0, HOLE_R, HOLE_R)
+    cell_out, _ = occ.cut(
+        [(2, cell_rect)], [(2, cell_hole)],
         removeObject=True, removeTool=True,
     )
     occ.synchronize()
+    unit_tag = cell_out[0][1]
 
-    # Physical groups -------------------------------------------------------
+    # --- Tile: copy unit cell to fill the nx × ny grid -----------------------
+    all_cells = [(2, unit_tag)]
+    for k in range(nx):
+        for j in range(ny):
+            if k == 0 and j == 0:
+                continue
+            copies = occ.copy([(2, unit_tag)])
+            occ.translate(copies, k * ELL, j * ELL, 0.0)
+            all_cells.extend(copies)
+
+    # Fragment merges all shared internal edges → conformal interface mesh.
+    out_ents, _ = occ.fragment(all_cells, [], removeObject=True, removeTool=True)
+    occ.synchronize()
+
+    # --- Physical groups ------------------------------------------------------
     surf_tags = [t for d, t in out_ents if d == 2]
     gmsh.model.addPhysicalGroup(2, surf_tags, tag=1, name="domain")
 
-    # Tag outer-boundary curves at y = 0 and y = H by bounding-box.
     tol = 1e-4 * ELL
-    bot_curves, top_curves = [], []
+    curves = {"xmin": [], "xmax": [], "ymin": [], "ymax": []}
     for _, ctag in gmsh.model.getEntities(1):
-        _, ymin, _, _, ymax, _ = gmsh.model.getBoundingBox(1, ctag)
-        if abs(ymin) < tol and abs(ymax) < tol:
-            bot_curves.append(ctag)
-        elif abs(ymin - H) < tol and abs(ymax - H) < tol:
-            top_curves.append(ctag)
+        xlo, ylo, _, xhi, yhi, _ = gmsh.model.getBoundingBox(1, ctag)
+        if abs(xlo - X0) < tol and abs(xhi - X0) < tol:
+            curves["xmin"].append(ctag)
+        elif abs(xlo - X1) < tol and abs(xhi - X1) < tol:
+            curves["xmax"].append(ctag)
+        elif abs(ylo - Y0) < tol and abs(yhi - Y0) < tol:
+            curves["ymin"].append(ctag)
+        elif abs(ylo - Y1) < tol and abs(yhi - Y1) < tol:
+            curves["ymax"].append(ctag)
 
-    if not bot_curves or not top_curves:
-        raise RuntimeError(
-            f"Failed to identify top/bottom curves "
-            f"(found {len(bot_curves)} bottom, {len(top_curves)} top)."
-        )
-    gmsh.model.addPhysicalGroup(1, bot_curves, tag=1, name="bottom")
-    gmsh.model.addPhysicalGroup(1, top_curves, tag=2, name="top")
+    for key, tags in curves.items():
+        if not tags:
+            raise RuntimeError(f"No curves found for boundary '{key}'.")
+        print(f"  {key}: {len(tags)} curve(s) — tags {tags[:5]}{'...' if len(tags) > 5 else ''}")
 
-    # Mesh options ----------------------------------------------------------
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", LC)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", LC)
+    gmsh.model.addPhysicalGroup(1, curves["ymin"], tag=1, name="bottom")
+    gmsh.model.addPhysicalGroup(1, curves["ymax"], tag=2, name="top")
+    gmsh.model.addPhysicalGroup(1, curves["xmin"], tag=3, name="left")
+    gmsh.model.addPhysicalGroup(1, curves["xmax"], tag=4, name="right")
+
+    # --- Periodic mesh constraints -------------------------------------------
+    # slave = master translated by affine; master nodes are reused on slave.
+    # xmin (x=0) ← xmax (x=W) by translation (-W, 0)
+    # ymin (y=0) ← ymax (y=H) by translation (0, -H)
+    gmsh.model.mesh.setPeriodic(
+        1, curves["xmin"], curves["xmax"], translation_matrix(-W, 0.0)
+    )
+    gmsh.model.mesh.setPeriodic(
+        1, curves["ymin"], curves["ymax"], translation_matrix(0.0, -H)
+    )
+
+    # --- Mesh options ---------------------------------------------------------
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", lc)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", lc)
     gmsh.option.setNumber("Mesh.ElementOrder", 2)
     gmsh.option.setNumber("Mesh.SecondOrderIncomplete", 0)
     gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
@@ -107,7 +151,7 @@ def main():
     gmsh.write(out)
 
     n_nodes = len(gmsh.model.mesh.getNodes()[0])
-    print(f"  W = {W:.3f} mm   H = {H:.3f} mm   holes = {args.w * args.h}")
+    print(f"  x ∈ [{X0:.3f}, {X1:.3f}] mm   y ∈ [{Y0:.3f}, {Y1:.3f}] mm   holes = {nx * ny}   lc = {lc:.4f} mm (ℓ/{args.h:g})")
     print(f"  nodes ≈ {n_nodes}")
     print(f"Mesh written to {out}")
 

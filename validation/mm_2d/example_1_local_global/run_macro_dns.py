@@ -142,10 +142,23 @@ def main():
     solver.setup(
         check_stability=not args.no_stability,
         newton_options={
-            "rel_tol": 1e-8, "abs_tol": 1e-6,
-            "max_iter": 50, "div_rel_tol": 10.0,
+            "rel_tol": 1e-10, "abs_tol": 1e-8,
+            "max_iter": 30, "div_rel_tol": 10.0,
             "switch_to_minres": True,
+            "petsc_options": {
+                "ksp_type": "preonly",
+                "pc_type": "lu",
+                "pc_factor_mat_solver_type": "mumps",
+            },
         },
+        stability_options={
+            "nev": 5,
+            "neg_tol": -1e-8,
+            "petsc_options": {
+                "st_ksp_type": "preonly",
+                "st_pc_type": "lu",
+            },
+        }
     )
 
     # -----------------------------------------------------------------------
@@ -159,7 +172,7 @@ def main():
     timestepper = TimeStepper(
         t_end=1.0,
         dt_init=1.0 / args.n_steps,
-        dt_min=1e-6,
+        dt_min=1e-8,
         dt_max=1.0 / args.n_steps,
         good_newton_steps=5,
     )
@@ -179,7 +192,7 @@ def main():
         timestepper=timestepper,
         output_manager=vtx,
         reaction_logger=reaction_logger,
-        pert_amplitude_init=1e-2,       # smaller than 3D-lattice default; 2D buckles softly
+        pert_amplitude_init=1e1,       # smaller than 3D-lattice default; 2D buckles softly
     )
     vtx.close()
     reaction_logger.save(

@@ -329,7 +329,7 @@ class MacroMicromorphicSolver:
         try:
             while not timestepper.finished:
                 trial_t = timestepper.step_forward()
-                logger.info("── Step  t=%.5f  dt=%.2e", trial_t, timestepper.dt)
+                logger.info("── Step  t=%.8f  dt=%.2e", trial_t, timestepper.dt)
                 loadhistory(trial_t)
 
                 stable_configuration = False

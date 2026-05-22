@@ -19,7 +19,7 @@ class TimeStepper:
 
     def step_forward(self) -> float:
         """Compute and cache the trial time for the next step."""
-        self._trial_time = np.round(self.t_current + self.dt, 5)
+        self._trial_time = np.round(self.t_current + self.dt, 8)
         return self._trial_time
 
     def accept(self, n_newton_iters: int) -> None:

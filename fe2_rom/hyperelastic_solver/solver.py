@@ -89,13 +89,19 @@ class HyperelasticStabilitySolver:
                                 measure_reaction, reaction_direction))
 
     def setup(self, check_stability: bool = True,
-              newton_options: dict | None = None) -> None:
+              newton_options: dict | None = None,
+              stability_options: dict | None = None) -> None:
         """Freeze BCs, compile UFL forms, and instantiate sub-solvers.
 
         Must be called once after all add_bc() calls and before run().
         Collective: calls fem.form() on all MPI ranks.
+
+        stability_options: kwargs forwarded to StabilityAnalyzer (nev, neg_tol,
+            tol, petsc_options, n_skip_eigenvalues).  Ignored when
+            check_stability=False.
         """
         newton_options = newton_options if newton_options is not None else {}
+        stability_options = stability_options if stability_options is not None else {}
 
         mesh = self._mesh
         fdim = mesh.topology.dim - 1
@@ -137,7 +143,7 @@ class HyperelasticStabilitySolver:
             self._J_expr = fem.Expression(J_ufl, SS.element.interpolation_points)
 
         if check_stability:
-            self._stability = StabilityAnalyzer(self.comm)
+            self._stability = StabilityAnalyzer(self.comm, **stability_options)
             if "switch_to_minres" in newton_options:
                 if newton_options["switch_to_minres"] is False:
                     logger.info("Overriding provided newton_options['switch_to_minres'] to True for stability checks.")
@@ -187,7 +193,7 @@ class HyperelasticStabilitySolver:
         simulation_finished = False
         while not timestepper.finished:
             trial_time = timestepper.step_forward()
-            logger.info("── Step  t=%.5f  dt=%.2e", trial_time, timestepper.dt)
+            logger.info("── Step  t=%.8f  dt=%.2e", trial_time, timestepper.dt)
 
             load_schedule(trial_time)
 
@@ -208,14 +214,13 @@ class HyperelasticStabilitySolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        target = np.where(eigenvalues < 1e-12)[0]
                         u.x.petsc_vec.axpy(pert_amplitude, self._eigenfunction.x.petsc_vec)
                         u.x.scatter_forward()
                         pert_amplitude *= 2
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
                             "perturbing with eigenvector (amplitude=%.2e)",
-                            eigenvalues[target[0]], pert_amplitude,
+                            eigenvalues.min(), pert_amplitude,
                         )
                     else:
                         stable_configuration = True

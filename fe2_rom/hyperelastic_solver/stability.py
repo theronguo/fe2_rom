@@ -134,7 +134,12 @@ class StabilityAnalyzer:
             is_stable = True
             negatives = np.where(eigenvalues < self._neg_tol)[0]
             if negatives.size > 0:
-                global_idx = int(physical_indices[negatives[0]])
+                # Pick the most negative eigenvalue (deepest into instability),
+                # not just the first in |λ| order, to avoid perturbing a
+                # near-zero numerical artefact when a genuinely negative mode
+                # is also present.
+                most_negative_local = negatives[np.argmin(eigenvalues[negatives])]
+                global_idx = int(physical_indices[most_negative_local])
                 eigensolver.getEigenvector(global_idx, eigenfunction.x.petsc_vec)
                 eigenfunction.x.scatter_forward()
                 is_stable = False
