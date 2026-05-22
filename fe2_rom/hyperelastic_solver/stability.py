@@ -25,14 +25,27 @@ def apply_eigenmode_perturbation(
     factor: float,
     comm,
     *,
+    blocks=None,
     dofs: np.ndarray | None = None,
     char_length: float = 1.0,
-) -> tuple[float, float]:
+) -> tuple[float, list[tuple[float, float]]]:
     """In-place perturbation ``target += scale·mode``.
 
-    ``scale = factor * u_ref / max|mode|`` where ``u_ref = max|target|`` (over
-    the owned dofs in ``dofs``, or all owned dofs if ``dofs`` is ``None``),
-    falling back to ``char_length`` when ``|target|`` is ~0.
+    The amplitude ``scale`` is chosen as the smallest value that respects a
+    per-block cap on ``‖scale·mode‖_∞``. For each block specified in
+    ``blocks`` as ``(dof_indices, fallback_ref)``:
+
+        ref_block   = max(max|target|_block, fallback_ref)
+        cap_block   = factor * ref_block / max|mode|_block
+        scale       = min over blocks of cap_block
+
+    so the perturbation magnitude in every block stays at most
+    ``factor * ref_block`` while the direction of ``mode`` is preserved.
+    ``fallback_ref`` is a *floor* on the reference magnitude — values of
+    ``max|target|_block`` below it (e.g. numerical noise around zero) are
+    clamped up to ``fallback_ref`` rather than used directly, otherwise a
+    drifting near-zero ``target`` block would shrink the cap toward zero
+    and stall the retry doubling.
 
     Parameters
     ----------
@@ -42,41 +55,56 @@ def apply_eigenmode_perturbation(
         Dimensionless perturbation factor.
     comm
         MPI communicator for the global max reductions.
-    dofs
-        Optional parent-space dof indices to restrict the magnitude
-        reduction to (e.g. the displacement subspace of a mixed space).
-        Indices beyond the owned range are filtered out automatically.
-    char_length
-        Fallback length scale used when ``max|target|`` is 0.
+    blocks
+        Sequence of ``(dof_indices, fallback_ref)``. ``dof_indices=None``
+        means all owned dofs of ``target``. Indices beyond the owned range
+        are filtered out automatically. If ``blocks`` is ``None`` a single
+        block ``[(dofs, char_length)]`` is used (back-compat single-block
+        API for non-mixed spaces).
+    dofs, char_length
+        Legacy single-block convenience kwargs, used only when
+        ``blocks is None``.
 
     Returns
     -------
-    (u_ref, abs_pert)
-        ``u_ref`` is the reference magnitude (``max|target|`` or
-        ``char_length``). ``abs_pert = factor * u_ref`` is the resulting
-        ∞-norm of the applied perturbation, useful for logging.
+    (scale, info)
+        ``scale`` is the chosen amplitude. ``info`` is a list of
+        ``(ref_block, phi_max_block)`` tuples in the same order as
+        ``blocks`` — useful for logging per-block reference magnitudes
+        and the resulting ``scale * phi_max_block`` perturbation norms.
     """
+    if blocks is None:
+        blocks = [(dofs, char_length)]
+
     n_local = (target.function_space.dofmap.index_map.size_local
                * target.function_space.dofmap.index_map_bs)
-    if dofs is None:
-        u_local = target.x.array[:n_local]
-        phi_local = mode.x.array[:n_local]
-    else:
-        owned = dofs[dofs < n_local]
-        u_local = target.x.array[owned] if owned.size else np.empty(0)
-        phi_local = mode.x.array[owned] if owned.size else np.empty(0)
 
-    u_max = comm.allreduce(
-        float(np.max(np.abs(u_local))) if u_local.size else 0.0, op=MPI.MAX,
-    )
-    phi_max = comm.allreduce(
-        float(np.max(np.abs(phi_local))) if phi_local.size else 0.0, op=MPI.MAX,
-    )
-    u_ref = u_max if u_max > 0.0 else char_length
-    scale = factor * u_ref / max(phi_max, 1e-300)
+    info: list[tuple[float, float]] = []
+    scale = float("inf")
+    for block_dofs, fallback_ref in blocks:
+        if block_dofs is None:
+            u_local = target.x.array[:n_local]
+            phi_local = mode.x.array[:n_local]
+        else:
+            owned = block_dofs[block_dofs < n_local]
+            u_local = target.x.array[owned] if owned.size else np.empty(0)
+            phi_local = mode.x.array[owned] if owned.size else np.empty(0)
+        u_max = comm.allreduce(
+            float(np.max(np.abs(u_local))) if u_local.size else 0.0, op=MPI.MAX,
+        )
+        phi_max = comm.allreduce(
+            float(np.max(np.abs(phi_local))) if phi_local.size else 0.0, op=MPI.MAX,
+        )
+        ref = max(u_max, fallback_ref)
+        cap = factor * ref / max(phi_max, 1e-300)
+        scale = min(scale, cap)
+        info.append((ref, phi_max))
+
+    if not np.isfinite(scale):
+        scale = 0.0
     target.x.petsc_vec.axpy(scale, mode.x.petsc_vec)
     target.x.scatter_forward()
-    return u_ref, factor * u_ref
+    return scale, info
 
 
 def solve_smallest_eigenpairs(

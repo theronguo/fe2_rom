@@ -222,15 +222,17 @@ class HyperelasticStabilitySolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        u_ref, abs_pert = apply_eigenmode_perturbation(
+                        scale, info = apply_eigenmode_perturbation(
                             u, self._eigenfunction, pert_amplitude, comm,
                             char_length=self._char_length,
                         )
+                        u_ref, phi_max = info[0]
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
                             "perturbing with eigenvector "
                             "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
-                            eigenvalues.min(), pert_amplitude, u_ref, abs_pert,
+                            eigenvalues.min(), pert_amplitude, u_ref,
+                            scale * phi_max,
                         )
                         pert_amplitude *= 2
                     else:

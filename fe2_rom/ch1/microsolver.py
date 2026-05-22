@@ -557,16 +557,17 @@ class MicroSolver:
 
                     if not is_stable:
                         target = np.where(eigenvalues < self._stability._neg_tol)[0]
-                        u_ref, abs_pert = apply_eigenmode_perturbation(
+                        scale, info = apply_eigenmode_perturbation(
                             u, self._eigenfunction, pert_amplitude, self.comm,
                             char_length=self._char_length,
                         )
+                        u_ref, phi_max = info[0]
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
                             "perturbing with eigenvector "
                             "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
                             eigenvalues[target[0]], pert_amplitude, u_ref,
-                            abs_pert,
+                            scale * phi_max,
                         )
                         pert_amplitude *= 2
                     else:

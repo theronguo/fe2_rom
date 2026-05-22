@@ -276,11 +276,17 @@ class MacroMicromorphicSolver:
         self._Jac_form = fem.form(self.Jac)
         self._Res_form = fem.form(self.Res)
 
-        # Parent-space dof indices of the u (displacement) subspace —
-        # used to scale the eigenmode perturbation against |u| alone,
-        # not against the enrichment-amplitude blocks.
+        # Parent-space dof indices, per subspace. The eigenmode perturbation
+        # caps each block independently: u against |u| (length-scaled),
+        # each v_i against |v_i| (with fallback 1.0, since v_i is the
+        # amplitude of a unit-normalised RVE buckling mode and naturally
+        # lives in O(1)).
         _, u_collapse_map = self.V.sub(0).collapse()
         self._u_parent_dofs = np.asarray(u_collapse_map, dtype=np.int32)
+        self._v_parent_dofs: list[np.ndarray] = []
+        for i in range(1, 1 + self.N_modes):
+            _, v_map = self.V.sub(i).collapse()
+            self._v_parent_dofs.append(np.asarray(v_map, dtype=np.int32))
 
         self._char_length = mesh_characteristic_length(mesh)
 
@@ -303,6 +309,7 @@ class MacroMicromorphicSolver:
         output_variables: list | None = None,
         reaction_logger: ReactionForceLogger | None = None,
         pert_amplitude_init: float = 1e-2,
+        max_iter_per_step: int = 25,
     ) -> None:
         """Run the adaptive load-stepping outer loop.
 
@@ -311,6 +318,11 @@ class MacroMicromorphicSolver:
         ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
         char_length`` if ``|u|`` is ~0), measured over the u-subspace only.
         The factor doubles on each retry within a step.
+
+        ``max_iter_per_step`` caps the *total* number of Newton iterations
+        spent across all perturb-and-retry SNES calls within a single load
+        step. When exceeded, the step is rejected like a SNES failure and
+        the timestepper halves dt.
         """
         if self._problem is None:
             raise RuntimeError("Call setup() before solve().")
@@ -319,29 +331,40 @@ class MacroMicromorphicSolver:
         # Default: collapse each sub-space into a separate named Function.
         # Pass output_variables=[] to suppress VTX output entirely.
         # VTXWriter does not support mixed Functions directly.
+        # VTXWriter does not support mixed Functions. Write each sub-field to
+        # its own .bp file, on a fresh (independent) function space, to avoid
+        # dofmap-layout issues that arise when multiple sub-collapsed spaces
+        # of the same mixed space share one VTX stream.
+        self._vtxs: list = []
         if output_variables is None:
-            fields = []
-            for i in range(1 + self.N_modes):
-                Vs, _ = self.V.sub(i).collapse()
-                name = "u" if i == 0 else f"v{i}"
-                fn = fem.Function(Vs, name=name)
-                fn.interpolate(self.w.sub(i))
-                fields.append(fn)
-            self._vtx_fields = fields  # keep alive; updated each step below
+            cell = self._mesh.topology.cell_type.name
+            P_u = basix.ufl.element("Lagrange", cell, 1, shape=(self.gdim,))
+            P_v = basix.ufl.element("Lagrange", cell, 1)
+            Vu_out = fem.functionspace(self._mesh, P_u)
+            Vv_out = fem.functionspace(self._mesh, P_v)
+            fn_u = fem.Function(Vu_out, name="u")
+            fn_u.interpolate(self.w.sub(0))
+            self._vtxs.append((
+                VTXManager(self.comm, os.path.join(output_dir, "macro_u.bp"), [fn_u]),
+                fn_u, 0,
+            ))
+            for i in range(1, 1 + self.N_modes):
+                fn_v = fem.Function(Vv_out, name=f"v{i}")
+                fn_v.interpolate(self.w.sub(i))
+                self._vtxs.append((
+                    VTXManager(self.comm, os.path.join(output_dir, f"macro_v{i}.bp"), [fn_v]),
+                    fn_v, i,
+                ))
         elif output_variables:
-            fields = output_variables
-            self._vtx_fields = None
-        else:
-            fields = []
-            self._vtx_fields = None
-        vtx = VTXManager(self.comm, os.path.join(output_dir, "macro_micromorphic.bp"), fields) \
-            if fields else None
+            self._vtxs.append((
+                VTXManager(self.comm, os.path.join(output_dir, "macro_micromorphic.bp"), output_variables),
+                None, None,
+            ))
 
         loadhistory(0.0)
-        if vtx is not None:
-            if self._vtx_fields is not None:
-                for i, fn in enumerate(self._vtx_fields):
-                    fn.interpolate(self.w.sub(i))
+        for vtx, fn, idx in self._vtxs:
+            if fn is not None:
+                fn.interpolate(self.w.sub(idx))
             vtx.write(0.0)
 
         simulation_finished = False
@@ -353,6 +376,7 @@ class MacroMicromorphicSolver:
 
                 stable_configuration = False
                 pert_amplitude = pert_amplitude_init
+                iters_in_step = 0
 
                 while not stable_configuration:
                     self.material.step_failed = False
@@ -367,6 +391,8 @@ class MacroMicromorphicSolver:
                     if self.material.step_failed:
                         logger.warning("%s", self.material.failure_reason)
                         reason = -1
+
+                    iters_in_step += max(n_iters, 0)
 
                     if reason <= 0:
                         ok = timestepper.reject()
@@ -419,17 +445,44 @@ class MacroMicromorphicSolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
-                        u_ref, abs_pert = apply_eigenmode_perturbation(
+                        if iters_in_step >= max_iter_per_step:
+                            ok = timestepper.reject()
+                            self.w.x.array[:] = self._w_last.x.array
+                            self.w.x.scatter_forward()
+                            if not ok:
+                                logger.error(
+                                    "Iteration budget exhausted (%d ≥ %d) "
+                                    "and dt=%.2e at dt_min — stopping.",
+                                    iters_in_step, max_iter_per_step,
+                                    timestepper.dt_min,
+                                )
+                                simulation_finished = True
+                            else:
+                                logger.warning(
+                                    "Iteration budget exhausted (%d ≥ %d) "
+                                    "within step — halving dt to %.2e",
+                                    iters_in_step, max_iter_per_step,
+                                    timestepper.dt,
+                                )
+                            break
+                        blocks = [(self._u_parent_dofs, self._char_length)]
+                        for v_dofs in self._v_parent_dofs:
+                            blocks.append((v_dofs, 1.0))
+                        scale, info = apply_eigenmode_perturbation(
                             self.w, self._eigenfunction, pert_amplitude,
-                            self.comm,
-                            dofs=self._u_parent_dofs,
-                            char_length=self._char_length,
+                            self.comm, blocks=blocks,
+                        )
+                        u_ref, phi_u_max = info[0]
+                        v_log = ", ".join(
+                            f"|v{i+1}|={info[i+1][0]:.2e}→Δ={scale*info[i+1][1]:.2e}"
+                            for i in range(self.N_modes)
                         )
                         logger.warning(
                             "Unstable equilibrium (λ_min=%.4e) — "
                             "perturbing with eigenvector "
-                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
-                            eigenvalues.min(), pert_amplitude, u_ref, abs_pert,
+                            "(factor=%.2e, |u|=%.2e, Δu=%.2e; %s)",
+                            eigenvalues.min(), pert_amplitude, u_ref,
+                            scale * phi_u_max, v_log,
                         )
                         pert_amplitude *= 2
                         continue
@@ -445,10 +498,9 @@ class MacroMicromorphicSolver:
                         n_iters, self._problem.solver.getFunctionNorm(),
                     )
 
-                    if vtx is not None:
-                        if self._vtx_fields is not None:
-                            for i, fn in enumerate(self._vtx_fields):
-                                fn.interpolate(self.w.sub(i))
+                    for vtx, fn, idx in self._vtxs:
+                        if fn is not None:
+                            fn.interpolate(self.w.sub(idx))
                         vtx.write(trial_t)
                     if self._reaction_specs:
                         self._record_reactions(reaction_logger, trial_t)
@@ -456,7 +508,7 @@ class MacroMicromorphicSolver:
                 if simulation_finished:
                     break
         finally:
-            if vtx is not None:
+            for vtx, _fn, _idx in self._vtxs:
                 vtx.close()
 
     # ------------------------------------------------------------------
