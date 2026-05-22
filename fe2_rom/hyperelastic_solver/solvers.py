@@ -292,7 +292,7 @@ class NewtonSolver:
             if iter_newton == 0:
                 self._abs_b_norm_init = abs_b_norm
 
-            rel = abs_b_norm / self._abs_b_norm_init
+            rel = abs_b_norm / max(self._abs_b_norm_init, 1e-16)
             logger.debug("  iter %2d  rel=%.3e  abs=%.3e", iter_newton, rel, abs_b_norm)
 
             if rel < self._rel_tol or abs_b_norm < self._abs_tol:

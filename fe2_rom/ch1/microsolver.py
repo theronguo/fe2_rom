@@ -64,6 +64,7 @@ class MicroSolver:
                  averages_only_final: bool = False,
                  corner_periodic: bool = False,
                  constraints: "list[LinearConstraint] | None" = None,
+                 rve_volume: float | None = None,
                  ) -> None:
 
         newton_options = newton_options if newton_options is not None else {
@@ -177,8 +178,16 @@ class MicroSolver:
         self._setup_visualization(visualize_fields, F_var, P_ufl, J_ufl, W_ufl, u_total, output_dir)
 
         # ---- Volume + homogenization context ----
-        vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
-        self._vol_global = float(self.comm.allreduce(vol_local, op=MPI.SUM))
+        # Macroscopic averaging is (1/|Q|) ∫_Ω · dX with |Q| the periodic-cell
+        # volume — voids counted.  For arbitrary (e.g. hexagonal) cells the
+        # caller MUST pass ``rve_volume``; the bounding box would be wrong.
+        # If not provided we fall back to ∫_Ω 1 dx = |Ω_solid|, which equals
+        # |Q| only for non-porous RVEs.
+        if rve_volume is None:
+            vol_local = fem.assemble_scalar(fem.form(1.0 * self.dx))
+            self._vol_global = float(self.comm.allreduce(vol_local, op=MPI.SUM))
+        else:
+            self._vol_global = float(rve_volume)
         self._context = HomogenizationContext(
             mesh=self._mesh, V=self.V, dx=self.dx, comm=self.comm,
             vol_global=self._vol_global,

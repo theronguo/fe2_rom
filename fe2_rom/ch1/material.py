@@ -33,10 +33,14 @@ from fe2_rom.ch1.exceptions import RVEConvergenceError
 logger = logging.getLogger(__name__)
 
 
-# 9-vector ordering used by dolfinx_materials.utils.nonsymmetric_tensor_to_vector
-# for a 3×3 nonsymmetric tensor.  Index k of the 9-vector corresponds to entry
-# (i, j) of the tensor.
-_F9_ORDER: tuple[tuple[int, int], ...] = (
+# MFront non-symmetric tensor → vector orderings used by
+# ``dolfinx_materials.utils.nonsymmetric_tensor_to_vector``.  In 2D the third
+# slot is a *dummy* plane-strain entry (set to zero here) so positions 0..4
+# correspond to (T_00, T_11, _, T_01, T_10).
+_F_ORDER_2D: tuple[tuple[int | None, int | None], ...] = (
+    (0, 0), (1, 1), (None, None), (0, 1), (1, 0),
+)
+_F_ORDER_3D: tuple[tuple[int, int], ...] = (
     (0, 0), (1, 1), (2, 2),
     (0, 1), (1, 0),
     (0, 2), (2, 0),
@@ -44,21 +48,43 @@ _F9_ORDER: tuple[tuple[int, int], ...] = (
 )
 
 
-def _vec9_to_tensor3(v: np.ndarray) -> np.ndarray:
-    T = np.zeros((3, 3), dtype=float)
-    for k, (i, j) in enumerate(_F9_ORDER):
+def _f_order(gdim: int):
+    if gdim == 2:
+        return _F_ORDER_2D, 5
+    if gdim == 3:
+        return _F_ORDER_3D, 9
+    raise ValueError(f"gdim must be 2 or 3, got {gdim}")
+
+
+def _vec_to_tensor(v: np.ndarray, gdim: int) -> np.ndarray:
+    order, _ = _f_order(gdim)
+    T = np.zeros((gdim, gdim), dtype=float)
+    for k, (i, j) in enumerate(order):
+        if i is None:
+            continue
         T[i, j] = v[k]
     return T
 
 
-def _tensor3_to_vec9(T: np.ndarray) -> np.ndarray:
-    return np.array([T[i, j] for (i, j) in _F9_ORDER], dtype=float)
+def _tensor_to_vec(T: np.ndarray, gdim: int) -> np.ndarray:
+    order, n = _f_order(gdim)
+    out = np.zeros(n, dtype=float)
+    for k, (i, j) in enumerate(order):
+        if i is None:
+            continue
+        out[k] = T[i, j]
+    return out
 
 
-def _tangent4_to_mat99(A: np.ndarray) -> np.ndarray:
-    M = np.empty((9, 9), dtype=float)
-    for p, (i, j) in enumerate(_F9_ORDER):
-        for q, (k, l) in enumerate(_F9_ORDER):
+def _tangent4_to_mat(A: np.ndarray, gdim: int) -> np.ndarray:
+    order, n = _f_order(gdim)
+    M = np.zeros((n, n), dtype=float)
+    for p, (i, j) in enumerate(order):
+        if i is None:
+            continue
+        for q, (k, l) in enumerate(order):
+            if k is None:
+                continue
             M[p, q] = A[i, j, k, l]
     return M
 
@@ -79,9 +105,11 @@ class RVEMaterial(Material):
         ``EffectiveAbar`` instances).
     """
 
-    def __init__(self, rve_factory: Callable[[int, int], object]):
+    def __init__(self, rve_factory: Callable[[int, int], object], *, gdim: int = 3):
         super().__init__()
         self._rve_factory = rve_factory
+        self._gdim = int(gdim)
+        _, self._F_dim = _f_order(self._gdim)
         self._rves: list | None = None
         self._n_qp: int | None = None
         self._rank = MPI.COMM_WORLD.Get_rank()
@@ -94,11 +122,11 @@ class RVEMaterial(Material):
 
     @property
     def gradients(self):
-        return {"F": 9}
+        return {"F": self._F_dim}
 
     @property
     def fluxes(self):
-        return {"PK1": 9}
+        return {"PK1": self._F_dim}
 
     def _ensure_rves(self, n_qp: int) -> None:
         if self._rves is None:
@@ -122,28 +150,32 @@ class RVEMaterial(Material):
 
         Parameters
         ----------
-        gradients : (n_qp, 9) array
-            Macroscopic deformation gradient at each qp in the
-            nonsymmetric 9-vector convention used by dolfinx_materials.
+        gradients : (n_qp, F_dim) array
+            Macroscopic deformation gradient at each qp in the nonsymmetric
+            vector convention used by dolfinx_materials.  ``F_dim`` is 5 in
+            2D (plane strain, with a dummy zz-slot) and 9 in 3D.
         dt : float
             Unused (RVE solvers do their own substepping).
 
         Returns
         -------
         fluxes, isvs, tangent
-            ``fluxes`` is ``(n_qp, 9)`` PK1; ``tangent`` is ``(n_qp, 9, 9)``
-            material tangent dP/dF; ``isvs`` is ``(n_qp, 0)``.
+            ``fluxes`` is ``(n_qp, F_dim)`` PK1; ``tangent`` is
+            ``(n_qp, F_dim, F_dim)`` material tangent dP/dF;
+            ``isvs`` is ``(n_qp, 0)``.
         """
         n_qp = gradients.shape[0]
         self._ensure_rves(n_qp)
 
-        P_flat = np.zeros((n_qp, 9), dtype=float)
-        A_flat = np.zeros((n_qp, 9, 9), dtype=float)
+        F_dim = self._F_dim
+        gdim = self._gdim
+        P_flat = np.zeros((n_qp, F_dim), dtype=float)
+        A_flat = np.zeros((n_qp, F_dim, F_dim), dtype=float)
 
         local_failure = 0
         failed_qp = -1
         for i, rve in enumerate(self._rves):
-            F_qp = _vec9_to_tensor3(gradients[i])
+            F_qp = _vec_to_tensor(gradients[i], gdim)
             with qp_context(i):
                 try:
                     out = rve(F_qp)
@@ -156,7 +188,7 @@ class RVEMaterial(Material):
                     if failed_qp < 0:
                         failed_qp = i
                     P_flat[i] = 0.0
-                    A_flat[i] = np.eye(9)
+                    A_flat[i] = np.eye(F_dim)
                     continue
                 except Exception:
                     logger.exception(
@@ -165,8 +197,8 @@ class RVEMaterial(Material):
                     )
                     raise
             P_qp, A_qp = out[-1]["Pbar"], out[-1]["dPbar_dFbar"]
-            P_flat[i] = _tensor3_to_vec9(P_qp)
-            A_flat[i] = _tangent4_to_mat99(A_qp)
+            P_flat[i] = _tensor_to_vec(P_qp, gdim)
+            A_flat[i] = _tangent4_to_mat(A_qp, gdim)
 
         # If any RVE failed on any rank, reject entire macro step by setting very high stress.
         any_failure = MPI.COMM_WORLD.allreduce(local_failure, op=MPI.LOR)

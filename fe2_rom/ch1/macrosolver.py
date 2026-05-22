@@ -94,6 +94,7 @@ class MacroSolver:
         rve_newton_options: dict | None = None,
         rve_timestepper_options: dict | None = None,
         rve_averages_only_final: bool = True,
+        rve_volume: float | None = None,
         # --- reduced-specific (full=False) ---
         rom_dir: str | None = None,
         # --- full-specific (full=True) ---
@@ -161,6 +162,7 @@ class MacroSolver:
                     timestepper_options=rve_timestepper_options,
                     save_snapshots=rve_save_snapshots,
                     averages_only_final=rve_averages_only_final,
+                    rve_volume=rve_volume,
                 )
         else:
             def _make_rve(rank: int, index: int):
@@ -178,11 +180,13 @@ class MacroSolver:
                     newton_options=rve_newton_options,
                     timestepper_options=rve_timestepper_options,
                     averages_only_final=rve_averages_only_final,
+                    rve_volume=rve_volume,
                 )
         self._make_rve = _make_rve
 
-        # Material bridge + qmap
-        self.material = RVEMaterial(self._make_rve)
+        # Material bridge + qmap (RVEMaterial needs gdim so its F-vector
+        # convention matches the macro grad(u) — 5 entries in 2D, 9 in 3D).
+        self.material = RVEMaterial(self._make_rve, gdim=gdim)
         self.qmap = QuadratureMap(mesh, n_qp, self.material)
 
         Id = ufl.Identity(gdim)

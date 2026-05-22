@@ -65,6 +65,7 @@ class ReducedMicroSolver:
         newton_options: dict | None = None,
         timestepper_options: dict | None = None,
         averages_only_final: bool = False,
+        rve_volume: float | None = None,
     ) -> None:
         newton_options = newton_options if newton_options is not None else {
             "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 50, "div_rel_tol": 10.0,
@@ -149,9 +150,20 @@ class ReducedMicroSolver:
             ufl.inner(A_grad_tr, ufl.grad(v_te)) * self._omega_func * self._dx_sub
         )
 
-        # ECM volume
-        self._vol = fem.assemble_scalar(fem.form(1.0 * self._omega_func * self._dx_sub))
-        logger.debug("Effective domain volume (ECM): %.6f", self._vol)
+        # Macroscopic averaging volume = |Q| (periodic-cell volume).  ECM
+        # weights ω are calibrated against FOM solid integrals, so
+        # ∫ω dx_sub ≈ |Ω_solid| — wrong denominator for a porous RVE.  Caller
+        # must supply ``rve_volume`` (e.g. (2ℓ)² for a square cell, or the
+        # exact area of a hexagonal cell).  If absent we fall back to the
+        # ECM-weighted solid integral, which only matches the FOM convention
+        # for non-porous RVEs.
+        if rve_volume is None:
+            self._vol = fem.assemble_scalar(
+                fem.form(1.0 * self._omega_func * self._dx_sub)
+            )
+        else:
+            self._vol = float(rve_volume)
+        logger.debug("Averaging volume |Q|: %.6f", self._vol)
 
         # --- HomogenizationContext + average-quantity registry ---
         self._context = HomogenizationContext(
