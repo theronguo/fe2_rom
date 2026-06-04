@@ -165,10 +165,10 @@ def _worker_task(args):
         # "A" is rank-4 so it is not written to the .bp file, only saved as
         # .npy snapshots. The per-worker .bp file is harmless overhead.
         visualize_fields=["P"],
-        save_snapshots=["u_fluc", "P"],
+        save_snapshots=["u_fluc", "P", "A", "dw_dFbar", "dw_dv", "dw_dg"],
         newton_options=NEWTON_OPTS,
         timestepper_options=TIMESTEP_OPTS,
-        averages_only_final=True,
+        averages_only_final=False,
     )
 
     # Inject precomputed phi and refresh constraint vectors.

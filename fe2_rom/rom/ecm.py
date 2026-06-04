@@ -338,6 +338,8 @@ class ECM:
             ecm_func = my_ecm
         A, b = self._build_matrices()
         self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol)
+        # self.magic_points = np.array(list(range(A.shape[1])))  # --- IGNORE ---
+        # self.magic_weights = np.ones_like(self.magic_points, dtype=float)  # --- IGNORE ---
 
     def show_active_cells(self, filename="active.xdmf"):
         assert self.magic_points is not None, "Call compute_magic first"

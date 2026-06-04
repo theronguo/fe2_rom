@@ -347,3 +347,55 @@ def save_rve_history(rank: int, output_dir: str, step_index: int, t: float,
             os.path.join(d, f"rank_{rank}_qp_{qp}_step_{step_index:06d}.npz"),
             **payload,
         )
+
+
+def qp_history_dir(output_dir: str) -> str:
+    return os.path.join(output_dir, "qp_history")
+
+
+def save_qp_history(comm, qmap, output_dir: str, step_index: int,
+                    t: float) -> None:
+    """Write the macro gradients at every *owned* quadrature point on this
+    rank to ``output_dir/qp_history/rank_{r}_step_{step_index:06d}.npz``.
+
+    Values are read straight off the registered qmap gradients (re-evaluated
+    on the current solution), so this works for any constitutive law
+    (FOM / ROM / dummy). Per-qp layout — cell-major, aligned with
+    :func:`quadrature_point_info`:
+
+        x : (n_qp, gdim)     quadrature-point physical coordinates
+        F : (n_qp, F_dim)    ``nonsymmetric_tensor_to_vector(I + grad u)``
+        v : (n_qp, N)        enrichment amplitudes        (omitted if N == 0)
+        g : (n_qp, N*gdim)   grad of enrichment, mode-major (omitted if N == 0)
+
+    Reconstruct the F matrix and reshape g downstream with
+    ``fe2_rom.mm.material._fvec_to_mat`` / ``g.reshape(N, gdim)``.
+    """
+    flux_fn = next(iter(qmap.fluxes.values()))
+    Vq = flux_fn.function_space
+    n_local = Vq.dofmap.index_map.size_local
+    coords = Vq.tabulate_dof_coordinates()[:n_local]
+
+    payload: dict[str, np.ndarray] = {
+        "t": np.float64(t),
+        "step_index": np.int64(step_index),
+        "x": np.asarray(coords),
+        "qp_local_index": np.arange(n_local, dtype=np.int64),
+    }
+    payload["F"] = np.asarray(
+        qmap.get_gradient_vals(qmap.gradients["F"], qmap.cells)[:n_local]
+    )
+    if "v" in qmap.gradients:
+        payload["v"] = np.asarray(
+            qmap.get_gradient_vals(qmap.gradients["v"], qmap.cells)[:n_local]
+        )
+        payload["g"] = np.asarray(
+            qmap.get_gradient_vals(qmap.gradients["g"], qmap.cells)[:n_local]
+        )
+
+    d = qp_history_dir(output_dir)
+    os.makedirs(d, exist_ok=True)
+    np.savez(
+        os.path.join(d, f"rank_{comm.rank}_step_{step_index:06d}.npz"),
+        **payload,
+    )

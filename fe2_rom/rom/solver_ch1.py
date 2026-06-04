@@ -98,9 +98,13 @@ class ReducedMicroSolver:
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
         tdim = mesh.topology.dim
         V_full = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))
-        submesh, _, _, _ = dmesh.create_submesh(mesh, tdim, indices)
+        submesh, sub_cell_map, _, _ = dmesh.create_submesh(mesh, tdim, indices)
         self._mesh_full = mesh
         self._submesh = submesh
+        # Sub->parent cell map, kept so subclasses can transfer parent-mesh DOF
+        # arrays (e.g. φ) onto V_sub by *exact dof-copy* rather than the lossy
+        # cross-mesh interpolation (which is inexact on curved/degree-2 meshes).
+        self._sub_cell_map = sub_cell_map
         self._dx_sub = ufl.Measure("dx", domain=submesh)
 
         # --- Function spaces ---

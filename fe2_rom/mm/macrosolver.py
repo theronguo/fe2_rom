@@ -325,6 +325,7 @@ class MacroMicromorphicSolver:
         save_macro_history: bool = False,
         vtx_segment_per_resume: bool = False,
         rve_history_qps: list[int] | None = None,
+        save_qp_history: bool = False,
     ) -> None:
         """Run the adaptive load-stepping outer loop.
 
@@ -404,6 +405,8 @@ class MacroMicromorphicSolver:
                     self.comm, self.w, output_dir, self._step_index, 0.0,
                     self._fingerprint(),
                 )
+            if save_qp_history:
+                self._save_qp_history(output_dir, self._step_index, 0.0)
 
         simulation_finished = False
         try:
@@ -544,6 +547,10 @@ class MacroMicromorphicSolver:
                         self._record_reactions(reaction_logger, trial_t)
 
                     self._step_index += 1
+                    if save_qp_history:
+                        self._save_qp_history(
+                            output_dir, self._step_index, trial_t,
+                        )
                     if self._full_two_scale:
                         if save_macro_history:
                             _restart.save_macro_snapshot(
@@ -613,6 +620,11 @@ class MacroMicromorphicSolver:
     def quadrature_point_info(self, *, gather: bool = True):
         """See :func:`fe2_rom.ch1.restart.quadrature_point_info`."""
         return _restart.quadrature_point_info(self.comm, self.qmap, gather=gather)
+
+    def _save_qp_history(self, output_dir, step_index, t):
+        _restart.save_qp_history(
+            self.comm, self.qmap, output_dir, step_index, t,
+        )
 
     def _dump_rve_history(self, output_dir, step_index, t, qps):
         rves = self.material._rves
