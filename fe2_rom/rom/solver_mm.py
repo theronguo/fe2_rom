@@ -36,6 +36,7 @@ from fe2_rom.ch1.averages import EffectiveAbar, EffectiveFbar, EffectivePbar, Ta
 from fe2_rom.mm.averages import EffectiveLambda, EffectivePi
 from ..hyperelastic_solver.forms import basis_tensor_ufl
 from .solver_ch1 import ReducedMicroSolver, _dF_Fbar_factory
+from .ecm import _parent_to_sub_array
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +149,10 @@ class ReducedMicroSolver(ReducedMicroSolver):
                     f_full = None
                 elif src_size == full_size:
                     f_full.x.array[:] = src.x.array
-                    f_sub.interpolate(src)
+                    f_full.x.scatter_forward()
+                    f_sub.x.array[:] = _parent_to_sub_array(
+                        f_full.x.array, self.V_full, self.V_sub, self._sub_cell_map,
+                    )
                 else:
                     raise ValueError(
                         f"phi[{i}] Function size {src_size} matches neither "
@@ -159,7 +163,9 @@ class ReducedMicroSolver(ReducedMicroSolver):
                 if arr.size == full_size:
                     f_full.x.array[:] = arr
                     f_full.x.scatter_forward()
-                    f_sub.interpolate(f_full)
+                    f_sub.x.array[:] = _parent_to_sub_array(
+                        f_full.x.array, self.V_full, self.V_sub, self._sub_cell_map,
+                    )
                 elif arr.size == sub_size:
                     f_sub.x.array[:] = arr
                     f_full = None

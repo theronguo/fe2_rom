@@ -215,6 +215,24 @@ class MicroSolver:
         # ---- Snapshot saving ----
         self.output_dir = output_dir
         self.save_snapshots = save_snapshots
+        # Cache for the most recent macro-variable sensitivities ∂w/∂μ_k,
+        # populated by ``_collect_averages``. Keyed by macro-var name
+        # (e.g. "Fbar", "v", "g") -> list[fem.Function]. Consumed by the
+        # ``dw_d{name}`` snapshot path.
+        self._last_sensitivities: dict | None = None
+
+        # ---- Optional A (stiffness) snapshot helper ----
+        # A is a rank-4 tensor field (∂P/∂F). We only build the DG storage
+        # when actually requested, since it costs gdim^4 components per cell.
+        self.A_func = None
+        self._A_expr = None
+        if "A" in save_snapshots:
+            AA = fem.functionspace(
+                self._mesh, ("DG", 1, (self.gdim, self.gdim, self.gdim, self.gdim)),
+            )
+            self.A_func = fem.Function(AA, name="A")
+            self._A_expr = fem.Expression(A_ufl, AA.element.interpolation_points)
+
         logger.debug("Snapshot fields: %s", save_snapshots)
         logger.debug("Setup complete (n_dofs=%d)", n_dofs)
 
@@ -472,10 +490,19 @@ class MicroSolver:
         for q in self._average_quantities:
             for name in q.required_macro_adjoints:
                 needed.add(name)
+        # Also include any macro variables requested through the
+        # ``dw_d{name}`` snapshot path, so sensitivities exist to dump even
+        # if no average quantity asked for them.
+        for field in self.save_snapshots:
+            if field.startswith("dw_d"):
+                var_name = field[4:]
+                if var_name in self._macro_var_rhs_forms:
+                    needed.add(var_name)
         adjoints: dict | None = None
         if needed:
             rhs_dict = {name: self._macro_var_rhs_forms[name] for name in needed}
             adjoints = self._newton.solve_macro_sensitivities(rhs_dict)
+        self._last_sensitivities = adjoints
         out: dict = {}
         for q in self._average_quantities:
             out[q.name] = q.compute(self._context, adjoints)
@@ -591,6 +618,36 @@ class MicroSolver:
                             elif field == "P":
                                 self.P_func.interpolate(self._P_expr)
                                 self._save_snapshot("P", self.P_func, t_save)
+                            elif field == "A":
+                                self.A_func.interpolate(self._A_expr)
+                                self._save_snapshot("A", self.A_func, t_save)
+                            elif field.startswith("dw_d"):
+                                var_name = field[4:]
+                                sens = (self._last_sensitivities or {}).get(var_name)
+                                if sens is None:
+                                    logger.warning(
+                                        "Snapshot '%s' requested but no "
+                                        "sensitivities for macro variable '%s' "
+                                        "are available.", field, var_name,
+                                    )
+                                    continue
+                                # Unravel the flat k-index into the macro
+                                # variable's natural shape (e.g. Fbar (i,j),
+                                # g (mode,d)) so each snapshot filename keeps
+                                # its component indices.
+                                mvar = self.macro_vars.get(var_name)
+                                shape = (
+                                    np.asarray(mvar.value).shape
+                                    if mvar is not None else (len(sens),)
+                                )
+                                if shape == ():
+                                    shape = (1,)
+                                for k, p in enumerate(sens):
+                                    idx = np.unravel_index(k, shape)
+                                    suffix = "_".join(str(i) for i in idx)
+                                    self._save_snapshot(
+                                        f"dw_d{var_name}_{suffix}", p, t_save,
+                                    )
 
                 else:
                     ok = self._timestepper.reject()

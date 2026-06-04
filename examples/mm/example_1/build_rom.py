@@ -87,11 +87,8 @@ reconstruction_error = l2_err / l2_norm
 print(f"Max reconstruction error among snapshots: {reconstruction_error.max():.2%}, mean: {reconstruction_error.mean():.2%}")
 
 # --- Pi and Lambda density snapshots, built from phi modes ----------------
-# phi modes were saved by compute_linear_buckling_modes(save_modes=True) as
-# phi_<i>.npy in the same snapshots/ folder; they live on V.
-phi_snapshots = POD.load_and_align_snapshots(
-    f"{phi_dir}/phi_*.npy", V,
-)
+phi_files = sorted(f for f in glob(f"{phi_dir}/phi_*.npy") if "dof_coords" not in f)
+phi_snapshots = np.array([np.load(f) for f in phi_files])
 N_modes = phi_snapshots.shape[0]
 phi_fns = []
 for i in range(N_modes):
@@ -100,59 +97,91 @@ for i in range(N_modes):
     fn.x.scatter_forward()
     phi_fns.append(fn)
 
-# Density spaces: stack across modes (and gdim for Lambda) so each timestep
-# yields a single field per quantity.
-S_Pi = fem.functionspace(mesh, ("DG", 1, (N_modes,)))
-S_Lambda = fem.functionspace(mesh, ("DG", 1, (N_modes, gdim)))
+# Each Pi_i (scalar) and Lambda_i (gdim-vector) is an independent density —
+# coupling to the independent macro variables v_i and g_i — so we POD them
+# per-mode rather than stacking the modes into one vector field.
+S_Pi_i = fem.functionspace(mesh, ("DG", 1))
+S_Lambda_i = fem.functionspace(mesh, ("DG", 1, (gdim,)))
 
 P_func = fem.Function(S, name="P_snap")
 X = ufl.SpatialCoordinate(mesh)
-pi_components = [ufl.inner(P_func, ufl.grad(phi)) for phi in phi_fns]
-pi_expr = fem.Expression(
-    ufl.as_vector(pi_components),
-    S_Pi.element.interpolation_points,
-)
-lam_rows = []
-for phi in phi_fns:
-    Pphi = ufl.dot(phi, P_func)            # vector of length gdim
-    Pgradphi = ufl.inner(P_func, ufl.grad(phi))
-    lam_rows.append(
-        ufl.as_vector([Pphi[d] + X[d] * Pgradphi for d in range(gdim)])
-    )
-lam_expr = fem.Expression(
-    ufl.as_matrix([[row[d] for d in range(gdim)] for row in lam_rows]),
-    S_Lambda.element.interpolation_points,
-)
 
-pi_fn = fem.Function(S_Pi)
-lam_fn = fem.Function(S_Lambda)
-snapshots_Pi = np.zeros((snapshots_P.shape[0], pi_fn.x.array.size))
-snapshots_Lambda = np.zeros((snapshots_P.shape[0], lam_fn.x.array.size))
+pi_exprs = [
+    fem.Expression(
+        ufl.inner(P_func, ufl.grad(phi)),
+        S_Pi_i.element.interpolation_points,
+    )
+    for phi in phi_fns
+]
+lam_exprs = []
+for phi in phi_fns:
+    Pphi = ufl.dot(phi, P_func)
+    Pgradphi = ufl.inner(P_func, ufl.grad(phi))
+    lam_exprs.append(fem.Expression(
+        ufl.as_vector([Pphi[d] + X[d] * Pgradphi for d in range(gdim)]),
+        S_Lambda_i.element.interpolation_points,
+    ))
+
+pi_fn_i = fem.Function(S_Pi_i)
+lam_fn_i = fem.Function(S_Lambda_i)
+snapshots_Pi_list = [
+    np.zeros((snapshots_P.shape[0], pi_fn_i.x.array.size))
+    for _ in range(N_modes)
+]
+snapshots_Lambda_list = [
+    np.zeros((snapshots_P.shape[0], lam_fn_i.x.array.size))
+    for _ in range(N_modes)
+]
 for t in range(snapshots_P.shape[0]):
     P_func.x.array[:] = snapshots_P[t]
     P_func.x.scatter_forward()
-    pi_fn.interpolate(pi_expr)
-    lam_fn.interpolate(lam_expr)
-    snapshots_Pi[t] = pi_fn.x.array
-    snapshots_Lambda[t] = lam_fn.x.array
+    for i in range(N_modes):
+        pi_fn_i.interpolate(pi_exprs[i])
+        lam_fn_i.interpolate(lam_exprs[i])
+        snapshots_Pi_list[i][t] = pi_fn_i.x.array
+        snapshots_Lambda_list[i][t] = lam_fn_i.x.array
 
-pod_Pi = POD(snapshots_Pi, S_Pi, inner_product="L2")
-pod_Lambda = POD(snapshots_Lambda, S_Lambda, inner_product="L2")
-N_Pi = pod_Pi.n_modes(energy_tol)
-N_Lambda = pod_Lambda.n_modes(energy_tol)
-print(f"Pi POD: {N_Pi} modes;  Lambda POD: {N_Lambda} modes")
+pod_Pi_list, pod_Lambda_list, N_Pi_list, N_Lambda_list = [], [], [], []
+for i in range(N_modes):
+    pod_Pi_i = POD(snapshots_Pi_list[i], S_Pi_i, inner_product="L2")
+    pod_Lam_i = POD(snapshots_Lambda_list[i], S_Lambda_i, inner_product="L2")
+    pod_Pi_i.plot_eigenvalues()
+    pod_Pi_list.append(pod_Pi_i)
+    pod_Lambda_list.append(pod_Lam_i)
+    N_Pi_list.append(pod_Pi_i.n_modes(energy_tol))
+    N_Lambda_list.append(pod_Lam_i.n_modes(energy_tol))
+    print(f"Mode {i}: Pi_{i} POD: {N_Pi_list[i]} modes;  "
+          f"Lambda_{i} POD: {N_Lambda_list[i]} modes")
+
+ecm_kwargs: dict = {}
+for i in range(N_modes):
+    n_pi = N_Pi_list[i]
+    ecm_kwargs[f"Pi_{i}"] = {
+        "basis": pod_Pi_list[i].basis[:, :n_pi],
+        "space": S_Pi_i,
+        "sigma": np.sqrt(pod_Pi_list[i].eigenvalues[:n_pi]),
+        "ratio": ratio_Pi,
+    }
+    n_lam = N_Lambda_list[i]
+    ecm_kwargs[f"Lambda_{i}"] = {
+        "basis": pod_Lambda_list[i].basis[:, :n_lam],
+        "space": S_Lambda_i,
+        "sigma": np.sqrt(pod_Lambda_list[i].eigenvalues[:n_lam]),
+        "ratio": ratio_Lambda,
+    }
+
 ecm = ECM(
     pod_u.basis[:, :N], pod_P.basis[:, :M], V, S,
     degree=degree,
     sigma_u=np.sqrt(pod_u.eigenvalues[:N]),
     sigma_P=np.sqrt(pod_P.eigenvalues[:M]),
     ratio_uP=ratio_uP, ratio_P=ratio_P,
-    kwargs={"Pi": {"basis": pod_Pi.basis[:, :N_Pi], "space": S_Pi, "sigma": np.sqrt(pod_Pi.eigenvalues[:N_Pi]), "ratio": ratio_Pi},
-            "Lambda": {"basis": pod_Lambda.basis[:, :N_Lambda], "space": S_Lambda, "sigma": np.sqrt(pod_Lambda.eigenvalues[:N_Lambda]), "ratio": ratio_Lambda}},
+    kwargs=ecm_kwargs,
 )
 ecm.compute_magic(tol=ecm_tol)
 
-print(f"Energy criterion ({energy_tol:.4%}): N={N} u-modes, M={M} P-modes, N_Pi={N_Pi} Pi-modes, N_Lambda={N_Lambda} Lambda-modes")
+print(f"Energy criterion ({energy_tol:.4%}): N={N} u-modes, M={M} P-modes, "
+      f"N_Pi_per_mode={N_Pi_list}, N_Lambda_per_mode={N_Lambda_list}")
 print("Number of magic points:", len(ecm.magic_points))
 
 ecm.save_variant2(f"{ecm_dir}")

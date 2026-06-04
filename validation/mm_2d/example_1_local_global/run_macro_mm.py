@@ -291,7 +291,8 @@ def main():
         reaction_logger=reaction_logger,
         save_macro_history=True,
         vtx_segment_per_resume=True,
-        rve_history_qps=[(0, 0)]
+        # rve_history_qps=[(0, 0)],
+        save_qp_history=True
     )
     reaction_logger.save(
         comm,
