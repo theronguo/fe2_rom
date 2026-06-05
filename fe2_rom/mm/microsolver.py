@@ -29,12 +29,10 @@ must be told to rebuild its constraint vectors — call ``rebuild_constraints()`
 from __future__ import annotations
 
 import logging
-import os
 
 import numpy as np
 import ufl
-from dolfinx import fem, io
-from mpi4py import MPI
+from dolfinx import fem
 from petsc4py import PETSc
 
 from fe2_rom.ch1.averages import EffectiveAbar, EffectiveFbar, EffectivePbar, TangentBlock
@@ -43,7 +41,6 @@ from fe2_rom.ch1.constraints import ZeroVolumeAverage
 from fe2_rom.mm.constraints import ZeroVolumeAverageDot, ZeroVolumeAverageOuter
 from fe2_rom.hyperelastic_solver.forms import basis_tensor_ufl
 from fe2_rom.ch1.microsolver import MicroSolver as _Ch1MicroSolver
-from fe2_rom.hyperelastic_solver.stability import solve_smallest_eigenpairs
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +130,12 @@ class MicroSolver(
         self._mm_target_g: np.ndarray | None = None
         self._mm_prev_v: np.ndarray | None = None
         self._mm_prev_g: np.ndarray | None = None
-        kwargs["corner_periodic"] = True
+        # Full periodicity is required for the micromorphic decomposition. On a
+        # box that is the corner-periodic regime; for an arbitrary polygon the
+        # caller supplies ``lattice_vectors`` (mutually exclusive with
+        # ``corner_periodic``), which selects the equivalent polygon path.
+        if kwargs.get("lattice_vectors") is None:
+            kwargs["corner_periodic"] = True
         super().__init__(mesh_path, comm, gdim, material, **kwargs)
 
     # ---- subclass hooks ----
@@ -374,32 +376,36 @@ class MicroSolver(
         save_modes: bool = False,
         n_skip: "int | None" = None,
     ) -> np.ndarray:
-        """Linear buckling analysis: load the first ``n_modes`` eigenmodes of
-        the tangent ``K`` at a reference macro state into ``self._phi``.
+        """Linear buckling analysis: load the first ``n_modes`` eigenmodes of the
+        tangent ``K`` at a reference macro state into ``self._phi``.
+
+        Thin wrapper around the base
+        :meth:`fe2_rom.ch1.MicroSolver.compute_buckling_spectrum`: it sets the
+        reference state, delegates the eigensolve / normalization / optional
+        save+visualize, then loads the returned modes into ``self._phi`` via
+        :meth:`load_buckling_modes` (which also rebuilds the φ-dependent
+        constraints).
 
         Procedure:
 
-        1. Solve the RVE at the reference state ``(Fbar, v, g)``. Defaults to
-           ``Fbar=I``, ``v=0``, ``g=0`` (undeformed); pass an ``Fbar`` close
-           to (or past) the critical load to capture true buckling modes.
-        2. Assemble ``K`` at that state and solve ``K φ = λ φ`` for the
-           ``n_modes + n_skip`` smallest-magnitude eigenpairs (SLEPc
-           shift-invert at ``σ = 0``, ``TARGET_REAL``).
-        3. Skip the first ``n_skip`` eigenpairs (null-space / gauge modes),
-           apply periodic MPC backsubstitution to the remaining ones, scale to
-           unit H1 norm (``∫ φ·φ + ∇φ:∇φ dx = 1``), and store in ``self._phi[i]``.
+        1. Reset φ to zero and solve the RVE at the reference state
+           ``(Fbar, v, g)`` (default ``Fbar=I``, ``v=0``, ``g=0`` — undeformed;
+           pass an ``Fbar`` close to / past the critical load for true buckling
+           modes). Because φ=0 makes the φ-dependent constraint rows vanish, the
+           reference solve temporarily restricts to the ``gdim`` base rows
+           (``ZeroVolumeAverage``).
+        2. Delegate to ``compute_buckling_spectrum`` (assemble ``K``, solve the
+           ``n_modes + n_skip`` smallest eigenpairs, skip ``n_skip`` gauge modes,
+           backsubstitute the periodic ties, unit-H¹ normalize).
+        3. Load the modes into ``self._phi`` and rebuild constraints.
 
-        ``n_skip`` defaults to ``self._count_zero_modes()``.  With
-        ``corner_periodic=True`` the dolfinx_mpc corner constraint introduces
-        one extra spurious near-zero mode beyond the ``gdim`` rigid-body
-        translations; pass ``n_skip`` explicitly to override the default count.
+        ``n_skip`` defaults to ``self._count_zero_modes()`` (``gdim+1`` under full
+        periodicity: rigid-body translations + one MPC gauge mode). After this
+        call the reference solve is *not* committed (``F_bar_conv``/``_u_conv``
+        unchanged), so the next ``self(F̄, v, g)`` ramps from the same baseline.
 
-        After this call the reference solve has *not* been committed (the
-        converged restart in ``F_bar_conv``/``_u_conv`` is unchanged), so the
-        next ``self(F̄, v, g)`` ramps from the same baseline as before.
-
-        Returns the ``n_modes`` physical eigenvalues as a NumPy array (NaN for
-        any slots where SLEPc did not converge).
+        Returns the ``n_modes`` physical eigenvalues (NaN where SLEPc did not
+        converge).
         """
         if n_modes <= 0:
             raise ValueError(f"n_modes must be positive, got {n_modes}")
@@ -408,126 +414,53 @@ class MicroSolver(
                 f"Requested {n_modes} modes but solver was constructed with "
                 f"N={self._N_modes}. Build the solver with N >= n_modes."
             )
-        if n_skip is None:
-            n_skip = self._count_zero_modes()
 
-        # 1. Reference solve at the chosen macro state.
-        # Reset φ to zero so the reference state is the standard hyperelastic
-        # one (no φ-contribution mixing into K).
+        # 1. Reference state: φ=0 so K is the standard hyperelastic tangent.
         for phi in self._phi:
             phi.x.array[:] = 0.0
             phi.x.scatter_forward()
         if Fbar is not None:
-            # phi=0 here, so the phi-dependent constraint rows are zero vectors and
-            # G = C C^T would be singular.  Temporarily restrict to the gdim base rows
-            # (ZeroVolumeAverage only) for this reference solve, then restore.
+            # φ=0 ⇒ the φ-dependent constraint rows are zero and G = C Cᵀ is
+            # singular; restrict to the gdim base rows (ZeroVolumeAverage) for the
+            # reference solve, then restore.
             all_forms = self._newton._constraint_forms_raw
             self._newton._constraint_forms_raw = all_forms[: self.gdim]
             self.rebuild_constraints()
             logger.info("Linear buckling: reference solve at F̄ = \n%s", Fbar)
             self(Fbar, v, g)
             self._newton._constraint_forms_raw = all_forms
-            # (rebuild with full phi-dependent rows happens below after LBA)
 
-        # 2. Assemble K and solve the eigenproblem.
-        K = self._newton.assemble_stiffness()
-        try:
-            nev_total = n_modes + n_skip
-            eps, n_conv = solve_smallest_eigenpairs(
-                K, self.comm, nev=nev_total, tol=tol,
-                petsc_options=slepc_options,
-            )
+        # 2. Delegate the eigensolve / normalize / save+visualize to the base.
+        eigvals, modes = self.compute_buckling_spectrum(
+            n_modes, Fbar=None, tol=tol, slepc_options=slepc_options, n_skip=n_skip,
+            visualize_modes=visualize_modes, modes_filename=modes_filename,
+            save_modes=save_modes, return_modes=True,
+        )
 
-            if n_conv < nev_total:
-                logger.warning(
-                    "Linear buckling: requested %d modes (%d physical + %d skipped), "
-                    "SLEPc converged %d",
-                    nev_total, n_modes, n_skip, n_conv,
-                )
+        # 3. Load the modes into the φ basis (+ rebuild φ-dependent constraints).
+        self.load_buckling_modes(modes)
+        return eigvals
 
-            skipped_eigvals = [eps.getEigenvalue(i).real for i in range(min(n_skip, n_conv))]
-            logger.info(
-                "Linear buckling: skipping %d null-space/gauge modes with λ = %s",
-                n_skip,
-                np.array2string(np.array(skipped_eigvals), precision=3),
-            )
+    def load_buckling_modes(self, modes) -> None:
+        """Load mode fields into ``self._phi`` and rebuild the φ-dependent
+        constraints.
 
-            # 3. Load physical eigenvectors (indices n_skip .. n_skip+n_modes-1).
-            eigvals = np.full(n_modes, np.nan)
-            n_phys_conv = max(0, n_conv - n_skip)
-            n_load = min(n_modes, n_phys_conv)
-            for i in range(n_load):
-                idx = n_skip + i
-                lam = eps.getEigenvalue(idx).real
-                eigvals[i] = lam
-                phi_vec = self._phi[i].x.petsc_vec
-                eps.getEigenvector(idx, phi_vec)
-                if self.mpc is not None:
-                    self.mpc.backsubstitution(phi_vec)
-                self._phi[i].x.scatter_forward()
-                phi_fn = self._phi[i]
-                h1_sq_local = fem.assemble_scalar(fem.form(
-                    (ufl.inner(phi_fn, phi_fn)
-                     + ufl.inner(ufl.grad(phi_fn), ufl.grad(phi_fn))) * self.dx
-                ))
-                h1_sq = self._mesh.comm.allreduce(h1_sq_local, op=MPI.SUM)
-                h1_norm = np.sqrt(h1_sq)
-                if h1_norm > 0.0:
-                    phi_vec.scale(1.0 / h1_norm)
-                    self._phi[i].x.scatter_forward()
-            # Zero any remaining slots (if SLEPc didn't converge enough).
-            for i in range(n_load, n_modes):
+        ``modes`` is a list of :class:`dolfinx.fem.Function` on ``self.V`` (as
+        returned by ``compute_buckling_spectrum(..., return_modes=True)``) or of
+        dof arrays (e.g. ``np.load``-ed ``phi_<i>.npy`` snapshots). Up to
+        ``self._N_modes`` entries are loaded; any remaining φ slots are zeroed.
+        Call this whenever ``self._phi`` changes so the projected Newton solver
+        picks up the new ``⟨w·φᵢ⟩`` / ``⟨(w·φᵢ)X⟩`` constraint rows.
+        """
+        for i in range(self._N_modes):
+            if i < len(modes):
+                m = modes[i]
+                arr = m.x.array if hasattr(m, "x") else np.asarray(m)
+                self._phi[i].x.array[:] = arr
+            else:
                 self._phi[i].x.array[:] = 0.0
-                self._phi[i].x.scatter_forward()
-
-            logger.info(
-                "Linear buckling eigenvalues (physical, smallest |λ|): %s",
-                np.array2string(eigvals, precision=4),
-            )
-
-            # Rebuild constraint vectors so the projected Newton solver uses
-            # the freshly-populated φᵢ rather than the zero functions at init.
-            self.rebuild_constraints()
-
-            # Optional ParaView output — one timestep per mode (t = mode index).
-            # The file contains a single vector field ``phi``; scrubbing the
-            # time slider in ParaView walks through φ₀, φ₁, …, φ_{N−1}.
-            if save_modes and n_load > 0:
-                snap_dir = f"{self.output_dir}/snapshots"
-                if self.comm.rank == 0:
-                    os.makedirs(snap_dir, exist_ok=True)
-                self.comm.barrier()
-                for i in range(n_load):
-                    self._save_snapshot("phi", self._phi[i], int(i))
-                if self.comm.rank == 0:
-                    np.save(f"{snap_dir}/buckling_eigvals.npy", eigvals)
-                logger.info(
-                    "Saved %d buckling mode(s) as numpy arrays to %s",
-                    n_load, snap_dir,
-                )
-
-            if visualize_modes and n_load > 0:
-                out_path = os.path.join(self.output_dir, modes_filename)
-                os.makedirs(self.output_dir, exist_ok=True)
-                phi_viz = fem.Function(self.V, name="phi")
-                writer = io.VTXWriter(
-                    self.comm, out_path, [phi_viz], engine="BP4",
-                )
-                try:
-                    for i in range(n_load):
-                        phi_viz.x.array[:] = self._phi[i].x.array
-                        phi_viz.x.scatter_forward()
-                        writer.write(float(i))
-                finally:
-                    writer.close()
-                logger.info(
-                    "Wrote %d buckling mode(s) to %s (timestep = mode index)",
-                    n_load, out_path,
-                )
-            return eigvals
-        finally:
-            eps.destroy()
-            PETSc.Mat.destroy(K)
+            self._phi[i].x.scatter_forward()
+        self.rebuild_constraints()
 
     # ---- driver override ----
 
