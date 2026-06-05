@@ -42,7 +42,7 @@ from fe2_rom.hyperelastic_solver import (
 )
 from fe2_rom.ch1 import MacroSolver
 
-from material import BertoldiHyperelastic
+from fe2_rom.hyperelastic_solver.material import BertoldiHyperelastic
 
 # ---------------------------------------------------------------------------
 # Geometry / material constants (paper Section 4.1, Table 1)

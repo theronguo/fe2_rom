@@ -47,7 +47,7 @@ from fe2_rom.mm.material import MicromorphicRVEMaterial
 from fe2_rom.mm.macrosolver import MacroMicromorphicSolver
 from fe2_rom.mm.microsolver import MicroSolver
 
-from material import BertoldiHyperelastic
+from fe2_rom.hyperelastic_solver.material import BertoldiHyperelastic
 
 # ---------------------------------------------------------------------------
 # Geometry / material constants (paper Section 4.1, Table 1)

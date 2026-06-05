@@ -39,7 +39,7 @@ from fe2_rom.hyperelastic_solver import (
     setup_logging,
 )
 
-from material import BertoldiHyperelastic
+from fe2_rom.hyperelastic_solver.material import BertoldiHyperelastic
 
 # ---------------------------------------------------------------------------
 # Constants (paper Section 4.1, Table 1)
