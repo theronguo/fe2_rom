@@ -28,6 +28,7 @@ from fe2_rom.hyperelastic_solver.stability import (
     StabilityAnalyzer,
     apply_eigenmode_perturbation,
     mesh_characteristic_length,
+    solve_smallest_eigenpairs,
 )
 from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 
@@ -69,6 +70,7 @@ class MicroSolver:
                  corner_periodic: bool = False,
                  constraints: "list[LinearConstraint] | None" = None,
                  rve_volume: float | None = None,
+                 lattice_vectors: "np.ndarray | None" = None,
                  ) -> None:
 
         newton_options = newton_options if newton_options is not None else {
@@ -127,6 +129,27 @@ class MicroSolver:
 
         # ---- Periodic BCs + MPC ----
         self._corner_periodic = corner_periodic
+        self._lattice_vectors = None
+        self._polygon_periodic = False
+        if lattice_vectors is not None:
+            lv = np.asarray(lattice_vectors, dtype=float)
+            if self.gdim != 2:
+                raise ValueError("lattice_vectors is only supported for gdim==2.")
+            if lv.shape != (2, 2):
+                raise ValueError(
+                    f"lattice_vectors must have shape (2, 2) (rows a1, a2), got {lv.shape}."
+                )
+            if self._corner_periodic:
+                raise ValueError(
+                    "lattice_vectors and corner_periodic are mutually exclusive; the "
+                    "polygon path already uses the full-periodicity + ZeroVolumeAverage "
+                    "gauge-fix regime."
+                )
+            det = float(np.linalg.det(lv))
+            if abs(det) < 1e-14 * (float(np.linalg.norm(lv)) ** 2 + 1e-30):
+                raise ValueError("lattice_vectors are (near-)linearly dependent.")
+            self._lattice_vectors = lv
+            self._polygon_periodic = True
         bcs, self.mpc = self._setup_periodic_bcs_and_mpc()
         self._bcs = bcs
         logger.debug("Periodic BCs set up with %d slave points",
@@ -260,7 +283,11 @@ class MicroSolver:
 
     def _build_constraint_forms(self, constraints: "list[LinearConstraint] | None") -> list:
         if constraints is None:
-            constraints = [ZeroVolumeAverage()] if self._corner_periodic else []
+            constraints = (
+                [ZeroVolumeAverage()]
+                if (self._corner_periodic or self._polygon_periodic)
+                else []
+            )
         if not constraints:
             return []
         forms = []
@@ -281,7 +308,7 @@ class MicroSolver:
         return
 
     def _count_zero_modes(self) -> int:
-        return self.gdim + 1 if self._corner_periodic else 0
+        return self.gdim + 1 if (self._corner_periodic or self._polygon_periodic) else 0
 
     # ------------------------------------------------------------------
     # Mesh / MPC helpers
@@ -376,6 +403,9 @@ class MicroSolver:
             )
         tol = 1e-8 * max(1.0, float(np.max(self.maxs - self.mins)))
 
+        if self._polygon_periodic:
+            return self._setup_polygon_periodic_mpc(tol)
+
         if self._corner_periodic:
             bcs: list = []
         else:
@@ -404,6 +434,332 @@ class MicroSolver:
         mpc.finalize()
 
         return bcs, mpc
+
+    # ------------------------------------------------------------------
+    # Arbitrary 2D polygon periodicity (geometric, lattice-vector driven)
+    # ------------------------------------------------------------------
+
+    def _setup_polygon_periodic_mpc(self, tol: float) -> tuple[list, dolfinx_mpc.MultiPointConstraint]:
+        """Periodic MPC for an arbitrary 2D periodic polygon (e.g. a hexagon).
+
+        Opposite boundary edges/vertices are auto-paired geometrically from the
+        two lattice vectors ``a1, a2`` (``self._lattice_vectors``) and the actual
+        mesh boundary. Slaves on the ``-t`` side of each edge pair are tied to the
+        matching master on the ``+t`` side; polygon vertices are tied per
+        lattice-equivalence orbit (depth-1 star to one representative). No
+        Dirichlet BCs are applied — the ``gdim`` rigid-translation gauge is removed
+        downstream by the default ``ZeroVolumeAverage`` constraint.
+
+        Prerequisites (failure to meet these silently corrupts the homogenized
+        response):
+
+        * The mesh must be generated with ``gmsh.model.mesh.setPeriodic`` between
+          each opposite edge pair (matching ``a1, a2``), so a slave node has an
+          exact translated master node — otherwise the geometric tie finds no
+          master (under-constrained) or an interpolated one (wrong condition).
+        * Holes must be strictly interior; their lattice translates then miss the
+          boundary and the hole-boundary dofs are auto-excluded.
+        * ``rve_volume`` must be passed for porous cells (the exact cell area
+          ``|Q|``); the ``∫ 1 dx`` fallback is only correct for non-porous cells.
+        """
+        bcs: list = []
+        a1, a2 = self._lattice_vectors[0], self._lattice_vectors[1]
+        positives, shell = self._lattice_translations(a1, a2, tol)
+
+        B = self._gather_boundary_dof_coords()
+        if B.shape[0] == 0:
+            raise RuntimeError("No boundary dofs found for polygon periodic BCs.")
+        contains = self._make_point_membership(B, tol)
+
+        edge_pts, vertex_pts, n_untied = self._classify_boundary_points(B, shell, contains)
+        if edge_pts.shape[0] + vertex_pts.shape[0] == 0:
+            raise RuntimeError(
+                "lattice_vectors do not match the mesh boundary: no boundary point "
+                "has a lattice-translated partner on the boundary. Check that "
+                "lattice_vectors are the true primitive translations of the mesh."
+            )
+        logger.debug(
+            "Polygon periodicity: %d boundary nodes (%d edge, %d vertex, %d untied/holes); "
+            "%d edge-pair translations",
+            B.shape[0], edge_pts.shape[0], vertex_pts.shape[0], n_untied, len(positives),
+        )
+
+        mpc = dolfinx_mpc.MultiPointConstraint(self.V)
+        gdim = self.gdim
+
+        # Edge-interior ties: for each positive translation, slaves are the
+        # edge-interior points whose +t translate is also on the boundary (the
+        # opposite-edge master). Masters live on the +t side and are never slaves.
+        for t_k in positives:
+            on_master_side = contains((edge_pts + t_k[:gdim]).T)
+            slave_pts = edge_pts[on_master_side]
+            if slave_pts.shape[0] == 0:
+                continue
+            indicator = self._make_point_membership(slave_pts, tol)
+            relation = self._make_translation_relation(t_k, gdim)
+            mpc.create_periodic_constraint_geometrical(self.V, indicator, relation, bcs)
+
+        # Vertex ties: per lattice-equivalence orbit, depth-1 star to one rep.
+        self._build_vertex_orbit_ties(mpc, vertex_pts, bcs, tol)
+
+        mpc.finalize()
+        return bcs, mpc
+
+    def _gather_boundary_dof_coords(self) -> np.ndarray:
+        """Allgathered global array of owned boundary dof (block) coordinates,
+        shape ``(M, gdim)``. Restricts to owned blocks before gathering so a node
+        shared across ranks is not double-counted."""
+        tdim = self._mesh.topology.dim
+        self._mesh.topology.create_connectivity(tdim - 1, tdim)
+        ext_facets = dmesh.exterior_facet_indices(self._mesh.topology)
+        bdofs = fem.locate_dofs_topological(self.V, tdim - 1, ext_facets)
+        coords = self.V.tabulate_dof_coordinates()
+        n_owned = self.V.dofmap.index_map.size_local
+        owned = bdofs[bdofs < n_owned]
+        local_pts = coords[owned, :self.gdim]
+        gathered = self.comm.allgather(local_pts)
+        parts = [g for g in gathered if len(g)]
+        return np.vstack(parts) if parts else np.empty((0, self.gdim), dtype=float)
+
+    @staticmethod
+    def _lattice_translations(a1: np.ndarray, a2: np.ndarray, tol: float
+                              ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """Return ``(positives, shell)``: the near-neighbor lattice translations
+        ``{n1*a1 + n2*a2 : n1,n2 in {-1,0,1}} \\ {0}`` (8 vectors, ``shell``), and
+        the 4 "positive" representatives (one per ±pair, ``positives``) in a fixed
+        deterministic order. Suffices for Wigner-Seitz-type cells where opposite
+        faces differ by a single near-neighbor lattice vector."""
+        a1 = np.asarray(a1, dtype=float)
+        a2 = np.asarray(a2, dtype=float)
+        shell = [n1 * a1 + n2 * a2
+                 for n1 in (-1, 0, 1) for n2 in (-1, 0, 1)
+                 if not (n1 == 0 and n2 == 0)]
+        positives = [t for t in shell
+                     if t[0] > tol or (abs(t[0]) <= tol and t[1] > tol)]
+        positives.sort(key=lambda t: (float(np.arctan2(t[1], t[0])), float(t @ t)))
+        return positives, shell
+
+    @staticmethod
+    def _make_point_membership(points: np.ndarray, tol: float) -> Callable:
+        """Return ``contains(P)`` mapping a coordinate array ``P`` of shape
+        ``(>=gdim, n)`` to a boolean mask ``(n,)`` that is True where a column of
+        ``P`` coincides (within ``tol``) with a row of ``points`` (shape
+        ``(M, gdim)``)."""
+        gdim = points.shape[1]
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(points)
+
+            def contains(P):
+                d, _ = tree.query(np.ascontiguousarray(P[:gdim].T),
+                                  k=1, distance_upper_bound=tol)
+                return np.isfinite(d)
+            return contains
+        except Exception:  # pragma: no cover - scipy expected in the env
+            scale = max(1.0, float(np.max(np.abs(points))) if points.size else 1.0)
+            decimals = max(0, int(round(-np.log10(tol / scale))) - 1)
+            keyset = set(map(tuple, np.round(points / scale, decimals)))
+
+            def contains(P):
+                keys = np.round(P[:gdim].T / scale, decimals)
+                return np.fromiter((tuple(r) in keyset for r in keys),
+                                   dtype=bool, count=keys.shape[0])
+            return contains
+
+    @staticmethod
+    def _make_translation_relation(t: np.ndarray, gdim: int) -> Callable:
+        """Map a slave coordinate array to ``x + t`` (the master side)."""
+        t = np.asarray(t, dtype=float)
+
+        def relation(x):
+            y = x.copy()
+            for d in range(gdim):
+                y[d] = x[d] + t[d]
+            return y
+        return relation
+
+    def _classify_boundary_points(self, B: np.ndarray, shell: list[np.ndarray],
+                                  contains: Callable) -> tuple[np.ndarray, np.ndarray, int]:
+        """Split boundary nodes ``B`` into edge-interior vs. polygon vertices by
+        counting how many near-neighbor translates land back on the boundary:
+        exactly 1 -> edge-interior, >=2 -> vertex, 0 -> untied (hole boundary)."""
+        counts = np.zeros(B.shape[0], dtype=int)
+        for t in shell:
+            counts += contains((B + t[:self.gdim]).T).astype(int)
+        edge_pts = B[counts == 1]
+        vertex_pts = B[counts >= 2]
+        n_untied = int(np.count_nonzero(counts == 0))
+        return edge_pts, vertex_pts, n_untied
+
+    def _build_vertex_orbit_ties(self, mpc: dolfinx_mpc.MultiPointConstraint,
+                                 vertex_pts: np.ndarray, bcs: list, tol: float) -> None:
+        """Tie polygon vertices per lattice-equivalence orbit. Two vertices share
+        an orbit iff their difference is an integer combination of ``a1, a2``. Each
+        orbit ties its members to one representative (depth-1 star); the rep is a
+        genuine non-slave dof. Distinct orbits stay independent (e.g. a hexagon's
+        two honeycomb sublattices), coupled only through the bulk stiffness."""
+        n = vertex_pts.shape[0]
+        if n == 0:
+            return
+        A = np.column_stack([self._lattice_vectors[0], self._lattice_vectors[1]])  # (2, 2)
+
+        parent = list(range(n))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = vertex_pts[j, :self.gdim] - vertex_pts[i, :self.gdim]
+                c, *_ = np.linalg.lstsq(A, d, rcond=None)
+                if (np.allclose(A @ c, d, atol=tol, rtol=0.0)
+                        and np.allclose(c, np.round(c), atol=1e-6, rtol=0.0)):
+                    parent[find(i)] = find(j)
+
+        orbits: dict[int, list[int]] = {}
+        for i in range(n):
+            orbits.setdefault(find(i), []).append(i)
+
+        logger.debug("Polygon vertex orbits: %d orbit(s) over %d vertices",
+                     len(orbits), n)
+
+        for members in orbits.values():
+            rep_idx = max(members, key=lambda k: tuple(vertex_pts[k, :self.gdim]))
+            rep = vertex_pts[rep_idx, :self.gdim]
+            for k in members:
+                if k == rep_idx:
+                    continue
+                selector = self._make_corner_selector(vertex_pts[k, :self.gdim], tol)
+                rep_map = self._make_corner_map(rep)
+                mpc.create_periodic_constraint_geometrical(self.V, selector, rep_map, bcs)
+
+    # ------------------------------------------------------------------
+    # Linear buckling spectrum (eigenvalues of the tangent K)
+    # ------------------------------------------------------------------
+
+    def compute_buckling_spectrum(self, n_eig: int, *,
+                                  Fbar: "np.ndarray | None" = None,
+                                  tol: float = 1e-6,
+                                  slepc_options: "dict | None" = None,
+                                  n_skip: "int | None" = None,
+                                  visualize_modes: bool = False,
+                                  modes_filename: str = "buckling_modes.bp",
+                                  save_modes: bool = False,
+                                  save_eigvals: bool = False,
+                                  return_modes: bool = False):
+        """Linear buckling spectrum of the tangent ``K`` at a reference state.
+
+        Assembles ``K`` at the reference macro state (``Fbar=None`` ⇒ the current
+        state, undeformed ``F̄=I`` by default; otherwise the RVE is first solved
+        to ``Fbar``), solves the smallest ``n_eig + n_skip`` eigenpairs of
+        ``K φ = λ φ`` (SLEPc shift-invert at ``σ=0``), backsubstitutes the periodic
+        ties and scales each eigenvector to unit H¹ norm. Logs the ``n_skip``
+        skipped null/gauge eigenvalues and the ``n_eig`` physical ones.
+
+        Optional outputs:
+
+        * ``visualize_modes`` → ``output_dir/modes_filename`` (one ParaView
+          timestep per mode);
+        * ``save_modes`` → ``output_dir/snapshots/phi_<i>.npy`` mode arrays,
+          loadable into a micromorphic basis (see
+          ``mm.MicroSolver.load_buckling_modes``);
+        * ``save_eigvals`` (or ``save_modes``) →
+          ``output_dir/snapshots/buckling_eigvals.npy``.
+
+        Returns the physical eigenvalues (``NaN`` where SLEPc did not converge),
+        or ``(eigvals, modes)`` with the in-memory eigenvector ``fem.Function``s
+        when ``return_modes=True``. The micromorphic ``compute_linear_buckling_modes``
+        uses ``return_modes=True`` to populate its φ basis without a disk
+        round-trip; with ``N=0`` (no basis) this is a pure spectrum probe.
+
+        ``n_skip`` defaults to ``self._count_zero_modes()`` (``gdim+1`` under full
+        periodicity: rigid-body translations + one MPC gauge mode).
+        """
+        if n_eig <= 0:
+            raise ValueError(f"n_eig must be positive, got {n_eig}")
+        if n_skip is None:
+            n_skip = self._count_zero_modes()
+
+        if Fbar is not None:
+            logger.info("Buckling spectrum: reference solve at F̄ =\n%s", Fbar)
+            self(Fbar)
+
+        K = self._newton.assemble_stiffness()
+        try:
+            nev_total = n_eig + n_skip
+            eps, n_conv = solve_smallest_eigenpairs(
+                K, self.comm, nev=nev_total, tol=tol, petsc_options=slepc_options,
+            )
+            if n_conv < nev_total:
+                logger.warning(
+                    "Buckling spectrum: requested %d eigenpairs (%d physical + %d "
+                    "skipped), SLEPc converged %d", nev_total, n_eig, n_skip, n_conv,
+                )
+
+            skipped = [eps.getEigenvalue(i).real for i in range(min(n_skip, n_conv))]
+            logger.info("Buckling spectrum: %d skipped null/gauge λ = %s",
+                        n_skip, np.array2string(np.array(skipped), precision=3))
+
+            # Extract the physical eigenpairs into normalized mode Functions.
+            eigvals = np.full(n_eig, np.nan)
+            n_load = min(n_eig, max(0, n_conv - n_skip))
+            modes: list[fem.Function] = []
+            for i in range(n_load):
+                eigvals[i] = eps.getEigenvalue(n_skip + i).real
+                phi = fem.Function(self.V, name=f"phi_{i}")
+                vec = phi.x.petsc_vec
+                eps.getEigenvector(n_skip + i, vec)
+                if self.mpc is not None:
+                    self.mpc.backsubstitution(vec)
+                phi.x.scatter_forward()
+                h1_sq = self._mesh.comm.allreduce(fem.assemble_scalar(fem.form(
+                    (ufl.inner(phi, phi)
+                     + ufl.inner(ufl.grad(phi), ufl.grad(phi))) * self.dx
+                )), op=MPI.SUM)
+                if h1_sq > 0.0:
+                    vec.scale(1.0 / np.sqrt(h1_sq))
+                    phi.x.scatter_forward()
+                modes.append(phi)
+            logger.info("Buckling spectrum (physical, smallest |λ|): %s",
+                        np.array2string(eigvals, precision=4))
+
+            if visualize_modes and modes:
+                out_path = os.path.join(self.output_dir, modes_filename)
+                os.makedirs(self.output_dir, exist_ok=True)
+                phi_viz = fem.Function(self.V, name="phi")
+                writer = io.VTXWriter(self.comm, out_path, [phi_viz], engine="BP4")
+                try:
+                    for i, phi in enumerate(modes):
+                        phi_viz.x.array[:] = phi.x.array
+                        phi_viz.x.scatter_forward()
+                        writer.write(float(i))
+                finally:
+                    writer.close()
+                logger.info("Wrote %d buckling mode(s) to %s (timestep = mode index)",
+                            len(modes), out_path)
+
+            if save_modes and modes:
+                snap_dir = os.path.join(self.output_dir, "snapshots")
+                if self.comm.rank == 0:
+                    os.makedirs(snap_dir, exist_ok=True)
+                self.comm.barrier()
+                for i, phi in enumerate(modes):
+                    self._save_snapshot("phi", phi, int(i))
+                logger.info("Saved %d buckling mode(s) as snapshots to %s",
+                            len(modes), snap_dir)
+
+            if (save_eigvals or save_modes) and self.comm.rank == 0:
+                snap_dir = os.path.join(self.output_dir, "snapshots")
+                os.makedirs(snap_dir, exist_ok=True)
+                np.save(os.path.join(snap_dir, "buckling_eigvals.npy"), eigvals)
+
+            return (eigvals, modes) if return_modes else eigvals
+        finally:
+            eps.destroy()
+            PETSc.Mat.destroy(K)
 
     # ------------------------------------------------------------------
     # Visualization and snapshots

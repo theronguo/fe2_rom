@@ -12,10 +12,10 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 - post-buckling tracing through eigenvalue perturbation of unstable equilibria,
 - **first-order computational homogenization** (CH1) on periodic RVEs
   (Hill–Mandel averaging of `F̄`, `P̄`, energy `W̄`, and tangent `Ā`),
-- **micromorphic homogenization** (MM, [\[1\]](#references)) with a user-supplied enriched ansatz
+- **micromorphic homogenization** (MM, [\[1\]](#references), [\[2\]](#references)) with a user-supplied enriched ansatz
   `u_total = (F̄ − I)·X + Σᵢ (vᵢ + X·gᵢ) φᵢ + w`, returning effective stresses
   `P̄`, `Πᵢ`, `Λᵢ` and the full 3 × 3 grid of tangents,
-- **reduced-order modelling** (POD + ECM hyper-reduction, [\[2\]](#references)) and matching reduced
+- **reduced-order modelling** (POD + ECM hyper-reduction, [\[3\]](#references)) and matching reduced
   RVE solvers for both CH1 and micromorphic kinematics,
 - **two-scale FE² simulation** — a (higher-order) macroscopic continuum whose constitutive
   response at every quadrature point comes from a nested RVE, with either the
@@ -46,11 +46,17 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 - **First-order homogenization** (`fe2_rom.ch1`) on Gmsh-generated RVEs using
   `dolfinx_mpc` periodic constraints, with a modular `AverageQuantity` /
   `TangentBlock` framework for the effective quantities (`F̄`, `P̄`, `W̄`, `Ā`)
-  and the matching tangents.
+  and the matching tangents. Periodicity covers axis-aligned boxes (2D/3D) and,
+  in 2D, **arbitrary polygonal unit cells** — hexagonal Wigner–Seitz or sheared
+  parallelogram lattices — through lattice-vector-driven auto-pairing of
+  opposite edges and vertices (`lattice_vectors=...`).
 - **Micromorphic homogenization** (`fe2_rom.mm`) — enriched ansatz with a
   user-supplied family of global modes `φᵢ` (from a linear buckling analysis
   or any other source) and extra macro variables `(v, g=∇v)`. Reports `P̄`, `Πᵢ`,
-  `Λᵢ` and the 3 × 3 grid of tangent blocks `d{P̄, Π, Λ} / d{F̄, v, g}`.
+  `Λᵢ` and the 3 × 3 grid of tangent blocks `d{P̄, Π, Λ} / d{F̄, v, g}`. The
+  modes are extracted from the RVE tangent by `compute_buckling_spectrum`
+  (inspect the eigenvalue spectrum — any RVE, no basis needed) and loaded into
+  the `φ` basis by `compute_linear_buckling_modes` / `load_buckling_modes`.
 - **Projected linear constraint enforcement** — `⟨w⟩ = 0`, `⟨w·φᵢ⟩ = 0`,
   `⟨(w·φᵢ) X⟩ = 0`, etc. are imposed through a projected Newton solve
   (`P K P x = P b`); a `corner_periodic` flag toggles between fixed-corner BCs
@@ -110,7 +116,7 @@ fe2_rom/
 │   ├── timestepping.py     # adaptive TimeStepper
 │   └── output.py           # VTXManager, ReactionForceLogger
 ├── ch1/                    # first-order classical homogenization
-│   ├── microsolver.py      # MicroSolver (full-order periodic RVE)
+│   ├── microsolver.py      # MicroSolver (full-order periodic RVE; box or 2D polygon)
 │   ├── macrosolver.py      # MacroSolver (FE² macro driver, FOM or ROM inner)
 │   ├── material.py         # RVEMaterial (dolfinx_materials bridge)
 │   ├── averages.py         # AverageQuantity framework: F̄, P̄, W̄, Ā, TangentBlock
@@ -142,7 +148,8 @@ examples/
 └── mm/                 # micromorphic homogenization
     ├── example_1/      # standalone micromorphic RVE + snapshot sampling + ROM build
     ├── example_2/      # FE² macro micromorphic with dummy constitutive law (3D)
-    └── example_3/      # FE² macro micromorphic with nested RVE (FOM or ROM, 2D)
+    ├── example_3/      # FE² macro micromorphic with nested RVE (FOM or ROM, 2D)
+    └── example_4/      # polygonal (hexagonal) RVE — buckling spectrum + micromorphic solve
 ```
 
 ## Quick start
@@ -233,7 +240,7 @@ Piola–Kirchhoff stress `P` (`L²`), then ECM hyper-reduction selects "magic
 points" on a sub-mesh. The reduced solver
 (`fe2_rom.rom.ReducedMicroSolver`) reproduces `P̄(F̄)` and the tangent
 `Ā(F̄)` at a fraction of the full-order cost. The POD + ECM construction
-follows Guo et al. (2024) [\[2\]](#references).
+follows Guo et al. (2024) [\[3\]](#references).
 
 ### 4. Two-scale FE² simulation (classical, CH1)
 
@@ -326,7 +333,7 @@ solver = MicroSolver(
 )
 
 # Populate φᵢ from a linear buckling analysis of the reference state
-eigvals = solver.compute_linear_buckling_modes(N=1, save_modes=True)
+eigvals = solver.compute_linear_buckling_modes(1, save_modes=True)
 
 # Apply macro inputs (F̄, v, g)
 Fbar = np.array([[0.9, 0.0], [0.0, 1.0]])
@@ -349,7 +356,54 @@ python build_rom.py               # POD + ECM on the micromorphic snapshots
 python run_micromorphic_rom.py    # reduced micromorphic online stage
 ```
 
-### 6. Two-scale FE² simulation (micromorphic)
+### 6. Polygonal RVE periodicity & automatic buckling-mode selection (hexagonal)
+
+Periodicity is not restricted to axis-aligned boxes. In 2D, supplying the two
+lattice vectors makes the (classical *or* micromorphic) `MicroSolver` auto-pair
+opposite edges and vertices of an **arbitrary polygonal unit cell** — a
+hexagonal Wigner–Seitz cell, a sheared parallelogram, … — through `dolfinx_mpc`
+geometric ties. The cell area is passed via `rve_volume`; the mesh must have
+node-for-node matching on opposite edges (e.g. Gmsh `setPeriodic`).
+
+```python
+import numpy as np
+from mpi4py import MPI
+from fe2_rom.hyperelastic_solver import NeoHookean
+from fe2_rom.mm import MicroSolver
+
+ell = 1.0                                            # hexagon apothem
+lattice = np.array([[2 * ell, 0.0],                  # opposite-edge translations
+                    [ell, np.sqrt(3) * ell]])
+
+solver = MicroSolver(
+    mesh_path="hexagonal_rve.msh", comm=MPI.COMM_WORLD, gdim=2,
+    material=NeoHookean(mu=1153.8, lmbda=1730.8),
+    N=0,                                             # no φ basis yet — spectrum only
+    lattice_vectors=lattice,                         # polygonal periodicity
+    rve_volume=2 * np.sqrt(3) * ell**2,              # exact cell area |Q|
+)
+
+# Inspect the linear buckling spectrum of the RVE tangent (works with N=0)
+eigvals = solver.compute_buckling_spectrum(8, visualize_modes=True)
+```
+
+`compute_buckling_spectrum` returns the tangent's eigenvalues without touching
+any mode basis, so the number of micromorphic modes can be chosen from the
+spectral gap *before* building the basis. The micromorphic
+`compute_linear_buckling_modes` then populates `self._phi` with the softest
+modes (and `load_buckling_modes` loads a pre-computed set).
+
+`examples/mm/example_4` runs the whole chain on a porous hexagonal RVE —
+generate the mesh, inspect the spectrum, auto-select the mode count from the
+spectral gap, populate the `φ` basis, and run a micromorphic solve:
+
+```bash
+cd examples/mm/example_4
+python generate_hexagonal_mesh.py     # periodic (D6-symmetric) hexagonal RVE
+python run_micromorphic.py            # spectrum → auto-select N → populate φ → micromorphic solve
+```
+
+### 7. Two-scale FE² simulation (micromorphic)
 
 `fe2_rom.mm.MacroMicromorphicSolver` couples the macroscopic displacement
 field `u` with `N_modes` scalar enrichment-amplitude fields `vᵢ` through the
@@ -428,6 +482,39 @@ example_3 expects `phi_*.npy` and the `ecm/` directory to already exist in
 > [`dolfinx_materials`](https://github.com/bleyerj/dolfinx_materials) — see the
 > install instructions above.
 
+## Validation
+
+The micromorphic two-scale solver is validated against the benchmark of
+van Bree et al. (2020) [\[2\]](#references) — the local-vs-global buckling of a
+pattern-transforming metamaterial column (their Section 4.1). The suite under
+`validation/mm_2d/example_1_local_global/` reproduces that example on a common
+microstructure (a 2ℓ × 2ℓ RVE with four circular holes) and macroscopic specimen
+(W = 4ℓ × H = 8ℓ) under compression, with three drivers:
+
+- `run_macro_dns.py` — a fully-resolved **direct numerical simulation** (DNS)
+  reference;
+- `run_macro_ch1.py` — **first-order** FE² (classical homogenization), the
+  baseline, which deviates from the DNS by up to ~40% in the post-buckling
+  regime;
+- `run_macro_mm.py` — the **micromorphic** FE², which captures the
+  local→global buckling transition to within ~6% of the DNS in applied strain.
+
+All three output the nominal stress `P₂₂` versus compressive strain `u/H`, so the
+curves are directly comparable.
+
+```bash
+cd validation/mm_2d/example_1_local_global
+python create_dns_mesh.py     # writes dns_6x30.msh (rve.msh ships with the repo)
+python run_macro_dns.py       # DNS reference
+python run_macro_ch1.py       # first-order FE² baseline
+python run_macro_mm.py        # micromorphic FE²
+```
+
+The reference paper is bundled at
+[`validation/mm_2d/paper/reference.pdf`](validation/mm_2d/paper/reference.pdf)
+(open access, CC BY 4.0) — DOI
+[10.1016/j.cma.2020.113333](https://doi.org/10.1016/j.cma.2020.113333).
+
 ## References
 
 <a id="references"></a>
@@ -438,11 +525,25 @@ example_3 expects `phi_*.npy` and the `ecm/` directory to already exist in
    Solids, **123**, 119–137.
    [doi:10.1016/j.jmps.2018.08.019](https://doi.org/10.1016/j.jmps.2018.08.019).
 
-2. Guo, T., Rokoš, O., & Veroy, K. (2024). *A reduced order model for
+2. van Bree, S. E. H. M., Rokoš, O., Peerlings, R. H. J., Doškář, M., &
+   Geers, M. G. D. (2020). *A Newton solver for micromorphic computational
+   homogenization enabling multiscale buckling analysis of pattern-transforming
+   metamaterials.* Computer Methods in Applied Mechanics and Engineering,
+   **372**, 113333.
+   [doi:10.1016/j.cma.2020.113333](https://doi.org/10.1016/j.cma.2020.113333).
+   Open access (CC BY 4.0); a copy is bundled at
+   [`validation/mm_2d/paper/reference.pdf`](validation/mm_2d/paper/reference.pdf).
+
+3. Guo, T., Rokoš, O., & Veroy, K. (2024). *A reduced order model for
    geometrically parameterized two-scale simulations of elasto-plastic
    microstructures under large deformations.* Computer Methods in Applied
    Mechanics and Engineering, **418**, 116467.
    [doi:10.1016/j.cma.2023.116467](https://doi.org/10.1016/j.cma.2023.116467).
+
+## Contact
+
+Questions, issues, or collaboration ideas? Contact **Theron Guo** —
+[t.guo@tue.nl](mailto:t.guo@tue.nl).
 
 ## License
 
