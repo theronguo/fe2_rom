@@ -63,8 +63,8 @@ solver = MicroSolver(
     visualize_fields=["u_fluc", "u_total", "F", "P"],
     newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                     "max_iter": 50, "div_rel_tol": 10, "switch_to_minres": True},
-    timestepper_options={"t_end": 1.0, "dt_init": 1e-1, "dt_min": 1e-5,
-                         "dt_max": 1e-1, "good_newton_steps": 5},
+    timestepper_options={"t_end": 1.0, "dt_init": 1e-2, "dt_min": 1e-5,
+                         "dt_max": 1e-2, "good_newton_steps": 5},
     lattice_vectors=LATTICE_VECTORS,
 )
 solver.load_buckling_modes([res.phi[:, i] for i in range(N_MODES)])
