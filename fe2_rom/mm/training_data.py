@@ -238,19 +238,66 @@ def _ensure_modes(mesh_path, comm, gdim, material, *, degree, lattice_vectors,
     return cached
 
 
-def _draw_samples(n_samples, n_modes, gdim, max_strain, v_max, g_max,
+_AXIS = {"x": 0, "y": 1, "z": 2}
+
+
+def _parse_fbar_key(key, gdim):
+    """Parse an F̄-component key like ``"F_xx"`` / ``"Fxy"`` / ``"xy"`` into a
+    ``(i, j)`` index pair (x→0, y→1, z→2)."""
+    s = str(key)
+    if s.startswith("F_"):
+        s = s[2:]
+    elif s.startswith("F"):
+        s = s[1:]
+    if len(s) != 2 or s[0].lower() not in _AXIS or s[1].lower() not in _AXIS:
+        raise ValueError(f"F̄ component key {key!r} must be like 'F_xx' "
+                         f"(two axis letters from x/y/z)")
+    i, j = _AXIS[s[0].lower()], _AXIS[s[1].lower()]
+    if i >= gdim or j >= gdim:
+        raise ValueError(f"F̄ component key {key!r} out of range for gdim={gdim}")
+    return i, j
+
+
+def _fbar_bounds(max_strain, gdim):
+    """Per-component ``(F_lo, F_hi)`` ``(gdim, gdim)`` sampling bounds for F̄.
+
+    * scalar ``ε`` → ``F̄ = I + δ`` with every ``δ_ij ∈ [−ε, ε]`` (symmetric box).
+    * dict → per-component *absolute* ranges, e.g.
+      ``{"F_xx": [0.85, 1.05], "F_xy": [-0.1, 0.1]}``; components not listed are
+      held fixed at the identity (diagonal 1, off-diagonal 0)."""
+    eye = np.eye(gdim)
+    if isinstance(max_strain, dict):
+        F_lo, F_hi = eye.copy(), eye.copy()
+        for key, rng in max_strain.items():
+            i, j = _parse_fbar_key(key, gdim)
+            lo, hi = float(rng[0]), float(rng[1])
+            F_lo[i, j], F_hi[i, j] = min(lo, hi), max(lo, hi)
+        return F_lo, F_hi
+    eps = float(max_strain)
+    return eye - eps, eye + eps
+
+
+def _representative_strain(F_lo, F_hi, gdim):
+    """Largest deviation of the F̄ box from the identity — the scale used for the
+    ``v`` / ``g`` amplitude bounds."""
+    eye = np.eye(gdim)
+    return float(np.maximum(np.abs(F_lo - eye), np.abs(F_hi - eye)).max())
+
+
+def _draw_samples(n_samples, n_modes, gdim, F_lo, F_hi, v_max, g_max,
                   seed, sampler):
-    """``n_samples`` triples ``(F̄, v, g)`` space-filling over the bound box.
-    Each component is symmetric about its reference value: ``F̄ = I + δ`` with
-    ``δ_ij ∈ [−max_strain, max_strain]``, ``v_i ∈ [−v_max[i], v_max[i]]``,
-    ``g_i ∈ [−g_max[i], g_max[i]]^{gdim}``. ``v_max`` / ``g_max`` are per-mode
-    arrays of length ``n_modes``."""
+    """``n_samples`` triples ``(F̄, v, g)`` space-filling over the bound box:
+    each ``F̄`` component independently in ``[F_lo, F_hi]``, ``v_i ∈
+    [−v_max[i], v_max[i]]``, ``g_i ∈ [−g_max[i], g_max[i]]^{gdim}``. ``v_max`` /
+    ``g_max`` are per-mode arrays of length ``n_modes``."""
     dim_F = gdim * gdim
     dim_v = n_modes
     dim_g = n_modes * gdim
     dim = dim_F + dim_v + dim_g
     v_max = np.asarray(v_max).reshape(n_modes)
     g_max = np.asarray(g_max).reshape(n_modes)
+    F_lo_flat = np.asarray(F_lo).ravel()
+    F_hi_flat = np.asarray(F_hi).ravel()
 
     if sampler in ("lhs", "sobol"):
         from scipy.stats import qmc
@@ -262,13 +309,12 @@ def _draw_samples(n_samples, n_modes, gdim, max_strain, v_max, g_max,
     else:
         raise ValueError(f"sampler must be 'lhs', 'sobol' or 'uniform', got {sampler!r}")
 
-    s = 2.0 * unit - 1.0   # → [-1, 1]
-    eye = np.eye(gdim)
     samples = []
-    for row in s:
-        Fbar = eye + row[:dim_F].reshape(gdim, gdim) * max_strain
-        v = row[dim_F:dim_F + dim_v] * v_max
-        g = row[dim_F + dim_v:].reshape(n_modes, gdim) * g_max[:, None]
+    for row in unit:
+        # F̄ component i,j mapped to its [lo, hi]; v / g centred on 0.
+        Fbar = (F_lo_flat + row[:dim_F] * (F_hi_flat - F_lo_flat)).reshape(gdim, gdim)
+        v = (2.0 * row[dim_F:dim_F + dim_v] - 1.0) * v_max
+        g = (2.0 * row[dim_F + dim_v:].reshape(n_modes, gdim) - 1.0) * g_max[:, None]
         samples.append((Fbar, v, g))
     return samples
 
@@ -338,7 +384,7 @@ def _merge_and_summarize(worker_root, pool_dir, samples, gdim):
 # ---------------------------------------------------------------------------
 
 def generate_training_data(
-    mesh_path: str, comm, gdim: int, material, max_strain: float, *,
+    mesh_path: str, comm, gdim: int, material, max_strain: "float | dict", *,
     lattice_vectors: "np.ndarray | None" = None,
     degree: int = 2,
     modes_dir: "str | None" = None,
@@ -365,8 +411,15 @@ def generate_training_data(
         ``comm`` is only used for the (optional) mode-extraction phase, so run
         this with plain ``python`` (the pool provides the parallelism), not
         ``mpirun``.
-    max_strain : the intended maximum deformation (per-component half-width of
-        the ``F̄`` box and the scale for the ``v``/``g`` bounds).
+    max_strain : the intended maximum deformation. Either
+        * a **scalar** ``ε`` → symmetric box ``F̄ = I + δ`` with every
+          ``δ_ij ∈ [−ε, ε]``; or
+        * a **dict** of per-component *absolute* ranges, e.g.
+          ``{"F_xx": [0.85, 1.05], "F_xy": [-0.1, 0.1]}`` (keys ``"F_<ab>"`` with
+          axes ``x``/``y``/``z``); components not listed are held fixed at the
+          identity.
+        The ``v``/``g`` amplitude bounds scale with the largest deviation of the
+        F̄ box from the identity.
     lattice_vectors : ``None`` for an axis-aligned box, ``(gdim, gdim)`` for a
         periodic polygon (forwarded to the solver and to mode extraction).
     modes_dir : where φ are cached / written (default ``output_dir/modes``).
@@ -421,18 +474,21 @@ def generate_training_data(
     #    pattern displacement regardless of how φ is normalised.
     L_rve = _rve_length_scale(mesh_path, gdim)
     mean_norms = _phi_mean_norms(mesh_path, gdim, degree, phi_arrays)
-    v_max = amplitude_factor * max_strain * L_rve / mean_norms
+    F_lo, F_hi = _fbar_bounds(max_strain, gdim)
+    strain_amp = _representative_strain(F_lo, F_hi, gdim)
+    v_max = amplitude_factor * strain_amp * L_rve / mean_norms
     g_max = v_max / L_rve
-    bounds = {"max_strain": max_strain, "L_RVE": L_rve,
+    bounds = {"max_strain": max_strain, "strain_amp": strain_amp, "L_RVE": L_rve,
               "amplitude_factor": amplitude_factor, "phi_mean_norms": mean_norms,
-              "v_max": v_max, "g_max": g_max}
+              "F_lo": F_lo, "F_hi": F_hi, "v_max": v_max, "g_max": g_max}
     with np.printoptions(precision=4, suppress=True):
-        logger.info("Bounds: L_RVE=%.4g, max_strain=%.4g, κ=%.2g, ⟨‖φ‖⟩=%s",
-                    L_rve, max_strain, amplitude_factor, mean_norms)
+        logger.info("Bounds: L_RVE=%.4g, strain(amp)=%.4g, κ=%.2g, ⟨‖φ‖⟩=%s",
+                    L_rve, strain_amp, amplitude_factor, mean_norms)
+        logger.info("        F̄ box lo=\n%s\n        F̄ box hi=\n%s", F_lo, F_hi)
         logger.info("        → v_max=%s, g_max=%s", v_max, g_max)
 
     # 3. Space-filling samples.
-    samples = _draw_samples(n_samples, n_modes, gdim, max_strain, v_max, g_max,
+    samples = _draw_samples(n_samples, n_modes, gdim, F_lo, F_hi, v_max, g_max,
                             seed, sampler)
 
     # 4. Parallel FOM solves (multiprocessing pool, COMM_SELF per worker).
@@ -475,8 +531,8 @@ def generate_training_data(
     }
     np.savez(os.path.join(output_dir, "sample_inputs.npz"), **targets)
     np.savez(os.path.join(output_dir, "training_summary.npz"),
-             v_max=v_max, g_max=g_max, L_RVE=L_rve, max_strain=max_strain,
-             amplitude_factor=amplitude_factor,
+             v_max=v_max, g_max=g_max, L_RVE=L_rve, strain_amp=strain_amp,
+             F_lo=F_lo, F_hi=F_hi, amplitude_factor=amplitude_factor,
              realized_Fbar_lo=realized["Fbar"][0], realized_Fbar_hi=realized["Fbar"][1],
              realized_v_lo=realized["v"][0], realized_v_hi=realized["v"][1],
              realized_g_lo=realized["g"][0], realized_g_hi=realized["g"][1])
