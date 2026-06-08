@@ -60,6 +60,7 @@ class MicroSolver:
                  degree: int = 1,
                  output_dir: str = "output",
                  check_stability: bool = True,
+                 perturb_post_buckling: bool = True,
                  visualize_fields: list[str] | None = None,
                  average_quantities: list | None = None,
                  stability_options: dict | None = None,
@@ -112,6 +113,15 @@ class MicroSolver:
 
         self._averages_only_final = averages_only_final
         self._material = material
+        # When False, an instability is not perturbed onto the buckled branch;
+        # instead the step is rejected and dt halved, so the solve approaches the
+        # bifurcation as closely as possible (used by the φ-extraction "lba"
+        # strategy, which then does a linear buckling analysis there).
+        self._perturb_post_buckling = perturb_post_buckling
+        # F̄ at the most recent accepted (stable) step — the near-critical state
+        # the "lba" strategy hands to compute_buckling_spectrum. Re-initialised at
+        # the start of every __call__ (F_bar is built later in __init__).
+        self._last_converged_Fbar = np.eye(self.gdim, dtype=PETSc.ScalarType)
 
         # ---- Function space and state fields ----
         self._degree = degree
@@ -894,6 +904,7 @@ class MicroSolver:
             output_quantities.append(self._collect_averages())
 
         self._timestepper.reset()
+        self._last_converged_Fbar = np.asarray(self.F_bar.value).copy()
         while not self._timestepper.finished:
             trial_time = self._timestepper.step_forward()
             logger.info("── Step  t=%.5f  dt=%.2e", trial_time, self._timestepper.dt)
@@ -938,26 +949,12 @@ class MicroSolver:
                     else:
                         is_stable, eigenvalues = True, np.array([])
 
-                    if not is_stable:
-                        target = np.where(eigenvalues < self._stability._neg_tol)[0]
-                        scale, info = apply_eigenmode_perturbation(
-                            u, self._eigenfunction, pert_amplitude, self.comm,
-                            char_length=self._char_length,
-                        )
-                        u_ref, phi_max = info[0]
-                        logger.warning(
-                            "Unstable equilibrium (λ_min=%.4e) — "
-                            "perturbing with eigenvector "
-                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
-                            eigenvalues[target[0]], pert_amplitude, u_ref,
-                            scale * phi_max,
-                        )
-                        pert_amplitude *= 2
-                    else:
+                    if is_stable:
                         stable_configuration = True
                         self._timestepper.accept(iter_newton)
                         self._u_last.x.array[:] = u.x.array[:]
                         self._u_last.x.scatter_forward()
+                        self._last_converged_Fbar = np.asarray(self.F_bar.value).copy()
 
                         if not self._averages_only_final:
                             output_quantities.append(self._collect_averages())
@@ -1004,6 +1001,42 @@ class MicroSolver:
                                     self._save_snapshot(
                                         f"dw_d{var_name}_{suffix}", p, t_save,
                                     )
+                    elif self._perturb_post_buckling:
+                        # Unstable: perturb onto the buckled branch and re-solve
+                        # (the eigenvector kick doubles on each retry).
+                        target = np.where(eigenvalues < self._stability._neg_tol)[0]
+                        scale, info = apply_eigenmode_perturbation(
+                            u, self._eigenfunction, pert_amplitude, self.comm,
+                            char_length=self._char_length,
+                        )
+                        u_ref, phi_max = info[0]
+                        logger.warning(
+                            "Unstable equilibrium (λ_min=%.4e) — "
+                            "perturbing with eigenvector "
+                            "(factor=%.2e, |u|=%.2e, ‖perturbation‖_∞=%.2e)",
+                            eigenvalues[target[0]], pert_amplitude, u_ref,
+                            scale * phi_max,
+                        )
+                        pert_amplitude *= 2
+                    else:
+                        # Approach mode (perturb_post_buckling=False): don't jump
+                        # onto the buckled branch — reject and halve dt to step as
+                        # close to the bifurcation as possible.
+                        logger.info(
+                            "Unstable equilibrium (λ_min=%.4e) — perturbation "
+                            "disabled; halving dt to approach the bifurcation",
+                            float(np.min(eigenvalues)),
+                        )
+                        ok = self._timestepper.reject()
+                        u.x.array[:] = self._u_last.x.array[:]
+                        u.x.scatter_forward()
+                        if not ok:
+                            raise RVEConvergenceError(
+                                f"Reached instability (approach mode) and "
+                                f"dt_min={self._timestepper.dt_min:.2e} reached "
+                                f"near t={self._timestepper.t_current:.4f}"
+                            )
+                        break
 
                 else:
                     ok = self._timestepper.reject()
