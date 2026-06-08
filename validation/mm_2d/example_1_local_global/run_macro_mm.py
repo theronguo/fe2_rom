@@ -31,7 +31,6 @@ import csv
 import logging
 
 import numpy as np
-import ufl
 from mpi4py import MPI
 
 from dolfinx import fem
@@ -46,6 +45,7 @@ from fe2_rom.hyperelastic_solver.timestepping import TimeStepper
 from fe2_rom.mm.material import MicromorphicRVEMaterial
 from fe2_rom.mm.macrosolver import MacroMicromorphicSolver
 from fe2_rom.mm.microsolver import MicroSolver
+from fe2_rom.mm import set_analytical_modes
 
 from fe2_rom.hyperelastic_solver.material import BertoldiHyperelastic
 
@@ -77,41 +77,24 @@ def parse_args():
 
 
 # ---------------------------------------------------------------------------
-# Analytical φ₁ (Eq. 56) and its in-place normalisation.
+# Analytical φ₁ (van Bree et al. Eq. 56), supplied as a coordinate→value
+# callable to the generic fe2_rom.mm helper.
 # ---------------------------------------------------------------------------
-def _populate_phi(rve, vol_global=None):
-    """Write the analytical patterning mode φ₁ into ``rve._phi[0]`` and
-    renormalise so that (1/|Q|) ∫_Q ‖φ₁‖ dX = 1, then call rebuild_constraints.
-    """
-    Vphi = rve._phi[0].function_space
-    bs = Vphi.dofmap.bs                                # 2 for 2D vector
-    assert bs == 2, f"expected vector space with bs=2, got {bs}"
-    coords = Vphi.tabulate_dof_coordinates()[:, :2]    # (n_dof, 2)
+def phi1_mode(coords):
+    """The square-stacking patterning mode φ₁ (Eq. 56), evaluated at the
+    ``(n_points, 2)`` coordinate array; returns ``(n_points, 2)`` values."""
     X1, X2 = coords[:, 0], coords[:, 1]
-
-    s_plus  = np.sin(np.pi * (X1 + X2) / ELL)
+    s_plus = np.sin(np.pi * (X1 + X2) / ELL)
     s_minus = np.sin(np.pi * (-X1 + X2) / ELL)
-    phi_x = -s_plus - s_minus
-    phi_y =  s_plus - s_minus
+    return np.column_stack([-s_plus - s_minus, s_plus - s_minus])
 
-    arr = rve._phi[0].x.array
-    arr[0::bs] = phi_x
-    arr[1::bs] = phi_y
-    rve._phi[0].x.scatter_forward()
 
-    # Numerical normalisation: C1 = ∫ ‖φ_raw‖ dX / |Q|.
-    phi = rve._phi[0]
-    norm_form = fem.form(ufl.sqrt(ufl.dot(phi, phi)) * rve.dx)
-    int_local = fem.assemble_scalar(norm_form)
-    int_global = rve.comm.allreduce(int_local, op=MPI.SUM)
-    if vol_global is not None:
-        vol_form  = fem.form(fem.Constant(rve._mesh, 1.0) * rve.dx)
-        vol_local = fem.assemble_scalar(vol_form)
-        vol_global = rve.comm.allreduce(vol_local, op=MPI.SUM)
-
-    C_norm = int_global / vol_global
-    arr[:] /= C_norm
-    rve._phi[0].x.scatter_forward()
+def _populate_phi(rve, vol_global=None):
+    """Write φ₁ into ``rve._phi[0]`` and renormalise (mean ‖φ₁‖ over the meshed
+    cell = 1, matching the original ∫dX normalisation), then rebuild constraints.
+    """
+    set_analytical_modes([rve._phi[0]], phi1_mode, dx=rve.dx, comm=rve.comm,
+                         normalize="mean", rve_volume=None)
     rve.rebuild_constraints()
 
 
