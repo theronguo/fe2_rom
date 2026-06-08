@@ -214,9 +214,11 @@ def _load_phi_arrays(phi_dir: str) -> list[np.ndarray]:
 
 
 def _ensure_modes(mesh_path, comm, gdim, material, *, degree, lattice_vectors,
-                  modes_dir, n_modes, extract_kwargs) -> list[np.ndarray]:
+                  modes_dir, n_modes, strain_amp, extract_kwargs) -> list[np.ndarray]:
     """Load cached φ from ``modes_dir/phi/`` or build them with
-    :func:`extract_buckling_modes`."""
+    :func:`extract_buckling_modes`. The extraction's symmetric compression depth
+    defaults to ``strain_amp`` (overridable by a scalar ``max_strain`` in
+    ``extract_kwargs``)."""
     phi_dir = os.path.join(modes_dir, "phi")
     cached = _load_phi_arrays(phi_dir)
     if cached:
@@ -224,8 +226,13 @@ def _ensure_modes(mesh_path, comm, gdim, material, *, degree, lattice_vectors,
     else:
         logger.info("No cached φ found — extracting buckling modes into %s", modes_dir)
         kw = dict(degree=degree, lattice_vectors=lattice_vectors,
-                  output_dir=modes_dir)
+                  output_dir=modes_dir, max_strain=strain_amp)
         kw.update(extract_kwargs or {})
+        # Mode extraction drives one symmetric compression and needs a *scalar*
+        # depth; if a per-component sampling dict was forwarded, collapse it to
+        # the representative strain.
+        if isinstance(kw.get("max_strain"), dict):
+            kw["max_strain"] = strain_amp
         extract_buckling_modes(mesh_path, comm, gdim, material, **kw)
         cached = _load_phi_arrays(phi_dir)
         if not cached:
@@ -461,21 +468,23 @@ def generate_training_data(
     worker_root = os.path.join(output_dir, "workers")
     os.makedirs(output_dir, exist_ok=True)
 
+    # F̄ sampling box + a representative scalar strain (drives the v/g amplitude
+    # bounds *and* the symmetric compression depth used to extract the φ modes).
+    F_lo, F_hi = _fbar_bounds(max_strain, gdim)
+    strain_amp = _representative_strain(F_lo, F_hi, gdim)
+
     # 1. Enrichment modes φ (build if absent).
     phi_arrays = _ensure_modes(
         mesh_path, comm, gdim, material, degree=degree,
         lattice_vectors=lattice_vectors, modes_dir=modes_dir,
-        n_modes=n_modes, extract_kwargs=extract_kwargs,
+        n_modes=n_modes, strain_amp=strain_amp, extract_kwargs=extract_kwargs,
     )
     n_modes = len(phi_arrays)
 
-    # 2. Bounds from L_RVE + max_strain (generous; convergence filters the rest).
-    #    Per mode, v_max = κ·ε·L / ⟨‖φ_i‖⟩ so the bound tracks the *physical*
-    #    pattern displacement regardless of how φ is normalised.
+    # 2. Bounds: per mode, v_max = κ·strain_amp·L / ⟨‖φ_i‖⟩ so the bound tracks
+    #    the *physical* pattern displacement regardless of how φ is normalised.
     L_rve = _rve_length_scale(mesh_path, gdim)
     mean_norms = _phi_mean_norms(mesh_path, gdim, degree, phi_arrays)
-    F_lo, F_hi = _fbar_bounds(max_strain, gdim)
-    strain_amp = _representative_strain(F_lo, F_hi, gdim)
     v_max = amplitude_factor * strain_amp * L_rve / mean_norms
     g_max = v_max / L_rve
     bounds = {"max_strain": max_strain, "strain_amp": strain_amp, "L_RVE": L_rve,
