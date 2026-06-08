@@ -21,17 +21,17 @@ from fe2_rom.rom.ecm import ECM
 comm = MPI.COMM_WORLD
 gdim = 2
 degree = 2
-snapshot_dir = "output"
+snapshot_dir = "output_gen"
 pool_dir = f"{snapshot_dir}/snapshots_pool"
 phi_dir = f"{snapshot_dir}/snapshots"
 ecm_dir = "ecm"
 mesh_file = "rve.msh"
-ecm_tol = 1e-4
+ecm_tol = 1e-3
 ratio_uP = 1.0
 ratio_P = 1e0
 ratio_Pi = 1e0
 ratio_Lambda = 1e0
-energy_tol = 0.999999
+energy_tol = 0.9999
 
 mesh = io.gmsh.read_from_msh(f"{mesh_file}", comm, 0, gdim=gdim).mesh
 V  = fem.functionspace(mesh, ("Lagrange", degree, (gdim,)))

@@ -177,15 +177,25 @@ def _n_modes_by_gap(singular_values: np.ndarray, gap_ratio: float) -> int:
     return int(sv.size)
 
 
-def _lba_modes(cfg: _RunConfig, F_ref: np.ndarray, tag: str) -> list[np.ndarray]:
+def _lba_modes(cfg: _RunConfig, F_ref: np.ndarray, tag: str, *,
+               solver=None) -> list[np.ndarray]:
     """Linear buckling modes at a (near-critical) pre-stress ``F_ref`` — compute
     ``fallback_n_modes`` eigenpairs and keep the buckling-relevant ones (below the
-    first eigenvalue gap)."""
-    lba = _build_solver(cfg, os.path.join(cfg.work_dir, f"{tag}_lba"),
-                        check_stability=False)
-    eigvals, modes = lba.compute_buckling_spectrum(
-        cfg.fallback_n_modes, Fbar=F_ref, return_modes=True,
-    )
+    first eigenvalue gap).
+
+    If ``solver`` is given it must already hold the converged equilibrium at
+    ``F_ref`` — the spectrum is then assembled in place (``Fbar=None``, no
+    re-solve). Otherwise a fresh solver is built and ramped to ``F_ref``."""
+    if solver is None:
+        solver = _build_solver(cfg, os.path.join(cfg.work_dir, f"{tag}_lba"),
+                               check_stability=False)
+        eigvals, modes = solver.compute_buckling_spectrum(
+            cfg.fallback_n_modes, Fbar=F_ref, return_modes=True,
+        )
+    else:
+        eigvals, modes = solver.compute_buckling_spectrum(
+            cfg.fallback_n_modes, Fbar=None, return_modes=True,
+        )
     n_keep = _ascending_gap_count(eigvals, cfg.gap_ratio)
     logger.info("  LBA eigenvalues %s → keep %d buckling mode(s)",
                 np.array2string(eigvals, precision=4), n_keep)
@@ -255,7 +265,13 @@ def _run_lba(cfg: _RunConfig, target_F: np.ndarray,
         logger.info("  approached the bifurcation (%s)", exc)
     F_crit = np.asarray(solver._last_converged_Fbar)
     logger.info("  LBA at near-critical F̄ =\n%s", np.array2string(F_crit, precision=4))
-    return _lba_modes(cfg, F_crit, f"path_{tag}"), []
+    # The approach solve leaves F_bar at the rejected post-critical trial while u was
+    # reset to the last converged step — restore the consistent (F_crit, u) state and
+    # do the LBA in place, so we don't re-ramp a fresh solver back to F_crit.
+    solver.F_bar.value[:] = solver._last_converged_Fbar
+    solver.u.x.array[:] = solver._u_last.x.array
+    solver.u.x.scatter_forward()
+    return _lba_modes(cfg, F_crit, f"path_{tag}", solver=solver), []
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +351,7 @@ def extract_buckling_modes(
     buckle_amp_ratio: float = 5.0,
     fallback_n_modes: int = 6,
     dt_init: "float | None" = None,
-    dt_min: float = 1e-5,
+    dt_min: float = 1e-3,
     dt_max: "float | None" = None,
     good_newton_steps: int = 7,
     newton_options: "dict | None" = None,

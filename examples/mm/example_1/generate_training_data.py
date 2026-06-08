@@ -29,7 +29,7 @@ RVE_MESH = os.path.abspath(os.path.join(HERE, "rve.msh"))
 OUTPUT_DIR = os.path.join(HERE, "output_gen")
 
 MAX_STRAIN = 0.10           # intended max per-component deformation
-AMPLITUDE_FACTOR = 2.0      # κ: generosity of the v/g bracket
+AMPLITUDE_FACTOR = 1.0      # κ: generosity of the v/g bracket
 N_SAMPLES = 32
 N_WORKERS = 8
 

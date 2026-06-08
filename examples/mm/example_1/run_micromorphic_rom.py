@@ -42,7 +42,7 @@ logger.addFilter(lambda r: comm.rank == 0)
 HERE = os.path.dirname(__file__)
 RVE_MESH = os.path.abspath(os.path.join(HERE, "rve.msh"))
 ROM_DIR  = os.path.abspath(os.path.join(HERE, "ecm"))
-PHI_DIR  = os.path.abspath(os.path.join(HERE, "output", "snapshots"))
+PHI_DIR  = os.path.abspath(os.path.join(HERE, "output_gen", "modes", "phi"))
 
 output_dir = os.path.join(HERE, "output_rom")
 os.makedirs(output_dir, exist_ok=True)
@@ -147,27 +147,22 @@ gx_hist = t_ramp * g_target[0, 0]
 fig, axes = plt.subplots(2, 3, figsize=(13, 7))
 
 axes[0, 0].plot(F00, Pbar_hist[:, 0, 0], "-o", ms=3)
-axes[0, 0].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$\bar P_{xx}$",
-               title=r"$\bar P_{xx}$ vs $\bar F_{xx}$")
+axes[0, 0].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$\bar P_{xx}$")
 
 axes[0, 1].plot(v0_hist, Pi_hist[:, 0], "-o", ms=3)
-axes[0, 1].set(xlabel=r"$v_0$", ylabel=r"$\Pi_0$", title=r"$\Pi$ vs $v$")
+axes[0, 1].set(xlabel=r"$v_0$", ylabel=r"$\Pi_0$")
 
 axes[0, 2].plot(gx_hist, Lam_hist[:, 0, 0], "-o", ms=3)
-axes[0, 2].set(xlabel=r"$g_{0,x}$", ylabel=r"$\Lambda_{0,x}$",
-               title=r"$\Lambda_x$ vs $g_x$")
+axes[0, 2].set(xlabel=r"$g_{0,x}$", ylabel=r"$\Lambda_{0,x}$")
 
 axes[1, 0].plot(F00, A_hist[:, 0, 0, 0, 0], "-o", ms=3)
-axes[1, 0].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$\bar A_{xxxx}$",
-               title=r"$\bar A_{xxxx}$ vs $\bar F_{xx}$")
+axes[1, 0].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$\bar A_{xxxx}$")
 
 axes[1, 1].plot(F00, dPidv_h[:, 0, 0], "-o", ms=3)
-axes[1, 1].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$d\Pi_0/dv_0$",
-               title=r"$d\Pi/dv$ vs $\bar F_{xx}$")
+axes[1, 1].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$d\Pi_0/dv_0$")
 
 axes[1, 2].plot(F00, dLamdg_h[:, 0, 0, 0, 0], "-o", ms=3)
-axes[1, 2].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$d\Lambda_{0,x}/dg_{0,x}$",
-               title=r"$d\Lambda_x/dg_x$ vs $\bar F_{xx}$")
+axes[1, 2].set(xlabel=r"$\bar F_{xx}$", ylabel=r"$d\Lambda_{0,x}/dg_{0,x}$")
 
 for ax in axes.ravel():
     ax.grid(True, alpha=0.3)

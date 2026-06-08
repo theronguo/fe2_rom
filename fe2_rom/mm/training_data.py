@@ -66,8 +66,8 @@ _DEFAULT_NEWTON = {
     "div_rel_tol": 10.0, "switch_to_minres": True,
 }
 _DEFAULT_TIMESTEP = {
-    "t_end": 1.0, "dt_init": 1e-2, "dt_min": 1e-5,
-    "dt_max": 1e-2, "good_newton_steps": 5,
+    "t_end": 1.0, "dt_init": 1e-1, "dt_min": 1e-5,
+    "dt_max": 1e-1, "good_newton_steps": 5,
 }
 # Snapshot fields consumed by the micromorphic build_rom.py (u_fluc + P; Π/Λ
 # densities are reconstructed there from P and φ). Extend via ``save_fields``.
