@@ -17,6 +17,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+import glob
 import logging
 import numpy as np
 from mpi4py import MPI
@@ -45,15 +46,26 @@ material = NeoHookean(mu=mu_micro, lmbda=lam_micro)
 LATTICE_VECTORS = None      # axis-aligned box RVE
 
 
-# --- 1. Extract the enrichment modes φ from RVE buckling --------------------
-res = extract_buckling_modes(
-    RVE_MESH, comm, gdim=2, material=material, degree=2,
-    lattice_vectors=LATTICE_VECTORS,
-    strategy="lba", max_strain=0.10,        # equal-biaxial compression
-    output_dir=os.path.join(output_dir, "modes"),
+# --- 1. Enrichment modes φ — load if already computed, else extract ---------
+MODES_DIR = os.path.join(output_dir, "modes")
+phi_files = sorted(
+    f for f in glob.glob(os.path.join(MODES_DIR, "phi", "phi_*.npy"))
+    if "dof_coords" not in f and "singular_values" not in f
 )
-N_MODES = res.n_modes
-logger.info("Extracted N=%d φ mode(s)", N_MODES)
+if phi_files:
+    phi_arrays = [np.load(f) for f in phi_files]
+    logger.info("Loaded %d cached φ mode(s) from %s", len(phi_arrays), MODES_DIR)
+else:
+    logger.info("No cached φ found — extracting from RVE buckling …")
+    res = extract_buckling_modes(
+        RVE_MESH, comm, gdim=2, material=material, degree=2,
+        lattice_vectors=LATTICE_VECTORS,
+        strategy="lba", max_strain=0.10,        # equal-biaxial compression
+        output_dir=MODES_DIR,
+    )
+    phi_arrays = [res.phi[:, i] for i in range(res.n_modes)]
+N_MODES = len(phi_arrays)
+logger.info("Using N=%d φ mode(s)", N_MODES)
 
 
 # --- 2. Build the micromorphic solver and load φ ----------------------------
@@ -67,7 +79,7 @@ solver = MicroSolver(
                          "dt_max": 1e-2, "good_newton_steps": 5},
     lattice_vectors=LATTICE_VECTORS,
 )
-solver.load_buckling_modes([res.phi[:, i] for i in range(N_MODES)])
+solver.load_buckling_modes(phi_arrays)
 
 
 # --- 3. Micromorphic probe — prescribe (F̄, v, g) ---------------------------

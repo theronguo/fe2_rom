@@ -48,7 +48,7 @@ import multiprocessing as mp
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from glob import glob
 
 import numpy as np
@@ -140,6 +140,12 @@ def _worker_task(task):
             material=cfg.material, N=cfg.n_modes, degree=cfg.degree,
             output_dir=work_dir, check_stability=cfg.check_stability,
             perturb_post_buckling=False,
+            # Training-data solves are pure forward problems: an empty
+            # average_quantities list means _collect_averages computes nothing,
+            # so no effective quantities / tangents and no macro-sensitivity
+            # (adjoint) solves are done; combined with check_stability=False and
+            # saving only the displacement + stress fields.
+            average_quantities=[],
             # "P" must be in visualize_fields for the P snapshot path to allocate
             # self.P_func; "A" likewise for the rank-4 tangent.
             visualize_fields=[f for f in ("P", "A") if f in cfg.save_fields],
@@ -377,7 +383,9 @@ def generate_training_data(
         ``(F̄, v, g)`` (the buckling component is carried by ``v``, not ``w``).
     newton_options, timestepper_options : inner-solve options (sensible defaults).
     save_fields : snapshot fields to save (default ``("u_fluc", "P")`` — what the
-        micromorphic ``build_rom.py`` consumes).
+        micromorphic ``build_rom.py`` consumes). The sample solves are pure
+        forward problems: no effective quantities / tangents are evaluated and no
+        macro-sensitivity (adjoint) solves are done.
     rve_volume : exact cell volume ``|Q|`` (required for porous polygon cells).
     output_dir : root for ``modes/``, ``snapshots_pool/``, ``workers/`` and the
         summary ``.npz`` files (default ``./mm_training_output``).

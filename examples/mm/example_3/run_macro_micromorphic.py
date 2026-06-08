@@ -69,7 +69,7 @@ HERE     = os.path.dirname(os.path.abspath(__file__))
 EXAMPLE1 = os.path.join(HERE, "..", "example_1")
 RVE_MESH = os.path.join(EXAMPLE1, "rve.msh")
 ROM_DIR  = os.path.join(EXAMPLE1, "ecm")
-PHI_DIR  = os.path.join(EXAMPLE1, "output", "snapshots")
+PHI_DIR  = os.path.join(EXAMPLE1, "output", "modes", "phi")
 
 # ---------------------------------------------------------------------------
 # Logging

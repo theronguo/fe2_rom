@@ -1,4 +1,12 @@
-"""
+"""Build the micromorphic ROM (POD + ECM) for the hexagonal RVE from the
+snapshot pool written by ``generate_training_data.py``.
+
+Analogue of examples/mm/example_1/build_rom.py. The POD/ECM machinery is
+geometry-agnostic (it works on the snapshot fields, which already encode the
+hexagonal periodicity), so the only differences from example 1 are the mesh file
+and the input/output paths. The number of enrichment modes (N = 3 for the
+hexagon) is read automatically from the ``phi_*.npy`` files.
+
 Run:
     python build_rom.py
     mpirun -n 4 python build_rom.py
@@ -23,9 +31,9 @@ gdim = 2
 degree = 2
 snapshot_dir = "output_gen"
 pool_dir = f"{snapshot_dir}/snapshots_pool"
-phi_dir = f"{snapshot_dir}/modes/phi"
+phi_dir = f"{snapshot_dir}/modes/phi"          # where generate_training_data writes φ
 ecm_dir = "ecm"
-mesh_file = "rve.msh"
+mesh_file = "hexagonal_rve.msh"
 ecm_tol = 1e-3
 ratio_uP = 1.0
 ratio_P = 1e0
@@ -66,7 +74,7 @@ def load_pool_snapshots(field: str, V_space):
 
 snapshots_u = load_pool_snapshots("u_fluc", V)
 print(f"[snapshots] u_fluc: {snapshots_u.shape}")
-pod_u = POD(snapshots_u, V, inner_product="L2")
+pod_u = POD(snapshots_u, V, inner_product="H1")
 N = pod_u.n_modes(energy_tol)
 
 u_proj = snapshots_u @ pod_u._ip_matrix @ pod_u.basis[:, :N] @ pod_u.basis[:, :N].T
@@ -87,7 +95,8 @@ reconstruction_error = l2_err / l2_norm
 print(f"Max reconstruction error among snapshots: {reconstruction_error.max():.2%}, mean: {reconstruction_error.mean():.2%}")
 
 # --- Pi and Lambda density snapshots, built from phi modes ----------------
-phi_files = sorted(f for f in glob(f"{phi_dir}/phi_*.npy") if "dof_coords" not in f)
+phi_files = sorted(f for f in glob(f"{phi_dir}/phi_*.npy")
+                   if "dof_coords" not in f and "singular_values" not in f)
 phi_snapshots = np.array([np.load(f) for f in phi_files])
 N_modes = phi_snapshots.shape[0]
 phi_fns = []
@@ -145,7 +154,6 @@ pod_Pi_list, pod_Lambda_list, N_Pi_list, N_Lambda_list = [], [], [], []
 for i in range(N_modes):
     pod_Pi_i = POD(snapshots_Pi_list[i], S_Pi_i, inner_product="L2")
     pod_Lam_i = POD(snapshots_Lambda_list[i], S_Lambda_i, inner_product="L2")
-    pod_Pi_i.plot_eigenvalues()
     pod_Pi_list.append(pod_Pi_i)
     pod_Lambda_list.append(pod_Lam_i)
     N_Pi_list.append(pod_Pi_i.n_modes(energy_tol))

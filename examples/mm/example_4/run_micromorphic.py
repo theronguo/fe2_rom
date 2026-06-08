@@ -22,6 +22,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+import glob
 import logging
 import numpy as np
 from mpi4py import MPI
@@ -75,21 +76,32 @@ lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 material = NeoHookean(mu=mu_micro, lmbda=lam_micro)
 
 
-# --- 1. Extract the enrichment modes φ from RVE buckling --------------------
-res = extract_buckling_modes(
-    RVE_MESH, comm, gdim=2, material=material, degree=2,
-    lattice_vectors=LATTICE_VECTORS,
-    strategy="lba", max_strain=0.10,        # equal-biaxial compression
-    output_dir=os.path.join(output_dir, "modes"),
+# --- 1. Enrichment modes φ — load if already computed, else extract ---------
+MODES_DIR = os.path.join(output_dir, "modes")
+phi_files = sorted(
+    f for f in glob.glob(os.path.join(MODES_DIR, "phi", "phi_*.npy"))
+    if "dof_coords" not in f and "singular_values" not in f
 )
-N_MODES = res.n_modes
-logger.info("Extracted N=%d φ mode(s)", N_MODES)
+if phi_files:
+    phi_arrays = [np.load(f) for f in phi_files]
+    logger.info("Loaded %d cached φ mode(s) from %s", len(phi_arrays), MODES_DIR)
+else:
+    logger.info("No cached φ found — extracting from RVE buckling …")
+    res = extract_buckling_modes(
+        RVE_MESH, comm, gdim=2, material=material, degree=2,
+        lattice_vectors=LATTICE_VECTORS,
+        strategy="lba", max_strain=0.10,        # equal-biaxial compression
+        output_dir=MODES_DIR,
+    )
+    phi_arrays = [res.phi[:, i] for i in range(res.n_modes)]
+N_MODES = len(phi_arrays)
+logger.info("Using N=%d φ mode(s)", N_MODES)
 
 
 # --- 2. Build the micromorphic solver and load φ ----------------------------
 solver = MicroSolver(
     mesh_path=RVE_MESH, comm=comm, gdim=2, material=material, N=N_MODES, degree=2,
-    output_dir=output_dir, check_stability=True,
+    output_dir=output_dir, check_stability=False,
     visualize_fields=["u_fluc", "u_total", "F", "P"],
     newton_options={"rel_tol": 1e-8, "abs_tol": 1e-6,
                     "max_iter": 50, "div_rel_tol": 10, "switch_to_minres": True},
@@ -98,16 +110,20 @@ solver = MicroSolver(
     rve_volume=RVE_VOLUME,
     lattice_vectors=LATTICE_VECTORS,
 )
-solver.load_buckling_modes([res.phi[:, i] for i in range(N_MODES)])
+solver.load_buckling_modes(phi_arrays)
 
 
 # --- 3. Micromorphic probe — prescribe (F̄, v, g) ---------------------------
-Fbar_target = np.array([[0.95, 0.0],
-                        [0.00, 1.0]])
+Fbar_target = np.array([[0.9, 0.05],
+                        [-0.03, 1.0]])
 v_target = np.zeros(N_MODES)
 v_target[0] = 0.5
+v_target[1] = -0.2
+v_target[2] = 0.7
 g_target = np.zeros((N_MODES, 2))
 g_target[0] = (-0.1, 0.05)
+g_target[1] = (0.12, -0.03)
+g_target[2] = (0.05, 0.02)
 
 logger.info("Micromorphic solve: F̄_xx=%.3f, v[0]=%.2f, g[0]=%s …",
             Fbar_target[0, 0], v_target[0], np.round(g_target[0], 3))
