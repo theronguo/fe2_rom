@@ -24,7 +24,7 @@ def petsc_to_scipy(mat):
 
 # ── Built-in ECM algorithm (replaceable by user) ──────────────────────────────
 
-def my_ecm(A, b, tol=1e-4):
+def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0):
     """Empirical cubature method via greedy NNLS pursuit.
 
     Parameters
@@ -32,21 +32,37 @@ def my_ecm(A, b, tol=1e-4):
     A : (n_constraints, n_candidates) ndarray
     b : (n_constraints,) ndarray
     tol : relative residual tolerance
+    candidate_batch : int or None
+        If set, each greedy step scores only this many randomly-chosen remaining
+        candidates (stochastic greedy) instead of all of them — cutting the
+        per-step cost from O(n_constraints * n_candidates) to
+        O(n_constraints * candidate_batch). Usually needs a few more points to
+        reach ``tol``. None (default) reproduces the deterministic full scan.
+    seed : int
+        RNG seed for the candidate subsampling (used only when candidate_batch set).
 
     Returns
     -------
     magic_points : list of int   — selected candidate indices
     alpha        : ndarray       — non-negative weights
     """
+    print(f"A shape: {A.shape}, b shape: {b.shape}, tol: {tol}, candidate_batch: {candidate_batch}")
     candidates = list(range(A.shape[1]))
     magic_points = []
     alpha = np.array([])
     r = b.copy()
     A_norm = A / np.linalg.norm(A, axis=0)
     k, counter_nnls = 0, 0
+    rng = np.random.default_rng(seed)
     print((k, len(alpha), counter_nnls), np.linalg.norm(r) / np.linalg.norm(b))
     while np.linalg.norm(r) / np.linalg.norm(b) > tol:
-        new_idx = int(np.argmax(A_norm[:, candidates].T @ r))
+        if candidate_batch is not None and len(candidates) > candidate_batch:
+            # stochastic greedy: score only a random subset of the candidates
+            sub_pos = rng.choice(len(candidates), size=candidate_batch, replace=False)
+            cols = [candidates[p] for p in sub_pos]
+            new_idx = int(sub_pos[int(np.argmax(A_norm[:, cols].T @ r))])
+        else:
+            new_idx = int(np.argmax(A_norm[:, candidates].T @ r))
         magic_points.append(candidates.pop(new_idx))
         A_current = A[:, magic_points]
         alpha, _, _, _ = lstsq(A_current, b)
@@ -326,18 +342,21 @@ class ECM:
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 
-    def compute_magic(self, ecm_func=None, tol=1e-6):
+    def compute_magic(self, ecm_func=None, tol=1e-6, **ecm_func_kwargs):
         """Compute magic points and weights.
 
         Parameters
         ----------
-        ecm_func : callable(A, b, tol) -> (magic_points, alpha), default my_ecm
+        ecm_func : callable(A, b, tol, **kw) -> (magic_points, alpha), default my_ecm
         tol      : relative residual tolerance passed to ecm_func
+        **ecm_func_kwargs : forwarded to ecm_func — e.g. ``candidate_batch=100``
+            (and optional ``seed``) to use the stochastic-greedy subset selection
+            in :func:`my_ecm`.
         """
         if ecm_func is None:
             ecm_func = my_ecm
         A, b = self._build_matrices()
-        self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol)
+        self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
         # self.magic_points = np.array(list(range(A.shape[1])))  # --- IGNORE ---
         # self.magic_weights = np.ones_like(self.magic_points, dtype=float)  # --- IGNORE ---
 
