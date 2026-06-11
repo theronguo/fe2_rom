@@ -8,7 +8,7 @@ hyper-reduction and full-order buckling solvers included. Built on
 
 The package ships with ready-to-use solvers in 2D and 3D for:
 
-- quasi-static hyperelasticity with Newton–Raphson and arc-length continuation,
+- quasi-static hyperelasticity with Newton–Raphson,
 - post-buckling tracing through eigenvalue perturbation of unstable equilibria,
 - **first-order computational homogenization** (CH1) on periodic RVEs
   (Hill–Mandel averaging of `F̄`, `P̄`, energy `W̄`, and tangent `Ā`),
@@ -41,8 +41,6 @@ The package ships with ready-to-use solvers in 2D and 3D for:
   onto the post-buckled branch.
 - **Adaptive time stepping** with automatic step-size cutbacks on Newton
   failure.
-- **Arc-length continuation** (`CylindricalArcLength`) for tracing snap-through
-  / snap-back responses where load- or displacement-control alone fails.
 - **First-order homogenization** (`fe2_rom.ch1`) on Gmsh-generated RVEs using
   `dolfinx_mpc` periodic constraints, with a modular `AverageQuantity` /
   `TangentBlock` framework for the effective quantities (`F̄`, `P̄`, `W̄`, `Ā`)
@@ -133,7 +131,7 @@ deployments (HPC, CI, reproducible runs).
 fe2_rom/
 ├── hyperelastic_solver/    # full-order FE solver
 │   ├── solver.py           # HyperelasticStabilitySolver
-│   ├── solvers.py          # NewtonSolver, ArcLengthSolver, CylindricalArcLength, ...
+│   ├── solvers.py          # NewtonSolver, ...
 │   ├── stability.py        # SLEPc-based eigenvalue / instability analysis
 │   ├── material.py         # MaterialModel, NeoHookean
 │   ├── forms.py            # weak-form assembly, basis_tensor_ufl
@@ -165,8 +163,7 @@ examples/
 ├── hyperelastic_solver/
 │   ├── example_1/      # 3D tetragonal lattice — compressive buckling
 │   ├── example_2/      # 3D hexagonal lattice — compressive buckling
-│   ├── example_3/      # 3D extruded honeycomb beam — bending/buckling
-│   └── arc-length/     # snap-back of a deep parabolic arch
+│   └── example_3/      # 3D extruded honeycomb beam — bending/buckling
 ├── ch1/                # first-order computational homogenization
 │   ├── example_1/      # 2D perforated RVE — FOM and ROM
 │   ├── example_2/      # 3D periodic RVE — FOM and ROM
