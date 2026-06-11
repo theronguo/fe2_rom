@@ -13,7 +13,7 @@ import numpy as np
 import ufl
 from dolfinx import fem
 
-from fe2_rom.ch1.averages import AverageQuantity, _avg_scalar
+from fe2_rom.ch1.averages import AverageQuantity, _BatchAverager
 
 
 class EffectivePi(AverageQuantity):
@@ -30,16 +30,11 @@ class EffectivePi(AverageQuantity):
         self._N = len(self._phi)
 
     def setup(self, context):
-        self._forms = [
-            fem.form(ufl.inner(context.P_ufl, ufl.grad(phi)) * context.weight * context.dx)
-            for phi in self._phi
-        ]
+        integrands = [ufl.inner(context.P_ufl, ufl.grad(phi)) for phi in self._phi]
+        self._avg = _BatchAverager(integrands, context.weight, context.dx, context.mesh)
 
     def compute(self, context, adjoints=None):
-        Pi = np.zeros(self._N)
-        for i in range(self._N):
-            Pi[i] = _avg_scalar(self._forms[i], context.comm, context.vol_global)
-        return Pi
+        return self._avg.compute(context.comm, context.vol_global)
 
 
 class EffectiveLambda(AverageQuantity):
@@ -57,23 +52,13 @@ class EffectiveLambda(AverageQuantity):
         gdim = context.mesh.geometry.dim
         self._gdim = gdim
         X = ufl.SpatialCoordinate(context.mesh)
-        self._forms = [
-            [
-                fem.form(
-                    (
-                        ufl.dot(self._phi[i], context.P_ufl)[d]
-                        + X[d] * ufl.inner(context.P_ufl, ufl.grad(self._phi[i]))
-                    )
-                    * context.weight * context.dx
-                )
-                for d in range(gdim)
-            ]
-            for i in range(self._N)
+        # Flat (i, d) C-order, matching the reshape below.
+        integrands = [
+            ufl.dot(self._phi[i], context.P_ufl)[d]
+            + X[d] * ufl.inner(context.P_ufl, ufl.grad(self._phi[i]))
+            for i in range(self._N) for d in range(gdim)
         ]
+        self._avg = _BatchAverager(integrands, context.weight, context.dx, context.mesh)
 
     def compute(self, context, adjoints=None):
-        Lam = np.zeros((self._N, self._gdim))
-        for i in range(self._N):
-            for d in range(self._gdim):
-                Lam[i, d] = _avg_scalar(self._forms[i][d], context.comm, context.vol_global)
-        return Lam
+        return self._avg.compute(context.comm, context.vol_global).reshape(self._N, self._gdim)

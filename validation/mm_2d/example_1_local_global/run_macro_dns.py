@@ -52,10 +52,10 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mesh", type=str, default="dns_6x30.msh",
                    help="DNS mesh file (default dns_6x30.msh)")
-    p.add_argument("--n_steps", type=int, default=50,
-                   help="number of load steps (default 50)")
-    p.add_argument("--max_strain", type=float, default=0.07,
-                   help="final compressive u/H (default 0.07)")
+    p.add_argument("--n_steps", type=int, default=100,
+                   help="number of load steps (default 100)")
+    p.add_argument("--max_strain", type=float, default=0.05,
+                   help="final compressive u/H (default 0.05)")
     p.add_argument("--output_dir", type=str, default=None,
                    help="output directory (default ./output_dns_<wxh>)")
     p.add_argument("--no_stability", action="store_true",

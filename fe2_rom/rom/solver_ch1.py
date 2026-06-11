@@ -13,7 +13,13 @@ from fe2_rom.ch1.averages import (
     EffectiveFbar,
     EffectivePbar,
     EffectiveAbar,
+    EffectiveAbarReduced,
     resolve_average_quantities,
+)
+from fe2_rom.ch1.objectivity import (
+    objective_transform_pbar,
+    polar_derivatives,
+    symmetric_basis_tensors,
 )
 from ..hyperelastic_solver.forms import basis_tensor_ufl
 from dolfinx import io, fem, mesh as dmesh
@@ -66,6 +72,7 @@ class ReducedMicroSolver:
         timestepper_options: dict | None = None,
         averages_only_final: bool = False,
         rve_volume: float | None = None,
+        objective_reduction: bool = False,
     ) -> None:
         newton_options = newton_options if newton_options is not None else {
             "rel_tol": 1e-8, "abs_tol": 1e-6, "max_iter": 50, "div_rel_tol": 10.0,
@@ -78,6 +85,10 @@ class ReducedMicroSolver:
 
         self.comm = comm
         self.gdim = gdim
+        # Objectivity (F̄ = R U) reduction — drive the ROM with the symmetric
+        # stretch U, reconstruct lab-frame P̄/dP̄/dF̄ analytically (6/3 symmetric
+        # adjoints instead of gdim²). See fe2_rom.ch1.objectivity.
+        self._objective = bool(objective_reduction)
         self._material = material
         self._newton_options = newton_options
         self._timestepper = TimeStepper(**timestepper_options)
@@ -174,7 +185,7 @@ class ReducedMicroSolver:
             mesh=submesh, V=V_sub, dx=self._dx_sub, comm=comm,
             vol_global=self._vol,
             F_var=F_ufl, P_ufl=self._P_ufl, A_ufl=self.A_ufl,
-            W_ufl=None, u=self.u_fluc, u_total=None,
+            W_ufl=material.strain_energy(F_ufl), u=self.u_fluc, u_total=None,
             macro_vars=self.macro_vars,
             phi=getattr(self, "_phi", []),
             weight=self._omega_func,
@@ -183,7 +194,10 @@ class ReducedMicroSolver:
         if average_quantities is None:
             self._quantities = self._make_default_average_quantities()
         else:
-            self._quantities = resolve_average_quantities(average_quantities)
+            self._quantities = resolve_average_quantities(
+                average_quantities, self._string_key_factories())
+        if self._objective:
+            self._quantities = self._objectivize_quantities(self._quantities)
         for q in self._quantities:
             q.setup(self._context)
 
@@ -200,15 +214,30 @@ class ReducedMicroSolver:
         #   D[:, mi] = Φᵀ d_mi
         # Convention matches FOM ``TangentBlock`` (last two indices of A
         # contract with ∂F/∂μ).
-        self._D_forms: dict[str, list] = {}
-        for name, dF_list in self._dF_dmu_lists.items():
-            forms_mi = []
-            for dF in dF_list:
-                A_dF = ufl.as_tensor(self.A_ufl[ii, jj, kk, ll] * dF[kk, ll], (ii, jj))
-                forms_mi.append(fem.form(
-                    ufl.inner(A_dF, ufl.grad(v_te)) * self._omega_func * self._dx_sub
-                ))
-            self._D_forms[name] = forms_mi
+        # Assemble all ∂R/∂μ_k columns in ONE vector over a tensor-valued
+        # (gdim × n_total) Lagrange test space, so the rank-4 tangent A is
+        # evaluated once per cell instead of once per column. The flat column
+        # order (and the per-macro-var column slices) are recorded for the
+        # projection/solve in ``_solve_adjoints``.
+        self._adj_flat = [
+            (name, mi)
+            for name, dF_list in self._dF_dmu_lists.items()
+            for mi in range(len(dF_list))
+        ]
+        self._n_adj_total = len(self._adj_flat)
+        dF_all = [dF for dF_list in self._dF_dmu_lists.values() for dF in dF_list]
+        V_big = fem.functionspace(submesh, ("Lagrange", degree, (gdim, self._n_adj_total)))
+        v_big = ufl.TestFunction(V_big)
+        L_batched = None
+        for idx, dF in enumerate(dF_all):
+            A_dF = ufl.as_tensor(self.A_ufl[ii, jj, kk, ll] * dF[kk, ll], (ii, jj))
+            vte_idx = ufl.as_vector([v_big[a, idx] for a in range(self.gdim)])
+            term = ufl.inner(A_dF, ufl.grad(vte_idx)) * self._omega_func * self._dx_sub
+            L_batched = term if L_batched is None else L_batched + term
+        self._D_form_batched = fem.form(L_batched)
+        self._adj_cols: dict[str, list] = {}
+        for gi, (name, _mi) in enumerate(self._adj_flat):
+            self._adj_cols.setdefault(name, []).append(gi)
 
         # Storage Functions for forward sensitivities p_μ_k = Σ_p α[p,k] φ_p,
         # one V_sub Function per flat macro-var component. Passed to each
@@ -292,11 +321,40 @@ class ReducedMicroSolver:
         macro variable in ``self.macro_vars``. The factory must return a flat
         C-ordered list of length ``prod(shape(macro_var))``.
         """
-        return {"Fbar": _dF_Fbar_factory}
+        return {"Fbar": self._fbar_dF_factory}
+
+    def _fbar_dF_factory(self, context) -> list:
+        """``∂F/∂F̄`` adjoint directions. Objective reduction: the 6 (3D) / 3
+        (2D) symmetric basis tensors (sensitivities w.r.t. the stretch ``U``).
+        Otherwise: the full ``gdim²`` single-entry basis tensors."""
+        gdim = context.mesh.geometry.dim
+        if self._objective:
+            return [ufl.as_matrix(S.tolist())
+                    for S in symmetric_basis_tensors(gdim)]
+        return [basis_tensor_ufl(gdim, i, j)
+                for i in range(gdim) for j in range(gdim)]
+
+    def _objectivize_quantities(self, qs: list) -> list:
+        """Swap effective quantities for their U-frame reduced variants when the
+        objectivity reduction is active. Subclasses extend this for their own
+        ``/dF̄`` tangent blocks."""
+        out = []
+        for q in qs:
+            if type(q) is EffectiveAbar:
+                out.append(EffectiveAbarReduced())
+            else:
+                out.append(q)
+        return out
 
     def _make_default_average_quantities(self) -> list:
         """Default quantity registry for the base solver."""
         return [EffectiveFbar(), EffectivePbar(), EffectiveAbar()]
+
+    def _string_key_factories(self) -> dict:
+        """Solver-specific ``{key: zero-arg callable}`` string-key constructors,
+        extending ``STRING_KEY_MAP`` (see the micromorphic subclass for the
+        φ-bound ``"Pi"`` / ``"Lambda"`` / tangent-block keys)."""
+        return {}
 
     def _restore_trial_state(self) -> None:
         """Restore subclass macro-variable trial state to the last committed
@@ -376,16 +434,17 @@ class ReducedMicroSolver:
         J_sym = L @ Dldl @ L.T
 
         Phi = self.basis_u_sub
+        # One batched assembly of all adjoint RHS, then project: D_all = Φᵀ B.
+        # b_big lays out (node, component, column) blocked; reshaping to
+        # (n_sub_dofs, n_total) recovers each column in V_sub dof order.
+        b_big = self._assemble_fom_linear(self._D_form_batched)
+        B = b_big.reshape(Phi.shape[0], self._n_adj_total)
+        D_all = Phi.T @ B  # (N, n_total)
         for name in self._adjoint_macro_vars:
-            forms_mi = self._D_forms[name]
-            n_mu = len(forms_mi)
-            D = np.zeros((N, n_mu))
-            for mi in range(n_mu):
-                d_vec = self._assemble_fom_linear(forms_mi[mi])
-                D[:, mi] = Phi.T @ d_vec
-            alpha = np.linalg.solve(J_sym, -D)  # (N, n_mu)
+            cols = self._adj_cols[name]
+            alpha = np.linalg.solve(J_sym, -D_all[:, cols])  # (N, n_mu)
             slots = self._adjoint_funcs[name]
-            for mi in range(n_mu):
+            for mi in range(len(cols)):
                 slots[mi].x.array[:] = Phi @ alpha[:, mi]
 
     def _collect_averages(self, with_tangents: bool = True) -> dict:
@@ -470,6 +529,15 @@ class ReducedMicroSolver:
 
         Fbar_prev = self.F_bar_conv.copy()
         Fbar_target = np.asarray(Fbar, dtype=PETSc.ScalarType)
+
+        # Objectivity reduction: drive the ROM with the symmetric stretch U and
+        # remember the polar data to rotate the outputs back to the lab frame.
+        obj_R = obj_dR = obj_dU = None
+        if self._objective:
+            obj_R, obj_U, obj_dR, obj_dU = polar_derivatives(
+                np.asarray(Fbar, dtype=float))
+            Fbar_target = np.asarray(obj_U, dtype=PETSc.ScalarType)
+
         self.F_bar.value[:] = Fbar_prev
         self._restore_state(self.coeffs_conv)
         self._restore_trial_state()
@@ -516,7 +584,26 @@ class ReducedMicroSolver:
         if self._averages_only_final:
             output_quantities.append(self._collect_averages(with_tangents=True))
 
+        if self._objective and output_quantities:
+            self._objective_transform_output(
+                output_quantities[-1], obj_R, obj_dR, obj_dU)
+
         return output_quantities
+
+    # --- Objectivity reduction: U-frame → lab-frame output conversion ---------
+
+    def _objective_transform_output(self, d: dict, R, dR, dU) -> None:
+        """Convert a U-frame output dict to the lab frame *in place*
+        (``P̄ = R P̃``, ``dP̄/dF̄`` reconstructed from the U-frame reduced tangent
+        and the polar derivatives). Subclasses override
+        :meth:`_objective_transform_extra` for the micromorphic blocks."""
+        objective_transform_pbar(d, R, dR, dU)
+        self._objective_transform_extra(d, R, dR, dU)
+
+    def _objective_transform_extra(self, d: dict, R, dR, dU) -> None:
+        """Subclass hook for extra U-frame → lab-frame conversions
+        (micromorphic ``Pi``/``Lambda`` blocks). Base does nothing."""
+        return
 
     def commit(self) -> None:
         """Promote trial state to the converged restart point."""

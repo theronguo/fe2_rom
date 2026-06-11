@@ -35,7 +35,15 @@ import ufl
 from dolfinx import fem
 from petsc4py import PETSc
 
-from fe2_rom.ch1.averages import EffectiveAbar, EffectiveFbar, EffectivePbar, TangentBlock
+from fe2_rom.ch1.averages import (
+    EffectiveAbar,
+    EffectiveAbarReduced,
+    EffectiveFbar,
+    EffectivePbar,
+    TangentBlock,
+    TangentBlockReduced,
+)
+from fe2_rom.ch1.objectivity import reconstruct_dscalar_dFbar
 from fe2_rom.mm.averages import EffectiveLambda, EffectivePi
 from fe2_rom.ch1.constraints import ZeroVolumeAverage
 from fe2_rom.mm.constraints import ZeroVolumeAverageDot, ZeroVolumeAverageOuter
@@ -225,9 +233,9 @@ class MicroSolver(
 
     def _build_macro_var_rhs_forms(self, build_tangent_rhs_forms):
         gdim = self.gdim
-        dF_dFbar = [basis_tensor_ufl(gdim, i, j)
-                    for i in range(gdim) for j in range(gdim)]
-        rhs = {"Fbar": build_tangent_rhs_forms(dF_dFbar)}
+        # Objective reduction: 6 (3D) / 3 (2D) symmetric U-directions for F̄;
+        # otherwise the full gdim² basis tensors (base class helper).
+        rhs = {"Fbar": build_tangent_rhs_forms(self._fbar_adjoint_directions())}
         if self._N_modes > 0:
             dF_dv = [ufl.grad(self._phi[i]) for i in range(self._N_modes)]
             rhs["v"] = build_tangent_rhs_forms(dF_dv)
@@ -242,20 +250,23 @@ class MicroSolver(
             rhs["g"] = build_tangent_rhs_forms(dF_dg)
         return rhs
 
-    def _make_default_average_quantities(self):
+    # Keys (in default registration order) of the φ-bound micromorphic
+    # quantities offered by ``_string_key_factories``.
+    _MM_QUANTITY_KEYS = (
+        "Pi", "Lambda",
+        "dPbar_dv", "dPbar_dg",
+        "dPi_dFbar", "dPi_dv", "dPi_dg",
+        "dLambda_dFbar", "dLambda_dv", "dLambda_dg",
+    )
+
+    def _string_key_factories(self) -> dict:
+        """φ-bound micromorphic quantities, usable as string keys in
+        ``average_quantities`` (e.g. ``["Wbar", "Pbar", "Pi", "Lambda"]``)."""
         gdim = self.gdim
         N = self._N_modes
         phi = self._phi
-
-        qs: list = [
-            EffectiveFbar(),
-            EffectivePbar(),
-            EffectiveAbar(),  # name="dPbar_dFbar"
-        ]
         if N == 0:
-            return qs
-
-        qs.extend([EffectivePi(phi), EffectiveLambda(phi)])
+            return {}
 
         # Shapes used to size the tangent blocks.
         s_Fbar = (gdim, gdim)
@@ -265,44 +276,80 @@ class MicroSolver(
         s_Pi = (N,)
         s_Lambda = (N, gdim)
 
-        qs.extend([
-            # dPbar / d{v, g} — Fbar already covered by EffectiveAbar.
-            TangentBlock(
+        return {
+            "Pi": lambda: EffectivePi(phi),
+            "Lambda": lambda: EffectiveLambda(phi),
+            # dPbar / d{v, g} — Fbar is covered by EffectiveAbar ("dPbar_dFbar").
+            "dPbar_dv": lambda: TangentBlock(
                 "dPbar_dv", "v", s_Pbar, s_v,
-                _M_Pbar_factory, _dF_v_factory(phi),
-            ),
-            TangentBlock(
+                _M_Pbar_factory, _dF_v_factory(phi)),
+            "dPbar_dg": lambda: TangentBlock(
                 "dPbar_dg", "g", s_Pbar, s_g,
-                _M_Pbar_factory, _dF_g_factory(phi),
-            ),
+                _M_Pbar_factory, _dF_g_factory(phi)),
             # dPi / d{Fbar, v, g}
-            TangentBlock(
+            "dPi_dFbar": lambda: TangentBlock(
                 "dPi_dFbar", "Fbar", s_Pi, s_Fbar,
-                _M_Pi_factory(phi), _dF_Fbar_factory,
-            ),
-            TangentBlock(
+                _M_Pi_factory(phi), _dF_Fbar_factory),
+            "dPi_dv": lambda: TangentBlock(
                 "dPi_dv", "v", s_Pi, s_v,
-                _M_Pi_factory(phi), _dF_v_factory(phi),
-            ),
-            TangentBlock(
+                _M_Pi_factory(phi), _dF_v_factory(phi)),
+            "dPi_dg": lambda: TangentBlock(
                 "dPi_dg", "g", s_Pi, s_g,
-                _M_Pi_factory(phi), _dF_g_factory(phi),
-            ),
+                _M_Pi_factory(phi), _dF_g_factory(phi)),
             # dLambda / d{Fbar, v, g}
-            TangentBlock(
+            "dLambda_dFbar": lambda: TangentBlock(
                 "dLambda_dFbar", "Fbar", s_Lambda, s_Fbar,
-                _M_Lambda_factory(phi), _dF_Fbar_factory,
-            ),
-            TangentBlock(
+                _M_Lambda_factory(phi), _dF_Fbar_factory),
+            "dLambda_dv": lambda: TangentBlock(
                 "dLambda_dv", "v", s_Lambda, s_v,
-                _M_Lambda_factory(phi), _dF_v_factory(phi),
-            ),
-            TangentBlock(
+                _M_Lambda_factory(phi), _dF_v_factory(phi)),
+            "dLambda_dg": lambda: TangentBlock(
                 "dLambda_dg", "g", s_Lambda, s_g,
-                _M_Lambda_factory(phi), _dF_g_factory(phi),
-            ),
-        ])
+                _M_Lambda_factory(phi), _dF_g_factory(phi)),
+        }
+
+    def _make_default_average_quantities(self):
+        qs: list = [
+            EffectiveFbar(),
+            EffectivePbar(),
+            EffectiveAbar(),  # name="dPbar_dFbar"
+        ]
+        factories = self._string_key_factories()
+        qs.extend(factories[key]() for key in self._MM_QUANTITY_KEYS if key in factories)
         return qs
+
+    def _objectivize_quantities(self, qs: list) -> list:
+        """Swap quantities for their U-frame reduced variants (objectivity
+        reduction): ``EffectiveAbar`` → ``EffectiveAbarReduced`` and the two
+        ``…_dFbar`` tangent blocks → ``TangentBlockReduced``. The ``/dv`` and
+        ``/dg`` blocks and the forward ``Pi``/``Lambda`` are left untouched
+        (``v``, ``g`` are objective invariants); the lab-frame rotation is
+        applied in :meth:`_objective_transform_extra`."""
+        out = []
+        for q in qs:
+            if type(q) is EffectiveAbar:
+                out.append(EffectiveAbarReduced())
+            elif isinstance(q, TangentBlock) and q._macro_var == "Fbar":
+                out.append(TangentBlockReduced(q.name, q._q_shape, q._M_factory))
+            else:
+                out.append(q)
+        return out
+
+    def _objective_transform_extra(self, d: dict, R, dR, dU) -> None:
+        """Lab-frame conversion of the micromorphic blocks (co-rotational
+        ansatz ``φ → R φ``). ``Pi``, ``Lambda`` and their ``/dv``, ``/dg``
+        derivatives are rotation-invariant; only the ``P̄`` blocks rotate and the
+        ``…_dFbar`` blocks contract the U-frame reduced tangent with ``dU/dF̄``."""
+        if "dPbar_dv" in d:
+            d["dPbar_dv"] = np.einsum("im,mJn->iJn", R, np.asarray(d["dPbar_dv"]))
+        if "dPbar_dg" in d:
+            d["dPbar_dg"] = np.einsum("im,mJnd->iJnd", R, np.asarray(d["dPbar_dg"]))
+        if "dPi_dFbar" in d:
+            d["dPi_dFbar"] = reconstruct_dscalar_dFbar(
+                np.asarray(d["dPi_dFbar"]), dU)
+        if "dLambda_dFbar" in d:
+            d["dLambda_dFbar"] = reconstruct_dscalar_dFbar(
+                np.asarray(d["dLambda_dFbar"]), dU)
 
     def _restore_trial_state(self):
         if self._N_modes == 0:
