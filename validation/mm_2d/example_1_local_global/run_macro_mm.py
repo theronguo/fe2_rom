@@ -73,6 +73,8 @@ def parse_args():
                    help="output directory (default ./output_hM<...>)")
     p.add_argument("--verbose_rve", action="store_true",
                    help="show per-qp RVE Newton/stability output")
+    p.add_argument("--objective", action="store_true",
+                   help="enable the objectivity (F̄=R U) reduction in each RVE")
     return p.parse_args()
 
 
@@ -102,7 +104,8 @@ def _populate_phi(rve, vol_global=None):
 # RVE factory (one fresh FOM per macro Gauss point).
 # ---------------------------------------------------------------------------
 rve_vol=(2.0 * ELL) ** 2
-def make_rve_factory(rve_mesh_path: str, output_root: str):
+def make_rve_factory(rve_mesh_path: str, output_root: str,
+                     objective_reduction: bool = False):
     def rve_factory(rank: int, index: int):
         out_dir = os.path.join(output_root, f"rve_{rank}_{index}")
         rve = MicroSolver(
@@ -133,6 +136,8 @@ def make_rve_factory(rve_mesh_path: str, output_root: str):
             },
             averages_only_final=True,
             rve_volume=rve_vol,    # |Q| of the square periodic cell
+            # Objectivity (F̄ = R U) reduction; off by default → unchanged.
+            objective_reduction=objective_reduction,
         )
         _populate_phi(rve, rve_vol)
         return rve
@@ -203,7 +208,7 @@ def main():
         [np.array([0.0, 0.0]), np.array([W, H])],
         [Nx, Ny],
         CellType.triangle,
-        ghost_mode=GhostMode.none,
+        ghost_mode=GhostMode.shared_facet,
     )
 
     # -----------------------------------------------------------------------
@@ -212,7 +217,10 @@ def main():
     rve_factory = make_rve_factory(
         rve_mesh_path=rve_mesh,
         output_root=os.path.join(args.output_dir, "rve_workdirs"),
+        objective_reduction=args.objective,
     )
+    if args.objective:
+        log.info("Objectivity reduction ENABLED (drive RVEs with U, symmetric adjoints)")
     material = MicromorphicRVEMaterial(rve_factory, N_modes=N_MODES, gdim=2)
 
     solver = MacroMicromorphicSolver(

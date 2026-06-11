@@ -12,10 +12,16 @@ import dolfinx_mpc
 
 from fe2_rom.ch1.averages import (
     EffectiveAbar,
+    EffectiveAbarReduced,
     EffectiveFbar,
     EffectivePbar,
     HomogenizationContext,
     resolve_average_quantities,
+)
+from fe2_rom.ch1.objectivity import (
+    objective_transform_pbar,
+    polar_derivatives,
+    symmetric_basis_tensors,
 )
 from fe2_rom.ch1.constraints import LinearConstraint, ZeroVolumeAverage
 from fe2_rom.ch1.exceptions import RVEConvergenceError
@@ -72,6 +78,7 @@ class MicroSolver:
                  constraints: "list[LinearConstraint] | None" = None,
                  rve_volume: float | None = None,
                  lattice_vectors: "np.ndarray | None" = None,
+                 objective_reduction: bool = False,
                  ) -> None:
 
         newton_options = newton_options if newton_options is not None else {
@@ -99,6 +106,12 @@ class MicroSolver:
         self._mesh.topology.create_connectivity(self._mesh.topology.dim - 1, self._mesh.topology.dim)
         self.dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
         self.gdim = gdim
+
+        # Objectivity (F̄ = R U) reduction. When enabled, ``__call__`` drives the
+        # RVE with the symmetric stretch ``U`` and reconstructs the lab-frame
+        # ``P̄ = R P̃`` / ``dP̄/dF̄`` analytically, using only the 6 (3D) / 3 (2D)
+        # symmetric adjoint directions instead of ``gdim²``.
+        self._objective = bool(objective_reduction)
 
         self.mins, self.maxs = self._compute_domain_bounds()
         self.length_scale = (self.maxs - self.mins).max()
@@ -241,7 +254,11 @@ class MicroSolver:
         # ---- Average quantities ----
         if average_quantities is None:
             average_quantities = self._make_default_average_quantities()
-        self._average_quantities = resolve_average_quantities(average_quantities)
+        self._average_quantities = resolve_average_quantities(
+            average_quantities, self._string_key_factories())
+        if self._objective:
+            self._average_quantities = self._objectivize_quantities(
+                self._average_quantities)
         for q in self._average_quantities:
             q.setup(self._context)
 
@@ -283,13 +300,43 @@ class MicroSolver:
         return None
 
     def _build_macro_var_rhs_forms(self, build_tangent_rhs_forms) -> dict:
+        return {"Fbar": build_tangent_rhs_forms(self._fbar_adjoint_directions())}
+
+    def _fbar_adjoint_directions(self) -> list:
+        """UFL 2-tensor directions ``∂F/∂F̄_k`` for the ``Fbar`` adjoint set.
+
+        Objective reduction: the 6 (3D) / 3 (2D) *symmetric* basis tensors
+        (sensitivities w.r.t. the stretch ``U``). Otherwise: the full ``gdim²``
+        single-entry basis tensors.
+        """
         gdim = self.gdim
-        dF_dFbar_list = [basis_tensor_ufl(gdim, i, j)
-                         for i in range(gdim) for j in range(gdim)]
-        return {"Fbar": build_tangent_rhs_forms(dF_dFbar_list)}
+        if self._objective:
+            return [ufl.as_matrix(S.tolist())
+                    for S in symmetric_basis_tensors(gdim)]
+        return [basis_tensor_ufl(gdim, i, j)
+                for i in range(gdim) for j in range(gdim)]
+
+    def _objectivize_quantities(self, qs: list) -> list:
+        """Swap effective quantities for their U-frame reduced variants when the
+        objectivity reduction is active. Subclasses extend this for their own
+        ``/dF̄`` tangent blocks."""
+        out = []
+        for q in qs:
+            if type(q) is EffectiveAbar:
+                out.append(EffectiveAbarReduced())
+            else:
+                out.append(q)
+        return out
 
     def _make_default_average_quantities(self) -> list:
         return [EffectiveFbar(), EffectivePbar(), EffectiveAbar()]
+
+    def _string_key_factories(self) -> dict:
+        """Solver-specific ``{key: zero-arg callable}`` string-key constructors,
+        extending ``STRING_KEY_MAP`` for quantities that need solver-held state
+        (the micromorphic subclasses register their φ-bound ``"Pi"``,
+        ``"Lambda"`` and tangent-block keys here)."""
+        return {}
 
     def _build_constraint_forms(self, constraints: "list[LinearConstraint] | None") -> list:
         if constraints is None:
@@ -887,6 +934,14 @@ class MicroSolver:
 
         target_F = np.asarray(Fbar, dtype=PETSc.ScalarType)
 
+        # Objectivity reduction: drive the RVE with the symmetric stretch U
+        # (F̄ = R U) and remember the polar data to rotate the outputs back.
+        obj_R = obj_dR = obj_dU = None
+        if self._objective:
+            obj_R, obj_U, obj_dR, obj_dU = polar_derivatives(
+                np.asarray(Fbar, dtype=float))
+            target_F = np.asarray(obj_U, dtype=PETSc.ScalarType)
+
         def load_schedule(t: float) -> None:
             for i in range(target_F.shape[0]):
                 for j in range(target_F.shape[1]):
@@ -1059,7 +1114,32 @@ class MicroSolver:
         if self._averages_only_final:
             output_quantities.append(self._collect_averages())
 
+        if self._objective and output_quantities:
+            self._objective_transform_output(
+                output_quantities[-1], obj_R, obj_dR, obj_dU)
+
         return output_quantities
+
+    # ------------------------------------------------------------------
+    # Objectivity reduction: U-frame → lab-frame output conversion
+    # ------------------------------------------------------------------
+
+    def _objective_transform_output(self, d: dict, R, dR, dU) -> None:
+        """Convert a U-frame output dict to the lab frame *in place*.
+
+        ``P̄ = R P̃`` and ``dP̄/dF̄ = dR·P̃ + R·(dP̃/dU)·dU`` from the U-frame
+        reduced tangent (emitted under ``"dPbar_dFbar"`` by
+        :class:`~fe2_rom.ch1.averages.EffectiveAbarReduced`) and the analytic
+        polar derivatives. Subclasses override :meth:`_objective_transform_extra`
+        for the additional micromorphic quantities.
+        """
+        objective_transform_pbar(d, R, dR, dU)
+        self._objective_transform_extra(d, R, dR, dU)
+
+    def _objective_transform_extra(self, d: dict, R, dR, dU) -> None:
+        """Subclass hook for extra U-frame → lab-frame conversions
+        (micromorphic ``Pi``/``Lambda`` blocks). Base does nothing."""
+        return
 
     def commit(self) -> None:
         self.F_bar_conv[:] = self.F_bar.value

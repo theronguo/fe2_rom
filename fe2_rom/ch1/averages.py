@@ -20,8 +20,14 @@ from typing import Any
 
 import numpy as np
 import ufl
-from dolfinx import fem
+from dolfinx import fem, la
 from mpi4py import MPI
+
+from fe2_rom.ch1.objectivity import (
+    assemble_symmetric_tangent,
+    symmetric_basis_tensors,
+    symmetric_index_pairs,
+)
 
 
 @dataclass
@@ -51,6 +57,38 @@ def _avg_scalar(form, comm, vol_global) -> float:
     val = fem.assemble_scalar(form)
     val = comm.allreduce(val, op=MPI.SUM)
     return val / vol_global
+
+
+class _BatchAverager:
+    """Volume-average many scalar integrands in a single vector assembly.
+
+    Builds a ``DG-0`` vector space with one component per integrand and assembles
+    ``Σ_k integrand_k · v_k · weight · dx`` *once*; summing the result over cells
+    gives ``⟨integrand_k⟩ = (1/V) ∫ integrand_k · weight dx`` for every ``k``.
+
+    This replaces ``len(integrands)`` separate ``fem.assemble_scalar`` calls —
+    whose per-call Python/FFI overhead dominates the effective-tangent cost on
+    the small ECM submesh — with one ``fem.assemble_vector``. The tensor field
+    (e.g. the rank-4 tangent ``A``) is also evaluated once per cell instead of
+    once per component. Results are identical to the per-scalar path up to
+    round-off (same integrand, same quadrature, same volume).
+    """
+
+    def __init__(self, integrands, weight, dx, mesh):
+        self._n = len(integrands)
+        self._V0 = fem.functionspace(mesh, ("DG", 0, (self._n,)))
+        v = ufl.TestFunction(self._V0)
+        L = integrands[0] * v[0]
+        for k in range(1, self._n):
+            L = L + integrands[k] * v[k]
+        self._form = fem.form(L * weight * dx)
+        self._nloc = self._V0.dofmap.index_map.size_local
+
+    def compute(self, comm, vol_global):
+        b = fem.assemble_vector(self._form)
+        b.scatter_reverse(la.InsertMode.add)
+        local = b.array[: self._nloc * self._n].reshape(self._nloc, self._n).sum(axis=0)
+        return comm.allreduce(local, op=MPI.SUM) / vol_global
 
 
 class AverageQuantity(ABC):
@@ -97,18 +135,12 @@ class EffectivePbar(AverageQuantity):
     def setup(self, context):
         gdim = context.mesh.geometry.dim
         self._gdim = gdim
-        self._forms = [
-            [fem.form(context.P_ufl[i, j] * context.weight * context.dx) for j in range(gdim)]
-            for i in range(gdim)
-        ]
+        integrands = [context.P_ufl[i, j] for i in range(gdim) for j in range(gdim)]
+        self._avg = _BatchAverager(integrands, context.weight, context.dx, context.mesh)
 
     def compute(self, context, adjoints=None):
         gdim = self._gdim
-        P_eff = np.zeros((gdim, gdim))
-        for i in range(gdim):
-            for j in range(gdim):
-                P_eff[i, j] = _avg_scalar(self._forms[i][j], context.comm, context.vol_global)
-        return P_eff
+        return self._avg.compute(context.comm, context.vol_global).reshape(gdim, gdim)
 
 
 class EffectiveAbar(AverageQuantity):
@@ -132,17 +164,20 @@ class EffectiveAbar(AverageQuantity):
         self._adjoint_slots = [
             [fem.Function(context.V) for _ in range(gdim)] for _ in range(gdim)
         ]
-        self._A_avg_forms = [[[[
-            fem.form(context.A_ufl[i, j, k, l] * context.weight * context.dx)
-            for l in range(gdim)] for k in range(gdim)]
-            for j in range(gdim)] for i in range(gdim)]
-        self._A_fluc_forms = [[[[
-            fem.form(
-                ufl.inner(context.A_ufl[i, j, :, :],
-                          ufl.grad(self._adjoint_slots[k][l])) * context.weight * context.dx
-            )
-            for l in range(gdim)] for k in range(gdim)]
-            for j in range(gdim)] for i in range(gdim)]
+        A = context.A_ufl
+        # Flat (i,j,k,l) C-order, matching the reshape below.
+        avg_integrands = [
+            A[i, j, k, l]
+            for i in range(gdim) for j in range(gdim)
+            for k in range(gdim) for l in range(gdim)
+        ]
+        fluc_integrands = [
+            ufl.inner(A[i, j, :, :], ufl.grad(self._adjoint_slots[k][l]))
+            for i in range(gdim) for j in range(gdim)
+            for k in range(gdim) for l in range(gdim)
+        ]
+        self._avg_b = _BatchAverager(avg_integrands, context.weight, context.dx, context.mesh)
+        self._fluc_b = _BatchAverager(fluc_integrands, context.weight, context.dx, context.mesh)
 
     def compute(self, context, adjoints):
         gdim = self._gdim
@@ -150,20 +185,70 @@ class EffectiveAbar(AverageQuantity):
         for k in range(gdim):
             for l in range(gdim):
                 slot = self._adjoint_slots[k][l]
-                src = Fbar_adjoints[k * gdim + l]
-                slot.x.array[:] = src.x.array
+                slot.x.array[:] = Fbar_adjoints[k * gdim + l].x.array
                 slot.x.scatter_forward()
-        A_eff = np.zeros((gdim, gdim, gdim, gdim))
-        for i in range(gdim):
-            for j in range(gdim):
-                for k in range(gdim):
-                    for l in range(gdim):
-                        avg = _avg_scalar(self._A_avg_forms[i][j][k][l],
-                                          context.comm, context.vol_global)
-                        fluc = _avg_scalar(self._A_fluc_forms[i][j][k][l],
-                                           context.comm, context.vol_global)
-                        A_eff[i, j, k, l] = avg + fluc
-        return A_eff
+        avg = self._avg_b.compute(context.comm, context.vol_global)
+        fluc = self._fluc_b.compute(context.comm, context.vol_global)
+        return (avg + fluc).reshape(gdim, gdim, gdim, gdim)
+
+
+class EffectiveAbarReduced(AverageQuantity):
+    """U-frame reduced effective tangent ``Ã[i,j,p,q] = ∂P̃[i,j]/∂U[p,q]``.
+
+    Used by the objectivity (``F̄ = R U``) reduction: the solver is driven with
+    the *symmetric* stretch ``U`` and this quantity returns the tangent w.r.t.
+    ``U``, computed from only ``n_sym`` = 6 (3D) / 3 (2D) adjoint directions (the
+    symmetric basis tensors ``S^{(pq)}``) instead of ``gdim²``:
+
+        ``dP̃_S[i,j] = ⟨A[i,j,:,:] : S⟩ + ⟨A[i,j,:,:] : ∇p_S⟩``
+
+    and assembles the symmetric tangent (see
+    :func:`fe2_rom.ch1.objectivity.assemble_symmetric_tangent`). The lab-frame
+    ``dP̄/dF̄ = dR·P̃ + R·Ã·dU`` is reconstructed downstream in the solver's
+    ``__call__`` from the analytic polar derivatives. Emits the key
+    ``"dPbar_dFbar"`` (same as :class:`EffectiveAbar`) but carrying the *U-frame*
+    tangent until that reconstruction runs.
+    """
+
+    name = "dPbar_dFbar"
+    required_macro_adjoints = ["Fbar"]
+
+    def setup(self, context):
+        gdim = context.mesh.geometry.dim
+        self._gdim = gdim
+        self._S = symmetric_basis_tensors(gdim)
+        self._n_sym = len(self._S)
+        self._adjoint_slots = [fem.Function(context.V) for _ in range(self._n_sym)]
+        A = context.A_ufl
+        avg_integrands = [
+            A[i, j, k, l]
+            for i in range(gdim) for j in range(gdim)
+            for k in range(gdim) for l in range(gdim)
+        ]
+        # Flat (s, i, j) C-order, matching the reshape below.
+        fluc_integrands = [
+            ufl.inner(A[i, j, :, :], ufl.grad(self._adjoint_slots[s]))
+            for s in range(self._n_sym)
+            for i in range(gdim) for j in range(gdim)
+        ]
+        self._avg_b = _BatchAverager(avg_integrands, context.weight, context.dx, context.mesh)
+        self._fluc_b = _BatchAverager(fluc_integrands, context.weight, context.dx, context.mesh)
+
+    def compute(self, context, adjoints):
+        gdim = self._gdim
+        src = adjoints["Fbar"]
+        for s in range(self._n_sym):
+            self._adjoint_slots[s].x.array[:] = src[s].x.array
+            self._adjoint_slots[s].x.scatter_forward()
+        avgA = self._avg_b.compute(context.comm, context.vol_global).reshape(
+            gdim, gdim, gdim, gdim)
+        fluc = self._fluc_b.compute(context.comm, context.vol_global).reshape(
+            self._n_sym, gdim, gdim)
+        dP_dir = np.empty((self._n_sym, gdim, gdim), dtype=float)
+        for s in range(self._n_sym):
+            direct = np.einsum("ijkl,kl->ij", avgA, self._S[s])
+            dP_dir[s] = direct + fluc[s]
+        return assemble_symmetric_tangent(dP_dir, gdim)
 
 
 class TangentBlock(AverageQuantity):
@@ -213,13 +298,15 @@ class TangentBlock(AverageQuantity):
         i, j, k, l = ufl.indices(4)
         A = context.A_ufl
         self._adj_slots = [fem.Function(context.V) for _ in range(n_mu)]
-        self._forms = [[None] * n_mu for _ in range(n_q)]
+        # Flat (qi, mi) C-order, matching the reshape below.
+        integrands = []
         for qi in range(n_q):
             M = M_list[qi]
             for mi in range(n_mu):
                 dF_total = dF_list[mi] + ufl.grad(self._adj_slots[mi])
                 A_dF = ufl.as_tensor(A[i, j, k, l] * dF_total[k, l], (i, j))
-                self._forms[qi][mi] = fem.form(ufl.inner(M, A_dF) * context.weight * context.dx)
+                integrands.append(ufl.inner(M, A_dF))
+        self._avg = _BatchAverager(integrands, context.weight, context.dx, context.mesh)
         self._n_q = n_q
         self._n_mu = n_mu
 
@@ -228,13 +315,40 @@ class TangentBlock(AverageQuantity):
         for mi, slot in enumerate(self._adj_slots):
             slot.x.array[:] = src_list[mi].x.array
             slot.x.scatter_forward()
-        flat = np.zeros((self._n_q, self._n_mu))
-        for qi in range(self._n_q):
-            for mi in range(self._n_mu):
-                flat[qi, mi] = _avg_scalar(
-                    self._forms[qi][mi], context.comm, context.vol_global
-                )
+        flat = self._avg.compute(context.comm, context.vol_global)
         return flat.reshape(self._q_shape + self._mu_shape)
+
+
+class TangentBlockReduced(TangentBlock):
+    """U-frame reduced ``∂Q̃/∂U`` block (objectivity reduction) for a forward
+    quantity ``Q = ⟨M:P⟩`` differentiated w.r.t. ``F̄``.
+
+    Identical machinery to :class:`TangentBlock` with ``macro_var="Fbar"`` but
+    the ``∂F/∂μ`` perturbations are the ``n_sym`` = 6 (3D) / 3 (2D) *symmetric*
+    basis directions (sensitivities w.r.t. the stretch ``U``). The per-direction
+    results are assembled into a tensor symmetric in the last two (stretch)
+    indices, so this returns ``q_shape + (gdim, gdim)`` = ``∂Q̃/∂U``. The
+    lab-frame ``dQ̄/dF̄ = ∂Q̃/∂U : dU/dF̄`` is reconstructed downstream in the
+    solver's output transform.
+    """
+
+    def __init__(self, name: str, q_shape: tuple, M_factory):
+        def _sym_dF_factory(context):
+            gd = context.mesh.geometry.dim
+            return [ufl.as_matrix(S.tolist()) for S in symmetric_basis_tensors(gd)]
+        # mu_shape fixed up in setup() once gdim is known.
+        super().__init__(name, "Fbar", q_shape, (1,), M_factory, _sym_dF_factory)
+
+    def setup(self, context):
+        gdim = context.mesh.geometry.dim
+        self._gdim = gdim
+        self._mu_shape = (len(symmetric_index_pairs(gdim)),)
+        super().setup(context)
+
+    def compute(self, context, adjoints):
+        flat = super().compute(context, adjoints)         # q_shape + (n_sym,)
+        arr = np.moveaxis(flat, -1, 0)                    # (n_sym, *q_shape)
+        return assemble_symmetric_tangent(arr, self._gdim)  # (*q_shape, g, g)
 
 
 STRING_KEY_MAP: dict[str, type[AverageQuantity]] = {
@@ -250,24 +364,30 @@ STRING_KEY_MAP: dict[str, type[AverageQuantity]] = {
 }
 
 
-def resolve_average_quantities(items) -> list[AverageQuantity]:
+def resolve_average_quantities(items, extra_factories=None) -> list[AverageQuantity]:
     """Normalize a list of ``AverageQuantity`` instances or string keys into instances.
 
     Strings are mapped via ``STRING_KEY_MAP`` and instantiated with no
     arguments — only valid for quantities that have no required state.
+    ``extra_factories`` is an optional ``{key: zero-arg callable}`` map that
+    takes precedence over ``STRING_KEY_MAP`` — solvers use it to offer keys
+    for quantities that need solver-held state (e.g. the φ-bound ``"Pi"`` /
+    ``"Lambda"`` / tangent blocks of the micromorphic solvers, via
+    ``_string_key_factories()``).
     """
+    extra_factories = extra_factories or {}
     out: list[AverageQuantity] = []
     for item in items:
         if isinstance(item, AverageQuantity):
             out.append(item)
         elif isinstance(item, str):
-            cls = STRING_KEY_MAP.get(item)
-            if cls is None:
+            factory = extra_factories.get(item) or STRING_KEY_MAP.get(item)
+            if factory is None:
                 raise ValueError(
                     f"Unknown average quantity key {item!r}. "
-                    f"Valid keys: {sorted(STRING_KEY_MAP)}"
+                    f"Valid keys: {sorted(set(STRING_KEY_MAP) | set(extra_factories))}"
                 )
-            out.append(cls())
+            out.append(factory())
         else:
             raise TypeError(
                 "average_quantities entries must be AverageQuantity or str, "

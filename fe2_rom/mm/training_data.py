@@ -148,7 +148,7 @@ def _worker_task(task):
             average_quantities=[],
             # "P" must be in visualize_fields for the P snapshot path to allocate
             # self.P_func; "A" likewise for the rank-4 tangent.
-            visualize_fields=[f for f in ("P", "A") if f in cfg.save_fields],
+            visualize_fields=["u_fluc", "P", "u_total"],
             save_snapshots=list(cfg.save_fields),
             newton_options=dict(cfg.newton_options),
             timestepper_options=dict(cfg.timestepper_options),
@@ -292,19 +292,27 @@ def _representative_strain(F_lo, F_hi, gdim):
 
 
 def _draw_samples(n_samples, n_modes, gdim, F_lo, F_hi, v_max, g_max,
-                  seed, sampler):
+                  seed, sampler, symmetric=False):
     """``n_samples`` triples ``(F̄, v, g)`` space-filling over the bound box:
     each ``F̄`` component independently in ``[F_lo, F_hi]``, ``v_i ∈
     [−v_max[i], v_max[i]]``, ``g_i ∈ [−g_max[i], g_max[i]]^{gdim}``. ``v_max`` /
-    ``g_max`` are per-mode arrays of length ``n_modes``."""
-    dim_F = gdim * gdim
+    ``g_max`` are per-mode arrays of length ``n_modes``.
+
+    ``symmetric=True`` samples only the **symmetric stretch ``U``**: the LHS fills
+    the ``gdim*(gdim+1)/2`` independent components (3 in 2D, 6 in 3D), using the
+    *upper-triangle* ``[F_lo, F_hi]`` ranges, and the lower triangle is mirrored
+    so every ``F̄`` is symmetric. This is the training counterpart of the
+    objectivity reduction (drive RVEs with ``U``): the snapshots are then
+    rotation-free (``R = I``) and the sampling space drops from 9 to 6 dims."""
+    pairs = [(p, q) for p in range(gdim) for q in range(p, gdim)]
+    dim_F = len(pairs) if symmetric else gdim * gdim
     dim_v = n_modes
     dim_g = n_modes * gdim
     dim = dim_F + dim_v + dim_g
     v_max = np.asarray(v_max).reshape(n_modes)
     g_max = np.asarray(g_max).reshape(n_modes)
-    F_lo_flat = np.asarray(F_lo).ravel()
-    F_hi_flat = np.asarray(F_hi).ravel()
+    F_lo = np.asarray(F_lo)
+    F_hi = np.asarray(F_hi)
 
     if sampler in ("lhs", "sobol"):
         from scipy.stats import qmc
@@ -319,7 +327,14 @@ def _draw_samples(n_samples, n_modes, gdim, F_lo, F_hi, v_max, g_max,
     samples = []
     for row in unit:
         # F̄ component i,j mapped to its [lo, hi]; v / g centred on 0.
-        Fbar = (F_lo_flat + row[:dim_F] * (F_hi_flat - F_lo_flat)).reshape(gdim, gdim)
+        if symmetric:
+            Fbar = np.zeros((gdim, gdim))
+            for k, (p, q) in enumerate(pairs):
+                val = F_lo[p, q] + row[k] * (F_hi[p, q] - F_lo[p, q])
+                Fbar[p, q] = Fbar[q, p] = val
+        else:
+            Fbar = (F_lo.ravel() + row[:dim_F]
+                    * (F_hi.ravel() - F_lo.ravel())).reshape(gdim, gdim)
         v = (2.0 * row[dim_F:dim_F + dim_v] - 1.0) * v_max
         g = (2.0 * row[dim_F + dim_v:].reshape(n_modes, gdim) - 1.0) * g_max[:, None]
         samples.append((Fbar, v, g))
@@ -399,6 +414,7 @@ def generate_training_data(
     n_samples: int = 64,
     amplitude_factor: float = 2.0,
     sampler: str = "lhs",
+    sample_symmetric_stretch: bool = False,
     seed: int = 12345,
     n_workers: "int | None" = None,
     check_stability: bool = False,
@@ -437,6 +453,12 @@ def generate_training_data(
         ``v_max[i] = κ·max_strain·L_RVE / ⟨‖φ_i‖⟩``. Bias it high — overshoots
         just fail to converge and are discarded.
     sampler : ``"lhs"`` (default), ``"sobol"`` or ``"uniform"``.
+    sample_symmetric_stretch : if ``True``, sample only the symmetric stretch
+        ``U`` (the ``gdim*(gdim+1)/2`` independent components, lower triangle
+        mirrored) instead of the full ``F̄``. Use this to train a ROM for the
+        objectivity reduction (``objective_reduction=True`` on the online
+        solver): snapshots are rotation-free and the sampling space drops from 9
+        to 6 dims. Default ``False``.
     seed, n_workers : RNG seed and pool size (default ``cpu_count − 1``).
     check_stability : monitor RVE stability during the sample solves. Default
         ``False`` — we want the equilibrium fluctuation at the *prescribed*
@@ -497,8 +519,12 @@ def generate_training_data(
         logger.info("        → v_max=%s, g_max=%s", v_max, g_max)
 
     # 3. Space-filling samples.
+    if sample_symmetric_stretch:
+        logger.info("Sampling the SYMMETRIC stretch U only (objectivity "
+                    "reduction): %d-dim F̄ box, rotation-free snapshots.",
+                    gdim * (gdim + 1) // 2)
     samples = _draw_samples(n_samples, n_modes, gdim, F_lo, F_hi, v_max, g_max,
-                            seed, sampler)
+                            seed, sampler, symmetric=sample_symmetric_stretch)
 
     # 4. Parallel FOM solves (multiprocessing pool, COMM_SELF per worker).
     if worker_root and os.path.isdir(worker_root):

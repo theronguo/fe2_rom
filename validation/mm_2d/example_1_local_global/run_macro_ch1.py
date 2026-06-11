@@ -126,7 +126,7 @@ def main():
         [np.array([0.0, 0.0]), np.array([W, H])],
         [Nx, Ny],
         CellType.triangle,
-        ghost_mode=GhostMode.none,
+        ghost_mode=GhostMode.shared_facet,
     )
 
     # -----------------------------------------------------------------------
@@ -145,12 +145,12 @@ def main():
         rve_average_quantities=["P", "A"],  # → Pbar, dPbar_dFbar
         rve_check_stability=True,
         rve_newton_options={
-            "rel_tol": 1e-8, "abs_tol": 1e-6,
+            "rel_tol": 1e-12, "abs_tol": 1e-8,
             "max_iter": 50, "div_rel_tol": 10.0,
             "switch_to_minres": True,
         },
         rve_timestepper_options={
-            "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-5,
+            "t_end": 1.0, "dt_init": 1.0, "dt_min": 1e-7,
             "dt_max": 1.0, "good_newton_steps": 5,
         },
         rve_averages_only_final=True,

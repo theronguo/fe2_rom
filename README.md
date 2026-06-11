@@ -53,14 +53,39 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 - **Micromorphic homogenization** (`fe2_rom.mm`) — enriched ansatz with a
   user-supplied family of global modes `φᵢ` (from a linear buckling analysis
   or any other source) and extra macro variables `(v, g=∇v)`. Reports `P̄`, `Πᵢ`,
-  `Λᵢ` and the 3 × 3 grid of tangent blocks `d{P̄, Π, Λ} / d{F̄, v, g}`. The
+  `Λᵢ` and the 3 × 3 grid of tangent blocks `d{P̄, Π, Λ} / d{F̄, v, g}` — each
+  selectable by string key in `average_quantities` (e.g.
+  `["Pbar", "Pi", "Lambda", "dPi_dFbar", ...]`). The
   modes are extracted from the RVE tangent by `compute_buckling_spectrum`
   (inspect the eigenvalue spectrum — any RVE, no basis needed) and loaded into
-  the `φ` basis by `compute_linear_buckling_modes` / `load_buckling_modes`.
+  the `φ` basis by `compute_linear_buckling_modes` / `load_buckling_modes`. With
+  the objectivity reduction (`objective_reduction=True`, see below) the modes
+  are treated **co-rotationally** (`φ → R φ`), making the homogenized law
+  frame-indifferent — a departure from the fixed-mode ansatz of the reference
+  papers.
 - **Projected linear constraint enforcement** — `⟨w⟩ = 0`, `⟨w·φᵢ⟩ = 0`,
   `⟨(w·φᵢ) X⟩ = 0`, etc. are imposed through a projected Newton solve
   (`P K P x = P b`); a `corner_periodic` flag toggles between fixed-corner BCs
   and full periodic constraints.
+- **Objectivity (frame-indifference) reduction** (`fe2_rom.ch1.objectivity`) —
+  material frame indifference gives `P̄(F̄) = R · P̄(U)` for the right polar
+  decomposition `F̄ = R U`, so the homogenized response depends on `F̄` only
+  through the symmetric stretch `U` (6 independent components in 3D, 3 in 2D).
+  Passing `objective_reduction=True` to any `MicroSolver` / `ReducedMicroSolver`
+  (classical *or* micromorphic, FOM *or* ROM) drives the RVE with `U` and
+  reconstructs the lab-frame stress `P̄` and tangent `dP̄/dF̄` analytically from
+  the polar derivatives `dR/dF̄`, `dU/dF̄` — solving only 6 (3D) / 3 (2D)
+  symmetric adjoint directions instead of `gdim²`. For the micromorphic kinematics
+  this realizes a **co-rotational** formulation in which the global modes
+  co-rotate with the macroscopic rotation `R` (`φ → R φ`): `Π` and `Λ` come out
+  rotation-invariant while `P̄` and its `v`/`g` derivatives rotate by `R`. This
+  frame-indifferent treatment **differs from the fixed-mode ansatz** of Rokoš et
+  al. (2019) [\[1\]](#references) / van Bree et al. (2020)
+  [\[2\]](#references), where the modes do not co-rotate. Polar derivatives use the
+  `C = U²` square-root route, which stays non-singular for repeated stretches
+  (including `F̄ = I`). For ROM training, `sample_symmetric_stretch=True` in
+  `generate_training_data` samples only `U` — rotation-free snapshots over a
+  6-dim (3D) / 3-dim (2D) box instead of the full 9.
 - **ROM toolkit** (`fe2_rom.rom`) — POD basis construction with `H¹` / `L²`
   inner products, ECM hyper-reduction (magic-point selection), and reduced
   online solvers for both CH1 (`ReducedMicroSolver`) and micromorphic
@@ -120,6 +145,7 @@ fe2_rom/
 │   ├── macrosolver.py      # MacroSolver (FE² macro driver, FOM or ROM inner)
 │   ├── material.py         # RVEMaterial (dolfinx_materials bridge)
 │   ├── averages.py         # AverageQuantity framework: F̄, P̄, W̄, Ā, TangentBlock
+│   ├── objectivity.py      # frame-indifference reduction (F̄ = R U): drive RVE with U
 │   ├── constraints.py      # LinearConstraint, ZeroVolumeAverage
 │   ├── solvers.py          # NewtonSolverFE2 (projected, MPC-aware)
 │   └── exceptions.py       # RVEConvergenceError
@@ -310,12 +336,24 @@ Newton solve is re-driven.
 
 The micromorphic `MicroSolver` enriches the classical periodic ansatz with a
 user-supplied family of global modes `φᵢ` (extracted here from a linear
-buckling analysis of the RVE) and a set of macro variables `(v, g)`, following
+buckling analysis of the RVE) and a set of macro variables `(v, g)`, building on
 the formulation of Rokoš et al. (2019) [\[1\]](#references):
 
 ```
 u_total = (F̄ − I)·X + Σᵢ (vᵢ + X·gᵢ) φᵢ + w
 ```
+
+With the objectivity reduction enabled (`objective_reduction=True`) the modes
+**co-rotate** with the macroscopic rotation `R` from `F̄ = R U`, i.e. the
+enrichment uses `R φᵢ` in the lab frame:
+
+```
+u_total = (F̄ − I)·X + Σᵢ (vᵢ + X·gᵢ) (R φᵢ) + w
+```
+
+This co-rotational treatment makes the homogenized law frame-indifferent and
+**differs from the fixed-mode ansatz** of Rokoš et al. (2019) / van Bree et al.
+(2020) [\[2\]](#references). See feature notes above and `fe2_rom.ch1.objectivity`.
 
 ```python
 import numpy as np
@@ -330,6 +368,7 @@ solver = MicroSolver(
     degree=2,
     save_snapshots=["u_fluc", "P"],
     check_stability=True,
+    # objective_reduction=True,  # co-rotational (φ → R φ), drive RVE with U
 )
 
 # Populate φᵢ from a linear buckling analysis of the reference state
@@ -504,10 +543,11 @@ curves are directly comparable.
 
 ```bash
 cd validation/mm_2d/example_1_local_global
-python create_dns_mesh.py     # writes dns_6x30.msh (rve.msh ships with the repo)
-python run_macro_dns.py       # DNS reference
-python run_macro_ch1.py       # first-order FE² baseline
-python run_macro_mm.py        # micromorphic FE²
+python create_dns_mesh.py        # writes dns_6x30.msh (rve.msh ships with the repo)
+python run_macro_dns.py          # DNS reference
+python run_macro_ch1.py          # first-order FE² baseline
+python run_macro_mm.py           # micromorphic FE²
+python run_macro_mm.py --objective  # co-rotational (φ → R φ) objectivity reduction
 ```
 
 The reference paper is bundled at
