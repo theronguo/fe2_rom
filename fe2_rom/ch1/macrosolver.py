@@ -31,7 +31,7 @@ from petsc4py import PETSc
 import ufl
 from dolfinx import fem, mesh as dmesh
 
-from dolfinx_materials.quadrature_map import QuadratureMap
+from fe2_rom.ch1.quadrature import OwnedCellQuadratureMap as QuadratureMap
 from dolfinx_materials.solvers import NonlinearMaterialProblem
 from dolfinx_materials.utils import nonsymmetric_tensor_to_vector
 
@@ -245,6 +245,9 @@ class MacroSolver:
         # Material bridge + qmap (RVEMaterial needs gdim so its F-vector
         # convention matches the macro grad(u) — 5 entries in 2D, 9 in 3D).
         self.material = RVEMaterial(self._make_rve, gdim=gdim)
+        # OwnedCellQuadratureMap evaluates the (expensive) RVE on owned cells
+        # only and scatters flux/tangent to the ghost layer, avoiding redundant
+        # ghost-cell RVE solves under MPI (see fe2_rom.ch1.quadrature).
         self.qmap = QuadratureMap(mesh, n_qp, self.material)
 
         Id = ufl.Identity(gdim)

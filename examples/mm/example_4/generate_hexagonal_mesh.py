@@ -319,8 +319,8 @@ def parse_args():
                    help="apothem l = centre-to-edge-midpoint distance, which is "
                         "the packing spacing (the 'l' arrow in the figure). "
                         "Default 1.0.  Circumradius R = 2*l/sqrt(3).")
-    p.add_argument("--lc", type=float, default=0.02,
-                   help="target element size (default 0.02 = l/50)")
+    p.add_argument("--lc", type=float, default=0.1,
+                   help="target element size (default 0.1)")
     p.add_argument("--hole-radius", type=float, default=0.45,
                    help="radius of the (equal) circular holes (default 0.45). "
                         "Must be < l/2 or the holes overlap.")

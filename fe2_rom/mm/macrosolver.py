@@ -39,7 +39,7 @@ import basix.ufl
 import ufl
 from dolfinx import fem, mesh as dmesh
 
-from dolfinx_materials.quadrature_map import QuadratureMap
+from fe2_rom.ch1.quadrature import OwnedCellQuadratureMap as QuadratureMap
 from dolfinx_materials.solvers import NonlinearMaterialProblem
 from dolfinx_materials.utils import nonsymmetric_tensor_to_vector
 
@@ -213,6 +213,7 @@ class MacroMicromorphicSolver:
         *,
         measure_reaction: bool = False,
         reaction_direction: tuple | None = None,
+        pointwise: bool = False,
     ) -> None:
         """Register a Dirichlet BC on any component of the mixed space.
 
@@ -228,13 +229,20 @@ class MacroMicromorphicSolver:
         measure_reaction
             If True, residual is summed at the constrained DOFs after each
             accepted step.
+        pointwise
+            If True, dofs are located *geometrically* (``locate_fn`` may select
+            isolated nodes, not whole boundary facets) — used for minimal
+            rigid-body pins in uniaxial-stress setups. Incompatible with
+            ``measure_reaction``.
         """
+        if pointwise and measure_reaction:
+            raise ValueError("pointwise BCs cannot be reaction probes.")
         if isinstance(component, int):
             path = (0, component)
         else:
             path = tuple(component)
         self._bc_specs.append(
-            (path, locate_fn, value, measure_reaction, reaction_direction)
+            (path, locate_fn, value, measure_reaction, reaction_direction, pointwise)
         )
 
     # ------------------------------------------------------------------
@@ -250,14 +258,19 @@ class MacroMicromorphicSolver:
         bcs: list = []
         reaction_specs: list = []
 
-        for path, locate_fn, value, measure_reaction, direction in self._bc_specs:
+        for path, locate_fn, value, measure_reaction, direction, pointwise in self._bc_specs:
             # Traverse subspace path
             V_sub = V.sub(path[0])
             for idx in path[1:]:
                 V_sub = V_sub.sub(idx)
 
-            facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
-            dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
+            if pointwise:
+                dofs = fem.locate_dofs_geometrical(
+                    (V_sub, V_sub.collapse()[0]), locate_fn)[0]
+                facets = None
+            else:
+                facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
+                dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
             bcs.append(fem.dirichletbc(value, dofs, V_sub))
 
             if measure_reaction:

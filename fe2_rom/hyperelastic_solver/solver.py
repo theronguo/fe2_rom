@@ -80,7 +80,8 @@ class HyperelasticStabilitySolver:
     def add_bc(self, subspace_index: int, locate_fn: Callable,
                value: fem.Constant, *,
                measure_reaction: bool = False,
-               reaction_direction: tuple = (0.0, 0.0, 1.0)) -> None:
+               reaction_direction: tuple = (0.0, 0.0, 1.0),
+               pointwise: bool = False) -> None:
         """Register a Dirichlet BC component.
 
         subspace_index: 0=x, 1=y, 2=z
@@ -88,9 +89,15 @@ class HyperelasticStabilitySolver:
         value: fem.Constant whose .value is updated by the load_schedule
         measure_reaction: if True, a ReactionProbe is created for this surface
         reaction_direction: unit vector for the reaction force projection
+        pointwise: if True, dofs are located *geometrically* (``locate_fn`` may
+            select isolated nodes, not whole boundary facets) — used for minimal
+            rigid-body pins in uniaxial-stress setups. Incompatible with
+            ``measure_reaction`` (a point has no surface to integrate over).
         """
+        if pointwise and measure_reaction:
+            raise ValueError("pointwise BCs cannot be reaction probes.")
         self._bc_specs.append((subspace_index, locate_fn, value,
-                                measure_reaction, reaction_direction))
+                                measure_reaction, reaction_direction, pointwise))
 
     def setup(self, check_stability: bool = True,
               newton_options: dict | None = None,
@@ -125,10 +132,15 @@ class HyperelasticStabilitySolver:
 
         bcs = []
         probes = []
-        for subspace_index, locate_fn, value, measure_reaction, reaction_dir in self._bc_specs:
+        for subspace_index, locate_fn, value, measure_reaction, reaction_dir, pointwise in self._bc_specs:
             V_sub = V.sub(subspace_index)
-            facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
-            dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
+            if pointwise:
+                dofs = fem.locate_dofs_geometrical(
+                    (V_sub, V_sub.collapse()[0]), locate_fn)[0]
+                facets = None
+            else:
+                facets = dmesh.locate_entities_boundary(mesh, fdim, locate_fn)
+                dofs = fem.locate_dofs_topological(V_sub, fdim, facets)
             bc = fem.dirichletbc(value, dofs, V_sub)
             bcs.append(bc)
             if measure_reaction:

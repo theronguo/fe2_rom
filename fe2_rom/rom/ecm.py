@@ -428,7 +428,6 @@ class ECM:
         np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
         np.save(os.path.join(output_dir, "omega_sub.npy"),   omega_sub)
         np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
-        np.save(os.path.join(output_dir, "basis_P.npy"), self.basis_P)
 
     # ── integration test variants ─────────────────────────────────────────────
 

@@ -33,6 +33,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+import sys
 import glob
 import logging
 import re
@@ -51,7 +52,7 @@ from fe2_rom.mm.macrosolver import MacroMicromorphicSolver
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-USE_ROM    = False     # True → ReducedMicroSolver, False → FOM homogenization
+USE_ROM    = bool(int(sys.argv[1]))     # True → ReducedMicroSolver, False → FOM homogenization
 N_ELEM     = 4        # macro mesh divisions per direction
 N_QP       = 2        # quadrature degree for dolfinx_materials
 MAX_DISP   = -0.02     # total applied u_x displacement (keep small for linear regime)

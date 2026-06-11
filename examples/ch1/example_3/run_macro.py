@@ -14,6 +14,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
+import sys
 import logging
 import numpy as np
 from mpi4py import MPI
@@ -61,10 +62,11 @@ domain = dmesh.create_unit_cube(
 
 # --- RVE setup (matches legacy run_macro.py) --------------------------------
 HERE = os.path.dirname(__file__)
-RVE_MESH = os.path.join(HERE, "mesh.msh")
+RVE_MESH = os.path.join(HERE, "..", "example_2", "mesh.msh")
 # ROM artifacts are reused from examples/ch1/example_2 — run its build_rom.py
 # first if you intend to switch to full=False (ROM-backed FE²).
 ROM_DIR = os.path.join(HERE, "..", "example_2", "ecm")
+FULL = bool(int(sys.argv[1]))  # set True to run full FE² with the original RVE solver (no ROM) — much slower!
 
 E_micro, nu_micro = 3000.0, 0.30
 mu_micro  = E_micro / (2.0 * (1.0 + nu_micro))
@@ -72,10 +74,10 @@ lam_micro = E_micro * nu_micro / ((1.0 + nu_micro) * (1.0 - 2.0 * nu_micro))
 
 
 # --- Macro solver -----------------------------------------------------------
-output_dir = "output"
+output_dir = "output_full" if FULL else "output_rom"
 solver = MacroSolver(
     mesh=domain,
-    full=True,
+    full=FULL,
     n_qp=2,
     rve_mesh_path=RVE_MESH,
     rve_material=NeoHookean(mu=mu_micro, lmbda=lam_micro),

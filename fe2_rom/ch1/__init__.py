@@ -28,6 +28,7 @@ from .solvers import NewtonSolverFE2
 from .microsolver import MicroSolver
 from .material import RVEMaterial
 from .macrosolver import MacroSolver
+from .homogenization import effective_stiffness, uniaxial_moduli
 
 __all__ = [
     "AverageQuantity", "HomogenizationContext",
@@ -40,4 +41,6 @@ __all__ = [
     "MicroSolver",
     "RVEMaterial",
     "MacroSolver",
+    "effective_stiffness",
+    "uniaxial_moduli",
 ]
