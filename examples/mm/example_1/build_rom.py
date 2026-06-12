@@ -1,12 +1,7 @@
 """
 Run:
     python build_rom.py
-    mpirun -n 4 python build_rom.py
 """
-import os
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
 from glob import glob
 
 import numpy as np
@@ -176,6 +171,8 @@ ecm = ECM(
     sigma_u=np.sqrt(pod_u.eigenvalues[:N]),
     sigma_P=np.sqrt(pod_P.eigenvalues[:M]),
     ratio_uP=ratio_uP, ratio_P=ratio_P,
+    compress_uP="auto",
+    quad_degree=degree + 2,   # triangle6 geometry: over-integrate the tabulation
     kwargs=ecm_kwargs,
 )
 ecm.compute_magic(tol=ecm_tol)
@@ -183,5 +180,6 @@ ecm.compute_magic(tol=ecm_tol)
 print(f"Energy criterion ({energy_tol:.4%}): N={N} u-modes, M={M} P-modes, "
       f"N_Pi_per_mode={N_Pi_list}, N_Lambda_per_mode={N_Lambda_list}")
 print("Number of magic points:", len(ecm.magic_points))
+print(f"Verified full-system residual: {ecm.true_residual:.3e}")
 
 ecm.save_variant2(f"{ecm_dir}")
