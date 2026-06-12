@@ -335,6 +335,7 @@ class MacroMicromorphicSolver:
         reaction_logger: ReactionForceLogger | None = None,
         pert_amplitude_init: float = 1e-2,
         max_iter_per_step: int = 25,
+        max_negative_eigenvalues: int = 1,
         save_macro_history: bool = False,
         vtx_segment_per_resume: bool = False,
         rve_history_qps: list[int] | None = None,
@@ -352,6 +353,14 @@ class MacroMicromorphicSolver:
         spent across all perturb-and-retry SNES calls within a single load
         step. When exceeded, the step is rejected like a SNES failure and
         the timestepper halves dt.
+
+        ``max_negative_eigenvalues`` bounds how many negative tangent
+        eigenvalues (below ``neg_tol``) the eigenmode-perturbation path will
+        try to resolve. A single-mode perturbation cannot stabilise several
+        simultaneous buckling modes, so when the count exceeds this threshold
+        the step is rejected outright (dt halved) instead of perturbed. The
+        default ``1`` rejects as soon as two or more negative eigenvalues
+        appear; raise it to fall back to the perturb-and-retry behaviour.
         """
         if self._problem is None:
             raise RuntimeError("Call setup() before solve().")
@@ -499,6 +508,28 @@ class MacroMicromorphicSolver:
                         is_stable, eigenvalues = True, np.array([])
 
                     if not is_stable:
+                        n_neg = int(np.sum(eigenvalues < self._stability._neg_tol))
+                        if n_neg > max_negative_eigenvalues:
+                            ok = timestepper.reject()
+                            self.w.x.array[:] = self._w_last.x.array
+                            self.w.x.scatter_forward()
+                            if not ok:
+                                logger.error(
+                                    "%d negative eigenvalues (> %d) and dt=%.2e "
+                                    "at dt_min — stopping.",
+                                    n_neg, max_negative_eigenvalues,
+                                    timestepper.dt_min,
+                                )
+                                simulation_finished = True
+                            else:
+                                logger.warning(
+                                    "%d negative eigenvalues (> %d) — too many to "
+                                    "perturb a single mode; rejecting step, "
+                                    "halving dt to %.2e",
+                                    n_neg, max_negative_eigenvalues,
+                                    timestepper.dt,
+                                )
+                            break
                         if iters_in_step >= max_iter_per_step:
                             ok = timestepper.reject()
                             self.w.x.array[:] = self._w_last.x.array
