@@ -7,8 +7,7 @@ import numpy as np
 import scipy.sparse as sp
 import ufl
 import matplotlib.pyplot as plt
-from scipy.optimize import nnls
-from scipy.linalg import lstsq
+from scipy.linalg import cho_factor, cho_solve
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 import gmsh
@@ -25,8 +24,16 @@ def petsc_to_scipy(mat):
 
 # ── Built-in ECM algorithm (replaceable by user) ──────────────────────────────
 
-def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0):
-    """Empirical cubature method via greedy NNLS pursuit.
+def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
+           backward_prune=True):
+    """Empirical cubature method via greedy non-negative pursuit.
+
+    Greedy max-correlation selection with a Lawson-Hanson-style
+    non-negativity repair. The per-iteration least-squares solve uses a
+    Cholesky factorisation of the (k x k) Gram matrix of the selected
+    columns — O(n_rows·k + k³) per iteration instead of the O(n_rows·k²)
+    of a fresh SVD-based ``lstsq``, which dominates on tall constraint
+    matrices once a few hundred points are selected.
 
     Parameters
     ----------
@@ -34,13 +41,21 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0):
     b : (n_constraints,) ndarray
     tol : relative residual tolerance
     candidate_batch : int or None
-        If set, each greedy step scores only this many randomly-chosen remaining
-        candidates (stochastic greedy) instead of all of them — cutting the
-        per-step cost from O(n_constraints * n_candidates) to
-        O(n_constraints * candidate_batch). Usually needs a few more points to
-        reach ``tol``. None (default) reproduces the deterministic full scan.
+        If set, each greedy step scores only this many randomly-chosen
+        remaining candidates (stochastic greedy). The deterministic full
+        scan (None, default) picks better points and is affordable unless
+        n_constraints*n_candidates is very large.
     seed : int
         RNG seed for the candidate subsampling (used only when candidate_batch set).
+    max_points : int or None
+        Optional cap on the number of selected points (stop early).
+    backward_prune : bool
+        After convergence, repeatedly try to remove selected points that
+        later additions have made redundant: drop the smallest-weight point,
+        re-solve, and keep the removal while the residual stays below tol
+        (greedy never revisits a point once added, so the final set usually
+        contains some). Costs one Gram re-factorisation per attempted
+        removal. Default True.
 
     Returns
     -------
@@ -48,36 +63,165 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0):
     alpha        : ndarray       — non-negative weights
     """
     print(f"A shape: {A.shape}, b shape: {b.shape}, tol: {tol}, candidate_batch: {candidate_batch}")
-    candidates = list(range(A.shape[1]))
-    magic_points = []
-    alpha = np.array([])
-    r = b.copy()
-    A_norm = A / np.linalg.norm(A, axis=0)
-    k, counter_nnls = 0, 0
+    n_rows, n_cand = A.shape
     rng = np.random.default_rng(seed)
-    print((k, len(alpha), counter_nnls), np.linalg.norm(r) / np.linalg.norm(b))
-    while np.linalg.norm(r) / np.linalg.norm(b) > tol:
-        if candidate_batch is not None and len(candidates) > candidate_batch:
-            # stochastic greedy: score only a random subset of the candidates
-            sub_pos = rng.choice(len(candidates), size=candidate_batch, replace=False)
-            cols = [candidates[p] for p in sub_pos]
-            new_idx = int(sub_pos[int(np.argmax(A_norm[:, cols].T @ r))])
+    col_norms = np.linalg.norm(A, axis=0)
+    col_norms[col_norms == 0.0] = 1.0
+    A_norm = A / col_norms
+    b_norm = np.linalg.norm(b)
+
+    cap = 256                                  # growing buffers for the selected set
+    AS = np.empty((n_rows, cap))               # selected columns of A
+    G = np.empty((cap, cap))                   # Gram matrix AS^T AS
+    beta = np.empty(cap)                       # AS^T b
+    S = []                                     # selected candidate indices
+    in_S = np.zeros(n_cand, dtype=bool)
+    alpha = np.empty(0)
+    r = b.copy()
+    k_iter, n_repair = 0, 0
+
+    def grow():
+        nonlocal cap, AS, G, beta
+        AS = np.concatenate([AS, np.empty((n_rows, cap))], axis=1)
+        G_new = np.empty((2 * cap, 2 * cap))
+        G_new[:cap, :cap] = G
+        G = G_new
+        beta = np.concatenate([beta, np.empty(cap)])
+        cap *= 2
+
+    def solve(k):
+        """Solve G[:k,:k] x = beta[:k]; jitter the diagonal if near-singular."""
+        Gk = G[:k, :k]
+        jitter = 0.0
+        while True:
+            try:
+                return cho_solve(cho_factor(Gk + jitter * np.eye(k), lower=True), beta[:k])
+            except np.linalg.LinAlgError:
+                jitter = 1e-14 * np.trace(Gk) / k if jitter == 0.0 else 100.0 * jitter
+                if jitter > np.trace(Gk):
+                    raise
+
+    def drop(keep):
+        """Remove the selected entries with keep[pos] == False, compacting buffers."""
+        kept = np.flatnonzero(keep)
+        for pos in np.flatnonzero(~keep)[::-1]:
+            idx = S.pop(int(pos))
+            in_S[idx] = False
+        m = kept.size
+        AS[:, :m] = AS[:, kept]
+        G[:m, :m] = G[np.ix_(kept, kept)]
+        beta[:m] = beta[kept]
+        return m
+
+    print((k_iter, len(alpha), n_repair), 1.0)
+    while np.linalg.norm(r) / b_norm > tol:
+        if max_points is not None and len(S) >= max_points:
+            print(f"ECM: max_points={max_points} reached, stopping early")
+            break
+        # 1. greedy selection by correlation with the residual
+        if candidate_batch is not None and n_cand - len(S) > candidate_batch:
+            cols = rng.choice(np.flatnonzero(~in_S), size=candidate_batch, replace=False)
+            new = int(cols[np.argmax(A_norm[:, cols].T @ r)])
         else:
-            new_idx = int(np.argmax(A_norm[:, candidates].T @ r))
-        magic_points.append(candidates.pop(new_idx))
-        A_current = A[:, magic_points]
-        alpha, _, _, _ = lstsq(A_current, b)
-        if np.any(alpha < 0):
-            alpha = nnls(A_current, b, maxiter=1000000)[0]
-            counter_nnls += 1
-            for idx in np.where(alpha < 1e-8)[0][::-1]:
-                candidates.append(magic_points.pop(idx))
-            A_current = A[:, magic_points]
-            alpha, _, _, _ = lstsq(A_current, b)
-        r = b - A_current @ alpha
+            scores = A_norm.T @ r
+            scores[in_S] = -np.inf
+            new = int(np.argmax(scores))
+            if scores[new] <= 0.0:
+                print("ECM: no candidate correlates with the residual, stopping early")
+                break
+        # 2. append column to the Gram system
+        k = len(S)
+        if k + 1 > cap:
+            grow()
+        a = A[:, new]
+        AS[:, k] = a
+        g = AS[:, :k].T @ a
+        G[:k, k] = g
+        G[k, :k] = g
+        G[k, k] = a @ a
+        beta[k] = a @ b
+        S.append(new)
+        in_S[new] = True
         k += 1
-        print((k, len(alpha), counter_nnls), np.linalg.norm(r) / np.linalg.norm(b))
-    return magic_points, alpha
+        # 3. solve, repairing negative weights (Lawson-Hanson inner loop)
+        alpha_feas = np.concatenate([alpha, [0.0]])
+        alpha_new = solve(k)
+        while np.any(alpha_new < 0.0):
+            n_repair += 1
+            neg = alpha_new < 0.0
+            t = alpha_feas[neg] / (alpha_feas[neg] - alpha_new[neg])
+            theta = min(float(t.min()), 1.0)
+            alpha_feas = alpha_feas + theta * (alpha_new - alpha_feas)
+            keep = alpha_feas > 1e-12 * alpha_feas.max()
+            if keep.all():
+                keep[int(np.argmin(alpha_feas))] = False
+            k = drop(keep)
+            alpha_feas = np.clip(alpha_feas[keep], 0.0, None)
+            alpha_new = solve(k)
+        alpha = alpha_new
+        r = b - AS[:, :k] @ alpha
+        k_iter += 1
+        print((k_iter, len(alpha), n_repair), np.linalg.norm(r) / b_norm)
+
+    # ── backward pruning: drop points made redundant by later additions ─────
+    # The greedy never revisits a point once added. Removing column j from an
+    # unconstrained least-squares fit increases the squared residual by
+    # alpha_j² / [G⁻¹]_jj; points whose predicted residual stays below tol are
+    # removal candidates. Each removal is verified on trial copies (including
+    # the non-negativity repair) before being committed.
+    if backward_prune and len(S) > 1:
+        n_removed = 0
+        while len(S) > 1:
+            k = len(S)
+            try:
+                cf = cho_factor(G[:k, :k], lower=True)
+            except np.linalg.LinAlgError:
+                break
+            Ginv_diag = np.abs(np.diagonal(cho_solve(cf, np.eye(k))))
+            sq_inc = alpha ** 2 / Ginv_diag
+            pos = int(np.argmin(sq_inc))
+            if np.linalg.norm(r) ** 2 + sq_inc[pos] > (tol * b_norm) ** 2:
+                break
+            # trial removal on copies, with Lawson-Hanson repair
+            idx = np.delete(np.arange(k), pos)
+            G_t = G[np.ix_(idx, idx)]
+            beta_t = beta[idx]
+            alpha_feas = np.clip(alpha[idx], 0.0, None)
+            alpha_t = None
+            while True:
+                try:
+                    alpha_t = cho_solve(cho_factor(G_t, lower=True), beta_t)
+                except np.linalg.LinAlgError:
+                    alpha_t = None
+                    break
+                if np.all(alpha_t >= 0.0):
+                    break
+                neg = alpha_t < 0.0
+                t = alpha_feas[neg] / (alpha_feas[neg] - alpha_t[neg])
+                theta = min(float(t.min()), 1.0)
+                alpha_feas = alpha_feas + theta * (alpha_t - alpha_feas)
+                keep_t = alpha_feas > 1e-12 * alpha_feas.max()
+                if keep_t.all():
+                    keep_t[int(np.argmin(alpha_feas))] = False
+                idx = idx[keep_t]
+                G_t = G_t[np.ix_(keep_t, keep_t)]
+                beta_t = beta_t[keep_t]
+                alpha_feas = np.clip(alpha_feas[keep_t], 0.0, None)
+            if alpha_t is None:
+                break
+            r_t = b - AS[:, idx] @ alpha_t
+            if np.linalg.norm(r_t) / b_norm > tol:
+                break
+            keep = np.zeros(k, dtype=bool)
+            keep[idx] = True
+            drop(keep)
+            n_removed += k - len(S)
+            alpha = alpha_t
+            r = r_t
+        if n_removed:
+            print(f"backward prune: removed {n_removed} -> {len(S)} points, "
+                  f"residual {np.linalg.norm(r) / b_norm:.3e}")
+    return S, alpha
 
 
 # ── Transfer utilities ────────────────────────────────────────────────────────
@@ -238,6 +382,50 @@ class ECM:
     include_P_int : bool — if False, drop the ∫P dX constraint block entirely
                 (keep only the P·∇u block, any extra blocks, and the volume row).
                 Default True.
+    row_weight_tol : float or None — if set, drop (and skip assembling) every
+                constraint row whose normalised singular-value weight falls
+                below this value: su[i]*sp[j] for the P·∇u block, sp[j] for the
+                ∫P block, sx[j] for extras (the block `ratio` is not included).
+                Rows with weight below the ECM tolerance are numerically
+                invisible to the greedy selection, but a more effective and
+                self-consistent choice is the POD truncation level itself
+                (e.g. ~1e-3 when the smallest kept σ/σ₀ is ~1e-3): mode pairs
+                whose combined weight is below what POD already discarded.
+                Saves assembly time, constraint-matrix memory, and ECM
+                iteration cost, all linear in the rows dropped. None (default)
+                keeps all rows. In the compressed path (`compress_uP`) the uP
+                rows are instead pruned by relative row norm with the same
+                threshold.
+    compress_uP : int, float, "auto" or None — if set, build the P·∇u block by
+                structured data compression (Liljegren-Sailer) instead of
+                assembling all N*M rows: the σ-weighted quadrature-point data
+                of the P modes is SVD-truncated to K_t "training stress
+                modes" in the metric induced by the ∇u modes, and the block
+                is materialised as N*K_t rows by tensor contraction — no
+                per-pair PETSc assembly. int = K_t directly — the
+                recommended form, using the paper's heuristic K_t ≈ expected
+                number of magic points + a small margin. float = relative
+                compression tolerance, K_t chosen as the smallest rank with
+                κ ≤ compress_uP·‖R·Ĝ‖_F; note this tail is bounded below by
+                roughly min(σ_P)/σ_P[0], so tolerances below that select
+                full rank (no compression) — 1e-2 is realistic, 1e-4 usually
+                is not. "auto" = fully automatic (requires compute_magic):
+                K_t starts at the smallest rank with relative spectrum tail
+                κ/‖R·Ĝ‖_F ≤ tol, the trained rule is verified against the
+                exact full-system residual (evaluated only at the selected
+                cells, so it stays cheap), and K_t is doubled and retrained
+                if the verification fails. The verified residual is stored
+                in ``self.true_residual``. The
+                compression error κ is stored in ``self.kappa_uP``
+                (cell-aggregated bound in ``self.kappa_uP_cells``); the true
+                training residual obeys η ≤ η_t + κ_cells·‖ω − ω_full‖.
+                None (default) keeps the exact per-pair assembly.
+    quad_degree : int or None — quadrature degree used by the compressed
+                path to tabulate the bases (default (deg_u − 1) + deg_P,
+                exact on affine cells; raise it for curved geometry, e.g.
+                +2 on triangle6 meshes).
+    cell_chunk : int — cells per tabulation chunk in the compressed path;
+                bounds peak memory (default 4096).
     kwargs    : dict or None — extra volume-integral-only constraint blocks,
                 ``name -> {"basis": (n_dofs_X, M_x) ndarray, "space":
                 FunctionSpace, "sigma": optional (M_x,) singular values,
@@ -288,6 +476,12 @@ class ECM:
 
         ECM(None, None, None, None, include_uP=False, include_P_int=False,
             kwargs={"W": {"basis": basis_W, "space": SW}})
+
+    Large problems — structured compression of the P·∇u block
+    (no per-pair assembly, N*K_t instead of N*M rows)::
+
+        ECM(basis_u, basis_P, V, S, sigma_u=su, sigma_P=sp,
+            compress_uP=1e-4)        # or an explicit rank: compress_uP=30
     """
 
     def __init__(self, basis_u, basis_P, V, S,
@@ -296,6 +490,10 @@ class ECM:
                  ratio_uP=1.0, ratio_P=1.0,
                  include_uP: bool = True,
                  include_P_int: bool = True,
+                 row_weight_tol: float | None = None,
+                 compress_uP: int | float | None = None,
+                 quad_degree: int | None = None,
+                 cell_chunk: int = 4096,
                  kwargs: dict | None = None):
         if include_uP:
             assert basis_u is not None and V is not None, \
@@ -323,6 +521,19 @@ class ECM:
         self.ratio_P = ratio_P
         self._include_uP = include_uP
         self._include_P_int = include_P_int
+        self.row_weight_tol = row_weight_tol
+        self.compress_uP = compress_uP
+        self.quad_degree = quad_degree
+        self.cell_chunk = cell_chunk
+        self.kappa_uP = None
+        self.kappa_uP_cells = None
+        self.true_residual = None
+        self._auto_tol = None        # set by compute_magic when compress_uP == "auto"
+        self._auto_K_t_floor = 1     # raised on auto-retry
+        self._K_t_used = None
+        self._n_uP_rows = 0
+        self._uP_tab = None          # quadrature tabulation cache (compressed path)
+        self._b_uP_full = None       # exact full-system uP rhs (compressed path)
         # Extra volume-integral-only bases.  Each entry is
         #   name -> {"basis", "space", "sigma" (optional), "ratio" (optional)}
         self.extras: dict = {}
@@ -361,42 +572,62 @@ class ECM:
         """Assemble the constraint matrix A and rhs b.
 
         Rows: N*M (if include_uP) + M*n_P_components (if include_P_int)
-        + the extra blocks from `kwargs` + 1 volume row.
+        + the extra blocks from `kwargs` + 1 volume row. If `row_weight_tol`
+        is set, rows whose normalised singular-value weight falls below it are
+        pruned before assembly (their forms are never assembled).
         """
         dofs_Q0 = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
         dx = ufl.dx(domain=self.mesh)
         cell_avg = ufl.TestFunction(self._Q0)
 
         A_blocks, b_blocks = [], []
+        theta = 0.0 if self.row_weight_tol is None else self.row_weight_tol
 
-        if self._include_uP:
-            basis_func_u = fem.Function(self.V)
-            basis_func_P = fem.Function(self.S)
-            mat = np.zeros((self.N, self.M, dofs_Q0))
-            form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
-            for i in range(self.N):
-                basis_func_u.x.array[:] = self.basis_u[:, i]
-                for j in range(self.M):
-                    basis_func_P.x.array[:] = self.basis_P[:, j]
-                    mat[i, j, :] = petsc.assemble_vector(
-                        form
-                    ).array.copy()
-            mat_int = mat.sum(axis=2)
-
+        self._n_uP_rows = 0
+        if self._include_uP and self.compress_uP is not None:
+            A_uP = self._compressed_uP_block()
+            A_blocks.append(A_uP)
+            b_blocks.append(A_uP.sum(axis=1))
+            self._n_uP_rows = A_uP.shape[0]
+        elif self._include_uP:
             # Per-row weights from normalised singular values
             # sigma_u[0] and sigma_P[0] are the reference (largest) values
             su = self.sigma_u / self.sigma_u[0]   # shape (N,), su[0] == 1
             sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
+            w_rel = np.outer(su, sp)              # (N, M), w_rel[0, 0] == 1
+            keep = w_rel >= theta
+            if self.row_weight_tol is not None:
+                print(f"uP block: keeping {keep.sum()}/{keep.size} rows "
+                      f"(row_weight_tol={theta:g})")
 
-            # mat block: w[i,j] = ratio_uP * su[i] * sp[j]
-            w_uP = self.ratio_uP * np.outer(su, sp)          # (N, M)
-            mat_w     = mat     * w_uP[:, :, np.newaxis]     # (N, M, dofs_Q0)
-            mat_int_w = mat_int * w_uP                        # (N, M)
-
-            A_blocks.append(mat_w.reshape(-1, dofs_Q0))
-            b_blocks.append(mat_int_w.reshape(-1))
+            basis_func_u = fem.Function(self.V)
+            basis_func_P = fem.Function(self.S)
+            form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
+            rows, w_rows = [], []
+            for i in range(self.N):
+                if not keep[i].any():
+                    continue
+                basis_func_u.x.array[:] = self.basis_u[:, i]
+                for j in range(self.M):
+                    if not keep[i, j]:
+                        continue
+                    basis_func_P.x.array[:] = self.basis_P[:, j]
+                    rows.append(petsc.assemble_vector(form).array.copy())
+                    # row weight: ratio_uP * su[i] * sp[j]
+                    w_rows.append(self.ratio_uP * w_rel[i, j])
+            if rows:
+                mat = np.asarray(rows) * np.asarray(w_rows)[:, np.newaxis]
+                A_blocks.append(mat)
+                b_blocks.append(mat.sum(axis=1))
+                self._n_uP_rows = mat.shape[0]
 
         if self._include_P_int:
+            sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
+            keep_P = sp >= theta
+            if self.row_weight_tol is not None:
+                print(f"P-int block: keeping {keep_P.sum()}/{keep_P.size} modes "
+                      f"(row_weight_tol={theta:g})")
+
             basis_func_P = fem.Function(self.S)
             # Pre-compile one form per flat component of P for ∫P_j_c φ_k dX
             p_shape = basis_func_P.ufl_shape
@@ -409,32 +640,31 @@ class ECM:
                 else:
                     comp = basis_func_P[idx]
                 p_component_forms.append(fem.form(comp * cell_avg * dx))
-            n_P_components = len(p_component_forms)
 
-            mat_P = np.zeros((self.M, n_P_components, dofs_Q0))
-            for j in range(self.M):
+            rows, w_rows = [], []
+            for j in np.flatnonzero(keep_P):
                 basis_func_P.x.array[:] = self.basis_P[:, j]
-                for c, form_Pc in enumerate(p_component_forms):
-                    mat_P[j, c, :] = petsc.assemble_vector(form_Pc).array.copy()
-            mat_P_int = mat_P.sum(axis=2)
-
-            # mat_P block: w[j] = ratio_P * sp[j]  (same for all components c)
-            sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
-            w_P     = self.ratio_P * sp                       # (M,)
-            mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
-            mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
-
-            A_blocks.append(mat_P_w.reshape(-1, dofs_Q0))
-            b_blocks.append(mat_P_int_w.reshape(-1))
+                for form_Pc in p_component_forms:
+                    rows.append(petsc.assemble_vector(form_Pc).array.copy())
+                    # row weight: ratio_P * sp[j] (same for all components)
+                    w_rows.append(self.ratio_P * sp[j])
+            if rows:
+                mat_P = np.asarray(rows) * np.asarray(w_rows)[:, np.newaxis]
+                A_blocks.append(mat_P)
+                b_blocks.append(mat_P.sum(axis=1))
 
         # Extra volume-integral-only blocks from `kwargs`.
-        for entry in self.extras.values():
+        for name, entry in self.extras.items():
             basis = entry["basis"]
             space = entry["space"]
             M_x = entry["M"]
             sigma = entry["sigma"]
             ratio = entry["ratio"]
             sx = sigma / sigma[0]                          # (M_x,), sx[0] == 1
+            keep_x = sx >= theta
+            if self.row_weight_tol is not None:
+                print(f"{name} block: keeping {keep_x.sum()}/{keep_x.size} modes "
+                      f"(row_weight_tol={theta:g})")
 
             basis_func_x = fem.Function(space)
             x_shape = basis_func_x.ufl_shape
@@ -447,46 +677,259 @@ class ECM:
                 else:
                     comp = basis_func_x[idx]
                 x_component_forms.append(fem.form(comp * cell_avg * dx))
-            n_x_components = len(x_component_forms)
 
-            mat_x = np.zeros((M_x, n_x_components, dofs_Q0))
-            for j in range(M_x):
+            rows, w_rows = [], []
+            for j in np.flatnonzero(keep_x):
                 basis_func_x.x.array[:] = basis[:, j]
-                for c, form_xc in enumerate(x_component_forms):
-                    mat_x[j, c, :] = petsc.assemble_vector(form_xc).array.copy()
-            mat_x_int = mat_x.sum(axis=2)
-
-            w_x         = ratio * sx                                          # (M_x,)
-            mat_x_w     = mat_x     * w_x[:, np.newaxis, np.newaxis]
-            mat_x_int_w = mat_x_int * w_x[:, np.newaxis]
-            A_blocks.append(mat_x_w.reshape(-1, dofs_Q0))
-            b_blocks.append(mat_x_int_w.reshape(-1))
+                for form_xc in x_component_forms:
+                    rows.append(petsc.assemble_vector(form_xc).array.copy())
+                    # row weight: ratio * sx[j] (same for all components)
+                    w_rows.append(ratio * sx[j])
+            if rows:
+                mat_x = np.asarray(rows) * np.asarray(w_rows)[:, np.newaxis]
+                A_blocks.append(mat_x)
+                b_blocks.append(mat_x.sum(axis=1))
 
         A = np.vstack(A_blocks + [self._weights])
         b = np.concatenate(b_blocks + [[self._volume]])
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 
-    def compute_magic(self, ecm_func=None, tol=1e-6, **ecm_func_kwargs):
+    def _compressed_uP_block(self):
+        """Build the P·∇u block via structured data compression.
+
+        Implements the preprocessing of Liljegren-Sailer (structured
+        compression of empirical-quadrature training data): instead of
+        assembling all N*M rows A[(i,j), m] = w[i,j] ∫_{Ω_m} P_j : ∇u_i dX,
+        the σ_P-weighted quadrature-point data Ĝ of the P modes is compressed
+        by a truncated SVD in the metric R² (diagonal, from the analytic QR
+        of the structured factor: R²_{(q,c)} = ratio_uP² W_q² Σ_i (su_i
+        [∇u_i]_c(ξ_q))²). The truncated right singular vectors define K_t
+        "training stress modes" Ĝ·V₁, and the block is materialised as N*K_t
+        rows by tensor contraction over quadrature points — the bases are
+        tabulated with `fem.Expression`, no per-pair PETSc assembly.
+
+        Stores the Frobenius compression error ``self.kappa_uP`` =
+        √(Σ_{i>K_t} σ_i²) and the cell-aggregated bound
+        ``self.kappa_uP_cells`` = √(n_q·n_comp)·κ (the constraint matrices
+        before/after compression differ by at most this in Frobenius norm).
+        """
+        import basix
+        import basix.ufl
+
+        cell_name = self.mesh.topology.cell_type.name
+        deg_u = self.V.ufl_element().degree
+        deg_P = self.S.ufl_element().degree
+        qdeg = self.quad_degree if self.quad_degree is not None else (deg_u - 1) + deg_P
+        pts, wts = basix.make_quadrature(getattr(basix.CellType, cell_name), qdeg)
+        n_q = wts.size
+        n_cells = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
+
+        # Scaled quadrature weights W[cell, q] = w_q |detJ(ξ_q)|, tabulated by
+        # assembling per-point indicator functions in a matching quadrature space
+        q_el = basix.ufl.quadrature_element(cell_name, value_shape=(),
+                                            scheme="default", degree=qdeg)
+        Q = fem.functionspace(self.mesh, q_el)
+        ind = fem.Function(Q)
+        cell_avg = ufl.TestFunction(self._Q0)
+        dxq = ufl.dx(domain=self.mesh,
+                     metadata={"quadrature_scheme": "default", "quadrature_degree": qdeg})
+        form_w = fem.form(ind * cell_avg * dxq)
+        W = np.empty((n_cells, n_q))
+        for q in range(n_q):
+            ind.x.array[:] = 0.0
+            ind.x.array[q::n_q] = 1.0
+            W[:, q] = petsc.assemble_vector(form_w).array
+        assert np.isclose(W.sum(), self._volume), "quadrature weight tabulation failed"
+
+        su = self.sigma_u / self.sigma_u[0]
+        sp = self.sigma_P / self.sigma_P[0]
+
+        basis_func_u = fem.Function(self.V)
+        basis_func_P = fem.Function(self.S)
+        expr_gu = fem.Expression(ufl.grad(basis_func_u), pts)
+        expr_P = fem.Expression(basis_func_P, pts)
+        n_comp = int(np.prod(basis_func_P.ufl_shape))
+        assert n_comp == int(np.prod(ufl.grad(basis_func_u).ufl_shape))
+
+        chunks = [np.arange(s, min(s + self.cell_chunk, n_cells), dtype=np.int32)
+                  for s in range(0, n_cells, self.cell_chunk)]
+
+        def tab(expr, func, basis, n_modes, cells_):
+            out = np.empty((n_modes, cells_.size, n_q, n_comp))
+            for k in range(n_modes):
+                func.x.array[:] = basis[:, k]
+                out[k] = expr.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+            return out
+
+        # Pass 1: Gram matrix H = Ĝᵀ R² Ĝ of the σ_P-weighted P data
+        # (BLAS-friendly: H += B Bᵀ with B = Ĝ·R per cell chunk), plus the
+        # exact full-system rhs b_uP[(i,j)] = w[i,j] ∫_Ω P_j : ∇u_i dX
+        H = np.zeros((self.M, self.M))
+        B_int = np.zeros((self.N, self.M))
+        for cells_ in tqdm(chunks, desc="uP compression: Gram"):
+            Uc = tab(expr_gu, basis_func_u, self.basis_u, self.N, cells_)
+            r2 = (self.ratio_uP ** 2) * (W[cells_] ** 2)[:, :, None] \
+                 * np.tensordot(su ** 2, Uc ** 2, axes=(0, 0))
+            Gc = tab(expr_P, basis_func_P, self.basis_P, self.M, cells_) \
+                 * sp[:, None, None, None]
+            B = (Gc * np.sqrt(r2)).reshape(self.M, -1)
+            H += B @ B.T
+            Uw = (Uc * W[cells_][None, :, :, None]).reshape(self.N, -1)
+            B_int += Uw @ Gc.reshape(self.M, -1).T
+        self._b_uP_full = (self.ratio_uP * su[:, None] * B_int).ravel()
+        self._uP_tab = {"pts": pts, "W": W, "n_q": n_q, "n_comp": n_comp,
+                        "su": su, "sp": sp}
+
+        evals, evecs = np.linalg.eigh(H)
+        order = np.argsort(evals)[::-1]
+        evals = np.clip(evals[order], 0.0, None)
+        evecs = evecs[:, order]
+        tails = np.sqrt(np.cumsum(evals[::-1])[::-1])   # tails[k] = ‖σ_{≥k}‖
+
+        if isinstance(self.compress_uP, str):
+            assert self.compress_uP == "auto", f"unknown compress_uP={self.compress_uP!r}"
+            assert self._auto_tol is not None, \
+                "compress_uP='auto' picks K_t from the ECM tolerance — use compute_magic()"
+            # deliberately small prior, capped even when the spectrum tail is
+            # flat: the verify-and-grow loop in compute_magic corrects
+            # underestimates (an overestimate would never be corrected down)
+            target = self._auto_tol * tails[0]
+            K_t = int(np.searchsorted(-tails, -target))
+            K_t = min(K_t, max(16, self.M // 8))
+            K_t = max(min(max(K_t, self._auto_K_t_floor), self.M), 1)
+        elif isinstance(self.compress_uP, (int, np.integer)):
+            K_t = int(min(self.compress_uP, self.M))
+        else:
+            rel_tol = float(self.compress_uP)
+            K_t = int(np.searchsorted(-tails, -rel_tol * tails[0]))
+            K_t = max(min(K_t, self.M), 1)
+        self._K_t_used = K_t
+        self.kappa_uP = float(np.sqrt(evals[K_t:].sum()))
+        self.kappa_uP_cells = self.kappa_uP * np.sqrt(n_q * n_comp)
+        print(f"uP compression: K_t={K_t}/{self.M} training stress modes, "
+              f"rows {self.N * self.M} -> {self.N * K_t}, "
+              f"kappa={self.kappa_uP:.3e} (cell-aggregated {self.kappa_uP_cells:.3e})")
+
+        # Pass 2: materialise A_t[(i,t), m] = ratio_uP su_i Σ_{q∈m,c} W U_i Ĝ·V₁
+        # (batched GEMM per cell: (n_cells, N, n_q·n_comp) @ (n_cells, n_q·n_comp, K_t))
+        Vt = evecs[:, :K_t]
+        A_t = np.empty((self.N, K_t, n_cells))
+        for cells_ in tqdm(chunks, desc="uP compression: rows"):
+            nc = cells_.size
+            Uc = tab(expr_gu, basis_func_u, self.basis_u, self.N, cells_)
+            Gc = tab(expr_P, basis_func_P, self.basis_P, self.M, cells_) \
+                 * sp[:, None, None, None]
+            Gt = np.tensordot(Vt, Gc, axes=(0, 0))           # (K_t, nc, q, c)
+            Gt *= W[cells_][None, :, :, None]
+            U_b = Uc.reshape(self.N, nc, -1).transpose(1, 0, 2)
+            G_b = Gt.reshape(K_t, nc, -1).transpose(1, 2, 0)
+            A_t[:, :, cells_] = np.matmul(U_b, G_b).transpose(1, 2, 0)
+        A_t *= self.ratio_uP * su[:, None, None]
+        A_t = A_t.reshape(self.N * K_t, n_cells)
+
+        if self.row_weight_tol is not None:
+            row_norms = np.linalg.norm(A_t, axis=1)
+            keep = row_norms >= self.row_weight_tol * row_norms.max()
+            print(f"uP compressed block: keeping {keep.sum()}/{keep.size} rows "
+                  f"(row_weight_tol={self.row_weight_tol:g} on relative row norms)")
+            A_t = A_t[keep]
+        return A_t
+
+    def _full_residual(self, A, b, magic_points, weights):
+        """Exact relative residual of a sparse rule on the FULL constraint system.
+
+        The uP block is evaluated against all N*M uncompressed rows — but only
+        their columns at the selected cells are needed, so they are rebuilt by
+        quadrature tabulation at those cells (cheap, no PETSc assembly and no
+        (N·M) x n_cells matrix). The remaining rows of `A` (∫P block, extras,
+        volume row) are uncompressed already and evaluated directly. Requires a
+        preceding compressed build (uses the tabulation data it cached).
+        """
+        assert self._uP_tab is not None and self._b_uP_full is not None, \
+            "_full_residual requires a compressed uP build"
+        pts = self._uP_tab["pts"]
+        W = self._uP_tab["W"]
+        n_q, n_comp = self._uP_tab["n_q"], self._uP_tab["n_comp"]
+        su, sp = self._uP_tab["su"], self._uP_tab["sp"]
+
+        basis_func_u = fem.Function(self.V)
+        basis_func_P = fem.Function(self.S)
+        expr_gu = fem.Expression(ufl.grad(basis_func_u), pts)
+        expr_P = fem.Expression(basis_func_P, pts)
+
+        points = np.asarray(magic_points, dtype=np.int32)
+        weights = np.asarray(weights)
+        r_uP = self._b_uP_full.copy()
+        for s in range(0, points.size, self.cell_chunk):
+            cells_ = points[s:s + self.cell_chunk]
+            w_ = weights[s:s + self.cell_chunk]
+            U_S = np.empty((self.N, cells_.size, n_q, n_comp))
+            for i in range(self.N):
+                basis_func_u.x.array[:] = self.basis_u[:, i]
+                U_S[i] = expr_gu.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+            G_S = np.empty((self.M, cells_.size, n_q, n_comp))
+            for j in range(self.M):
+                basis_func_P.x.array[:] = self.basis_P[:, j]
+                G_S[j] = expr_P.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+            G_S *= sp[:, None, None, None]
+            Uw = (U_S * W[cells_][None, :, :, None]).reshape(self.N, cells_.size, -1)
+            # A_cols[(i,j), s] = ratio_uP su_i Σ_{q,c} W U_i G_j
+            cols = np.matmul(Uw.transpose(1, 0, 2),
+                             G_S.reshape(self.M, cells_.size, -1).transpose(1, 2, 0))
+            cols = cols.transpose(1, 2, 0) * (self.ratio_uP * su[:, None, None])
+            r_uP -= cols.reshape(self.N * self.M, cells_.size) @ w_
+
+        omega = np.zeros(A.shape[1])
+        omega[points] = weights
+        r_other = b[self._n_uP_rows:] - A[self._n_uP_rows:] @ omega
+        num = np.sqrt(np.linalg.norm(r_uP) ** 2 + np.linalg.norm(r_other) ** 2)
+        den = np.sqrt(np.linalg.norm(self._b_uP_full) ** 2
+                      + np.linalg.norm(b[self._n_uP_rows:]) ** 2)
+        return float(num / den)
+
+    def compute_magic(self, ecm_func=None, tol=1e-6, max_auto_rounds=4, **ecm_func_kwargs):
         """Compute magic points and weights.
 
         Parameters
         ----------
         ecm_func : callable(A, b, tol, **kw) -> (magic_points, alpha), default my_ecm
         tol      : relative residual tolerance passed to ecm_func
+        max_auto_rounds : int — with ``compress_uP="auto"``, maximum number of
+            train-verify-retry rounds (K_t doubles each retry).
         **ecm_func_kwargs : forwarded to ecm_func — e.g. ``candidate_batch=100``
             (and optional ``seed``) to use the stochastic-greedy subset selection
             in :func:`my_ecm`.
 
         Results are stored in ``self.magic_points`` (active cell indices) and
-        ``self.magic_weights`` (their non-negative quadrature weights).
+        ``self.magic_weights`` (their non-negative quadrature weights). With
+        ``compress_uP="auto"``, K_t is selected from `tol`, the trained rule is
+        verified against the exact full-system residual, K_t is doubled and the
+        training repeated if verification fails; the verified residual is
+        stored in ``self.true_residual``.
         """
         if ecm_func is None:
             ecm_func = my_ecm
-        A, b = self._build_matrices()
-        self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
-        # self.magic_points = np.array(list(range(A.shape[1])))  # --- IGNORE ---
-        # self.magic_weights = np.ones_like(self.magic_points, dtype=float)  # --- IGNORE ---
+        auto = self._include_uP and isinstance(self.compress_uP, str)
+        if auto:
+            self._auto_tol = tol
+            self._auto_K_t_floor = 1
+        for round_ in range(max_auto_rounds if auto else 1):
+            A, b = self._build_matrices()
+            self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
+            if not auto:
+                return
+            self.true_residual = self._full_residual(A, b, self.magic_points, self.magic_weights)
+            print(f"auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
+                  f"{len(self.magic_points)} points, "
+                  f"true full-system residual {self.true_residual:.3e} (tol {tol:g})")
+            if self.true_residual <= tol or self._K_t_used >= self.M:
+                return
+            # paper's rule (K_t = M_c + 10) with the measured point count,
+            # guarded by geometric growth; saturates at M (= exact system)
+            self._auto_K_t_floor = int(min(self.M, max(len(self.magic_points) + 10,
+                                                       1.5 * self._K_t_used)))
+        print("auto-K_t: max_auto_rounds reached, keeping last result")
 
     def show_active_cells(self, filename="active.xdmf"):
         """Write the selected (active) cells as meshtags to an XDMF file for ParaView."""
