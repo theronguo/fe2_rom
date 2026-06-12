@@ -151,12 +151,24 @@ class MacroSolver:
         rve_timestepper_options: dict | None = None,
         rve_averages_only_final: bool = True,
         rve_volume: float | None = None,
+        # Objectivity (F̄ = R U) reduction: drive each RVE with the symmetric
+        # stretch U and reconstruct the lab-frame P̄ / dP̄/dF̄ analytically (6/3
+        # symmetric adjoint directions instead of gdim²). Applies to both the FOM
+        # (MicroSolver) and reduced (ReducedMicroSolver) inner RVEs; a ROM driven
+        # with this on must have been trained on symmetric-stretch snapshots.
+        rve_objective_reduction: bool = False,
         # --- reduced-specific (full=False) ---
         rom_dir: str | None = None,
         # --- full-specific (full=True) ---
         rve_check_stability: bool = False,
         rve_stability_options: dict | None = None,
         rve_save_snapshots: list | None = None,
+        # Inner-RVE periodicity regime (FOM only): False (default) pins the
+        # corner dofs to zero; True ties them periodically and removes the
+        # rigid-body gauge with the ⟨w⟩=0 integral constraint instead. Both
+        # apply the per-axis periodic (PBC) face ties — see
+        # ch1.MicroSolver._setup_periodic_bcs_and_mpc.
+        rve_corner_periodic: bool = False,
         # --- macro-level ---
         degree: int = 1,
         snes_options: dict | None = None,
@@ -221,6 +233,8 @@ class MacroSolver:
                     save_snapshots=rve_save_snapshots,
                     averages_only_final=rve_averages_only_final,
                     rve_volume=rve_volume,
+                    corner_periodic=rve_corner_periodic,
+                    objective_reduction=rve_objective_reduction,
                 )
         else:
             def _make_rve(rank: int, index: int):
@@ -239,6 +253,7 @@ class MacroSolver:
                     timestepper_options=rve_timestepper_options,
                     averages_only_final=rve_averages_only_final,
                     rve_volume=rve_volume,
+                    objective_reduction=rve_objective_reduction,
                 )
         self._make_rve = _make_rve
 

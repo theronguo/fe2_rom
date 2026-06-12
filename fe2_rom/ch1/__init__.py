@@ -7,6 +7,7 @@ Submodules:
     fe2_rom.ch1.constraints    — volume-averaging linear constraints.
     fe2_rom.ch1.exceptions     — RVEConvergenceError.
     fe2_rom.ch1.solvers        — NewtonSolverFE2.
+    fe2_rom.ch1.training_data  — generate F̄ ROM training snapshots.
 """
 from .averages import (
     AverageQuantity,
@@ -29,6 +30,7 @@ from .microsolver import MicroSolver
 from .material import RVEMaterial
 from .macrosolver import MacroSolver
 from .homogenization import effective_stiffness, uniaxial_moduli
+from .training_data import generate_training_data, TrainingData
 
 __all__ = [
     "AverageQuantity", "HomogenizationContext",
@@ -43,4 +45,6 @@ __all__ = [
     "MacroSolver",
     "effective_stiffness",
     "uniaxial_moduli",
+    "generate_training_data",
+    "TrainingData",
 ]

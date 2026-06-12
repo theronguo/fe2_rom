@@ -17,6 +17,7 @@ import gmsh
 # ── Sparse helper ─────────────────────────────────────────────────────────────
 
 def petsc_to_scipy(mat):
+    """Convert a PETSc matrix to a scipy.sparse.csr_matrix."""
     ai, aj, av = mat.getValuesCSR()
     m, n = mat.getSize()
     return sp.csr_matrix((av, aj, ai), shape=(m, n))
@@ -94,6 +95,11 @@ def _cell_map_to_array(cell_map, submesh):
 
 
 def _parent_to_sub_array(arr_parent, V_parent, V_sub, cell_map):
+    """Transfer a dof array from a parent-mesh space to the matching submesh space.
+
+    Matches dofs cell-by-cell through `cell_map` (sub→parent cell indices);
+    both spaces must have the same element and block size.
+    """
     bs = V_parent.dofmap.bs
     assert bs == V_sub.dofmap.bs
     cell_map = _cell_map_to_array(cell_map, V_sub.mesh)
@@ -110,12 +116,18 @@ def _parent_to_sub_array(arr_parent, V_parent, V_sub, cell_map):
 
 
 def _cell_centroids(msh):
+    """Return the (n_local_cells, 3) array of cell geometry-node centroids."""
     tdim = msh.topology.dim
     n = msh.topology.index_map(tdim).size_local
     return msh.geometry.x[msh.geometry.dofmap[:n]].mean(axis=1)
 
 
 def _make_coord_perm(V_src, V_dst, tol=1e-10):
+    """Return perm such that dst dof k sits at the coordinates of src dof perm[k].
+
+    Only valid for spaces with coordinate-unique dofs (e.g. Lagrange, DG-0);
+    asserts that every dst dof has a src dof within `tol`.
+    """
     xs, xd = V_src.tabulate_dof_coordinates(), V_dst.tabulate_dof_coordinates()
     dist, perm = cKDTree(xs).query(xd, k=1)
     assert dist.max() < tol * (1 + np.abs(xs).max()), f"dof match failed, max dist={dist.max():.2e}"
@@ -123,10 +135,18 @@ def _make_coord_perm(V_src, V_dst, tol=1e-10):
 
 
 def _apply_coord_perm(arr, perm, bs):
+    """Apply a dof permutation from :func:`_make_coord_perm` to a blocked dof array."""
     return arr[(perm[:, None] * bs + np.arange(bs)).ravel()].copy()
 
 
 def _make_dg_perm(V_src, V_dst, src_cells_for_dst):
+    """Build flat (src, dst) index arrays mapping DG dofs between meshes.
+
+    For each dst cell c, `src_cells_for_dst[c]` names the matching src cell;
+    within a cell, local dofs are paired by nearest coordinates (DG dofs are
+    not coordinate-unique across cells, so :func:`_make_coord_perm` cannot be
+    used). Apply with :func:`_apply_dg_perm`.
+    """
     bs = V_src.dofmap.bs
     assert bs == V_dst.dofmap.bs
     n_dst = src_cells_for_dst.size
@@ -145,12 +165,18 @@ def _make_dg_perm(V_src, V_dst, src_cells_for_dst):
 
 
 def _apply_dg_perm(arr, src_flat, dst_flat, out_size):
+    """Apply the (src, dst) index map from :func:`_make_dg_perm` to a dof array."""
     result = np.zeros(out_size, dtype=arr.dtype)
     result[dst_flat] = arr[src_flat]
     return result
 
 
 def _write_submesh_to_gmsh(submesh, filename, comm, gdim):
+    """Export a triangle6 submesh to a .msh file and reload it as a fresh mesh.
+
+    Used by :meth:`ECM.test_variant3` to obtain a standalone gmsh-built mesh of
+    the active cells. Only second-order triangles are supported.
+    """
     tdim = submesh.topology.dim
     assert submesh.topology.cell_type.name == "triangle"
     assert submesh.geometry.dofmap.shape[1] == 6, \
@@ -178,12 +204,25 @@ def _write_submesh_to_gmsh(submesh, filename, comm, gdim):
 class ECM:
     """Adapted Empirical Cubature Method for hyper-reduction.
 
+    Finds a sparse, non-negative cell-wise quadrature rule (magic points +
+    weights) that exactly reproduces, over the full mesh, a set of constraint
+    integrals built from ROM bases: the virtual-work block ∫P:∇u dX, the
+    average-stress block ∫P dX (component-wise), optional extra
+    volume-integral blocks, and the total volume. Each block can be switched
+    off independently (`include_uP`, `include_P_int`), e.g. to find an
+    integration rule for ∫P dX alone or only for the `kwargs` blocks.
+
     Parameters
     ----------
-    basis_u   : (n_dofs_V, N) ndarray   — displacement ROM basis
-    basis_P   : (n_dofs_S, M) ndarray   — stress ROM basis
-    V         : displacement FunctionSpace
-    S         : stress FunctionSpace
+    basis_u   : (n_dofs_V, N) ndarray   — displacement ROM basis.
+                May be None when include_uP=False.
+    basis_P   : (n_dofs_S, M) ndarray   — stress ROM basis.
+                May be None when include_uP=False and include_P_int=False
+                (e.g. an integration rule built from `kwargs` blocks only).
+    V         : displacement FunctionSpace (None allowed iff basis_u is None)
+    S         : stress FunctionSpace (None allowed iff basis_P is None)
+    degree    : int — Lagrange degree used to rebuild V on the active-cell
+                submesh in save_variant2 / the test variants (default 1).
     sigma_u   : (N,) array-like or None — singular values for u basis;
                 rows are weighted by sigma_u[i]*sigma_P[j] / (sigma_u[0]*sigma_P[0]).
                 If None, all u modes are weighted equally.
@@ -192,21 +231,89 @@ class ECM:
                 the volume row (default 1.0).
     ratio_P   : float — overall scale of the ∫P dX constraint block relative to
                 the volume row (default 1.0).
+    include_uP : bool — if False, drop the P·∇u constraint block entirely
+                (keep only the ∫P dX block, any extra blocks, and the volume
+                row), e.g. to find an integration rule for ∫P dX alone.
+                Default True.
+    include_P_int : bool — if False, drop the ∫P dX constraint block entirely
+                (keep only the P·∇u block, any extra blocks, and the volume row).
+                Default True.
+    kwargs    : dict or None — extra volume-integral-only constraint blocks,
+                ``name -> {"basis": (n_dofs_X, M_x) ndarray, "space":
+                FunctionSpace, "sigma": optional (M_x,) singular values,
+                "ratio": optional float block scale}``. For each block, every
+                flat component of every mode contributes a row ∫X_j_c dX.
+
+    Usage
+    -----
+    ``ecm = ECM(...)``; ``ecm.compute_magic(tol=...)``; then
+    ``ecm.save_variant2(out_dir)`` for the online stage, or
+    ``ecm.test_variant{1,2,3}()`` to verify/benchmark the rule.
+
+    Call patterns
+    -------------
+    Any combination of the three block types is allowed; the volume row is
+    always included. Bases/spaces of disabled blocks may be passed as None
+    (basis_u/V are only needed for the uP block; basis_P/S for the uP and
+    ∫P blocks).
+
+    P·∇u + ∫P (default)::
+
+        ECM(basis_u, basis_P, V, S)
+
+    P·∇u + ∫P + extras::
+
+        ECM(basis_u, basis_P, V, S,
+            kwargs={"W": {"basis": basis_W, "space": SW}})
+
+    P·∇u only::
+
+        ECM(basis_u, basis_P, V, S, include_P_int=False)
+
+    P·∇u + extras::
+
+        ECM(basis_u, basis_P, V, S, include_P_int=False,
+            kwargs={"W": {"basis": basis_W, "space": SW}})
+
+    ∫P only (integration rule for the average stress alone)::
+
+        ECM(None, basis_P, None, S, include_uP=False)
+
+    ∫P + extras::
+
+        ECM(None, basis_P, None, S, include_uP=False,
+            kwargs={"W": {"basis": basis_W, "space": SW}})
+
+    extras only (rule built purely from the kwargs blocks)::
+
+        ECM(None, None, None, None, include_uP=False, include_P_int=False,
+            kwargs={"W": {"basis": basis_W, "space": SW}})
     """
 
     def __init__(self, basis_u, basis_P, V, S,
                  degree: int = 1,
                  sigma_u=None, sigma_P=None,
                  ratio_uP=1.0, ratio_P=1.0,
+                 include_uP: bool = True,
+                 include_P_int: bool = True,
                  kwargs: dict | None = None):
+        if include_uP:
+            assert basis_u is not None and V is not None, \
+                "basis_u and V are required when include_uP=True"
+        if include_uP or include_P_int:
+            assert basis_P is not None and S is not None, \
+                "basis_P and S are required when include_uP or include_P_int is True"
         self.basis_u = basis_u
         self.basis_P = basis_P
-        self.N = basis_u.shape[1]
-        self.M = basis_P.shape[1]
+        self.N = 0 if basis_u is None else basis_u.shape[1]
+        self.M = 0 if basis_P is None else basis_P.shape[1]
         self.V = V
         self.S = S
-        self.mesh = V.mesh
-        self.gdim = V.mesh.topology.dim
+        spaces = [sp_ for sp_ in (V, S) if sp_ is not None]
+        spaces += [spec["space"] for spec in (kwargs or {}).values()]
+        assert spaces, "need at least one function space to determine the mesh"
+        self.mesh = spaces[0].mesh
+        self.gdim = self.mesh.topology.dim
         self.degree = degree
         self._Q0 = fem.functionspace(self.mesh, ("DG", 0))
         self._weights, self._volume = self._assemble_weights()
@@ -214,6 +321,8 @@ class ECM:
         self.sigma_P = np.ones(self.M) if sigma_P is None else np.asarray(sigma_P, dtype=float)
         self.ratio_uP = ratio_uP
         self.ratio_P = ratio_P
+        self._include_uP = include_uP
+        self._include_P_int = include_P_int
         # Extra volume-integral-only bases.  Each entry is
         #   name -> {"basis", "space", "sigma" (optional), "ratio" (optional)}
         self.extras: dict = {}
@@ -232,6 +341,7 @@ class ECM:
         self.magic_weights = None
 
     def _assemble_weights(self):
+        """Return (per-cell volumes as a DG-0 vector, total mesh volume)."""
         dx = ufl.dx(domain=self.mesh)
         cell_avg = ufl.TestFunction(self._Q0)
         w = petsc.assemble_vector(fem.form(cell_avg * dx)).array.copy()
@@ -239,68 +349,83 @@ class ECM:
 
     @property
     def weights(self):
+        """Per-cell volumes (the exact DG-0 quadrature weights of the full mesh)."""
         return self._weights
 
     @property
     def volume(self):
+        """Total mesh volume (sum of `weights`)."""
         return self._volume
 
     def _build_matrices(self):
-        """Assemble the (N*M + M*n_P_components + 1) x dofs_Q0 constraint matrix A and rhs b."""
+        """Assemble the constraint matrix A and rhs b.
+
+        Rows: N*M (if include_uP) + M*n_P_components (if include_P_int)
+        + the extra blocks from `kwargs` + 1 volume row.
+        """
         dofs_Q0 = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
         dx = ufl.dx(domain=self.mesh)
         cell_avg = ufl.TestFunction(self._Q0)
-        basis_func_u = fem.Function(self.V)
-        basis_func_P = fem.Function(self.S)
 
-        mat = np.zeros((self.N, self.M, dofs_Q0))
-        form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
-        for i in range(self.N):
-            basis_func_u.x.array[:] = self.basis_u[:, i]
+        A_blocks, b_blocks = [], []
+
+        if self._include_uP:
+            basis_func_u = fem.Function(self.V)
+            basis_func_P = fem.Function(self.S)
+            mat = np.zeros((self.N, self.M, dofs_Q0))
+            form = fem.form(ufl.inner(basis_func_P, ufl.grad(basis_func_u)) * cell_avg * dx)
+            for i in range(self.N):
+                basis_func_u.x.array[:] = self.basis_u[:, i]
+                for j in range(self.M):
+                    basis_func_P.x.array[:] = self.basis_P[:, j]
+                    mat[i, j, :] = petsc.assemble_vector(
+                        form
+                    ).array.copy()
+            mat_int = mat.sum(axis=2)
+
+            # Per-row weights from normalised singular values
+            # sigma_u[0] and sigma_P[0] are the reference (largest) values
+            su = self.sigma_u / self.sigma_u[0]   # shape (N,), su[0] == 1
+            sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
+
+            # mat block: w[i,j] = ratio_uP * su[i] * sp[j]
+            w_uP = self.ratio_uP * np.outer(su, sp)          # (N, M)
+            mat_w     = mat     * w_uP[:, :, np.newaxis]     # (N, M, dofs_Q0)
+            mat_int_w = mat_int * w_uP                        # (N, M)
+
+            A_blocks.append(mat_w.reshape(-1, dofs_Q0))
+            b_blocks.append(mat_int_w.reshape(-1))
+
+        if self._include_P_int:
+            basis_func_P = fem.Function(self.S)
+            # Pre-compile one form per flat component of P for ∫P_j_c φ_k dX
+            p_shape = basis_func_P.ufl_shape
+            p_component_forms = []
+            for idx in np.ndindex(*p_shape):
+                if not idx:
+                    comp = basis_func_P
+                elif len(idx) == 1:
+                    comp = basis_func_P[idx[0]]
+                else:
+                    comp = basis_func_P[idx]
+                p_component_forms.append(fem.form(comp * cell_avg * dx))
+            n_P_components = len(p_component_forms)
+
+            mat_P = np.zeros((self.M, n_P_components, dofs_Q0))
             for j in range(self.M):
                 basis_func_P.x.array[:] = self.basis_P[:, j]
-                mat[i, j, :] = petsc.assemble_vector(
-                    form
-                ).array.copy()
-        mat_int = mat.sum(axis=2)
+                for c, form_Pc in enumerate(p_component_forms):
+                    mat_P[j, c, :] = petsc.assemble_vector(form_Pc).array.copy()
+            mat_P_int = mat_P.sum(axis=2)
 
-        # Pre-compile one form per flat component of P for ∫P_j_c φ_k dX
-        p_shape = basis_func_P.ufl_shape
-        p_component_forms = []
-        for idx in np.ndindex(*p_shape):
-            if not idx:
-                comp = basis_func_P
-            elif len(idx) == 1:
-                comp = basis_func_P[idx[0]]
-            else:
-                comp = basis_func_P[idx]
-            p_component_forms.append(fem.form(comp * cell_avg * dx))
-        n_P_components = len(p_component_forms)
+            # mat_P block: w[j] = ratio_P * sp[j]  (same for all components c)
+            sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
+            w_P     = self.ratio_P * sp                       # (M,)
+            mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
+            mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
 
-        mat_P = np.zeros((self.M, n_P_components, dofs_Q0))
-        for j in range(self.M):
-            basis_func_P.x.array[:] = self.basis_P[:, j]
-            for c, form_Pc in enumerate(p_component_forms):
-                mat_P[j, c, :] = petsc.assemble_vector(form_Pc).array.copy()
-        mat_P_int = mat_P.sum(axis=2)
-
-        # Per-row weights from normalised singular values
-        # sigma_u[0] and sigma_P[0] are the reference (largest) values
-        su = self.sigma_u / self.sigma_u[0]   # shape (N,), su[0] == 1
-        sp = self.sigma_P / self.sigma_P[0]   # shape (M,), sp[0] == 1
-
-        # mat block: w[i,j] = ratio_uP * su[i] * sp[j]
-        w_uP = self.ratio_uP * np.outer(su, sp)          # (N, M)
-        mat_w     = mat     * w_uP[:, :, np.newaxis]     # (N, M, dofs_Q0)
-        mat_int_w = mat_int * w_uP                        # (N, M)
-
-        # mat_P block: w[j] = ratio_P * sp[j]  (same for all components c)
-        w_P     = self.ratio_P * sp                       # (M,)
-        mat_P_w     = mat_P     * w_P[:, np.newaxis, np.newaxis]   # (M, n_P_comp, dofs_Q0)
-        mat_P_int_w = mat_P_int * w_P[:, np.newaxis]               # (M, n_P_comp)
-
-        A_blocks = [mat_w.reshape(-1, dofs_Q0), mat_P_w.reshape(-1, dofs_Q0)]
-        b_blocks = [mat_int_w.reshape(-1), mat_P_int_w.reshape(-1)]
+            A_blocks.append(mat_P_w.reshape(-1, dofs_Q0))
+            b_blocks.append(mat_P_int_w.reshape(-1))
 
         # Extra volume-integral-only blocks from `kwargs`.
         for entry in self.extras.values():
@@ -352,6 +477,9 @@ class ECM:
         **ecm_func_kwargs : forwarded to ecm_func — e.g. ``candidate_batch=100``
             (and optional ``seed``) to use the stochastic-greedy subset selection
             in :func:`my_ecm`.
+
+        Results are stored in ``self.magic_points`` (active cell indices) and
+        ``self.magic_weights`` (their non-negative quadrature weights).
         """
         if ecm_func is None:
             ecm_func = my_ecm
@@ -361,6 +489,7 @@ class ECM:
         # self.magic_weights = np.ones_like(self.magic_points, dtype=float)  # --- IGNORE ---
 
     def show_active_cells(self, filename="active.xdmf"):
+        """Write the selected (active) cells as meshtags to an XDMF file for ParaView."""
         assert self.magic_points is not None, "Call compute_magic first"
         tdim = self.mesh.topology.dim
         self.mesh.topology.create_entities(tdim)
@@ -375,6 +504,7 @@ class ECM:
     # ── internal helpers ──────────────────────────────────────────────────────
 
     def _make_cell_tags_and_indices(self):
+        """Return (meshtags marking the active cells with tag 999, sorted unique cell indices)."""
         tdim = self.mesh.topology.dim
         self.mesh.topology.create_entities(tdim)
         indices = np.unique(np.asarray(self.magic_points, dtype=np.int32))
@@ -382,6 +512,7 @@ class ECM:
         return dmesh.meshtags(self.mesh, tdim, indices, values), indices
 
     def _make_omega(self):
+        """Return the DG-0 weight function: magic weights on active cells, 0 elsewhere."""
         omega = fem.Function(self._Q0)
         omega.x.array[:] = 0.0
         omega.x.array[self.magic_points] = self.magic_weights
@@ -393,9 +524,10 @@ class ECM:
         Saves
         -----
         indices.npy         : (n_active,) int32  — parent cell indices of active cells
-        basis_u_sub.npy     : (N, n_dofs_V_sub)  — displacement modes on submesh
-        basis_P_sub.npy     : (M, n_dofs_S_sub)  — stress modes on submesh
         omega_sub.npy       : (n_dofs_Q0_sub,)   — ECM weight function on submesh
+        basis_u_sub.npy     : (n_dofs_V_sub, N)  — displacement modes on submesh
+        basis_u.npy         : (n_dofs_V, N)      — full-mesh displacement modes
+        (the two basis_u files are skipped when basis_u is None)
 
         The submesh can be reconstructed at load time via
             submesh, cell_map, _, _ = dmesh.create_submesh(mesh, tdim, indices)
@@ -408,31 +540,33 @@ class ECM:
         tdim = self.mesh.topology.dim
         submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
 
-        V_sub  = fem.functionspace(submesh, ("Lagrange", self.degree, (self.gdim,)))
-        S_sub  = fem.functionspace(submesh, ("DG", 1, (self.gdim, self.gdim)))
         Q0_sub = fem.functionspace(submesh, ("DG", 0))
-
-        basis_u_sub = np.stack([
-            _parent_to_sub_array(self.basis_u[:, i], self.V, V_sub, cell_map)
-            for i in range(self.N)
-        ]).T
-        basis_P_sub = np.stack([
-            _parent_to_sub_array(self.basis_P[:, j], self.S, S_sub, cell_map)
-            for j in range(self.M)
-        ]).T
 
         omega = self._make_omega()
         omega_sub = _parent_to_sub_array(omega.x.array, self._Q0, Q0_sub, cell_map)
 
-        np.save(os.path.join(output_dir, "indices.npy"),     indices)
-        np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
-        np.save(os.path.join(output_dir, "omega_sub.npy"),   omega_sub)
-        np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
+        np.save(os.path.join(output_dir, "indices.npy"),   indices)
+        np.save(os.path.join(output_dir, "omega_sub.npy"), omega_sub)
+
+        if self.basis_u is not None:
+            V_sub = fem.functionspace(submesh, ("Lagrange", self.degree, (self.gdim,)))
+            basis_u_sub = np.stack([
+                _parent_to_sub_array(self.basis_u[:, i], self.V, V_sub, cell_map)
+                for i in range(self.N)
+            ]).T
+            np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
+            np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
 
     # ── integration test variants ─────────────────────────────────────────────
 
     def test_variant1(self, n_trials=10000):
-        """Full mesh: weight function omega * dx_hr(999) restricted to active cells."""
+        """Verify and time the ECM rule on the full mesh.
+
+        Integrates omega * dx_hr(999) (the weight function on a measure
+        restricted to the active cells), asserts every ∫P:∇u mode pair matches
+        the full integral, then benchmarks full vs ECM assembly over
+        `n_trials` random mode pairs. Requires basis_u and basis_P.
+        """
         assert self.magic_points is not None, "Call compute_magic first"
         dx = ufl.dx(domain=self.mesh)
         cell_tags, _ = self._make_cell_tags_and_indices()
@@ -473,7 +607,13 @@ class ECM:
         print(f"Variant 1 ECM integration:   {time() - t0:.3f}s")
 
     def test_variant2(self, n_trials=10000):
-        """Submesh: create_submesh of active cells, transfer bases, integrate over dx_sub."""
+        """Verify and time the ECM rule on an active-cell submesh.
+
+        Builds the submesh with create_submesh, transfers the bases and weight
+        function to it, asserts every ∫P:∇u mode pair matches the full-mesh
+        integral, then benchmarks full vs submesh assembly. This is the layout
+        saved by :meth:`save_variant2`. Requires basis_u and basis_P.
+        """
         assert self.magic_points is not None, "Call compute_magic first"
         dx = ufl.dx(domain=self.mesh)
         _, indices = self._make_cell_tags_and_indices()
@@ -527,7 +667,14 @@ class ECM:
         print(f"Variant 2 ECM submesh:       {time() - t0:.3f}s")
 
     def test_variant3(self, n_trials=10000):
-        """Gmsh remesh: export submesh via gmsh, reload as fresh mesh, transfer bases."""
+        """Verify and time the ECM rule on a gmsh round-tripped active-cell mesh.
+
+        Exports the active-cell submesh to .msh, reloads it as a standalone
+        mesh, transfers the bases by coordinate/cell matching, asserts every
+        ∫P:∇u mode pair matches the full-mesh integral, then benchmarks full
+        vs remeshed assembly. Triangle6 meshes only (see
+        :func:`_write_submesh_to_gmsh`). Requires basis_u and basis_P.
+        """
         assert self.magic_points is not None, "Call compute_magic first"
         dx = ufl.dx(domain=self.mesh)
         _, indices = self._make_cell_tags_and_indices()
