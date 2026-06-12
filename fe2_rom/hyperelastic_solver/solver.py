@@ -88,7 +88,10 @@ class HyperelasticStabilitySolver:
         locate_fn: callable x -> bool array (geometric boundary detection)
         value: fem.Constant whose .value is updated by the load_schedule
         measure_reaction: if True, a ReactionProbe is created for this surface
-        reaction_direction: unit vector for the reaction force projection
+            (consistent residual-based reaction at the constrained dofs)
+        reaction_direction: unit vector for the reaction force projection.
+            A component BC only transmits force along its own axis, so only
+            entry [subspace_index] enters (as a projection weight).
         pointwise: if True, dofs are located *geometrically* (``locate_fn`` may
             select isolated nodes, not whole boundary facets) — used for minimal
             rigid-body pins in uniaxial-stress setups. Incompatible with
@@ -144,7 +147,12 @@ class HyperelasticStabilitySolver:
             bc = fem.dirichletbc(value, dofs, V_sub)
             bcs.append(bc)
             if measure_reaction:
-                probe = ReactionProbe(mesh, facets, P_ufl,
+                # The subspace-only `dofs` above is what fem.dirichletbc needs;
+                # the probe indexes the assembled residual, so it needs the
+                # same dofs in the *parent* numbering of V.
+                parent_dofs, _ = fem.locate_dofs_topological(
+                    (V_sub, V_sub.collapse()[0]), fdim, facets)
+                probe = ReactionProbe(V, parent_dofs, R_form, subspace_index,
                                       direction=reaction_dir, bc_value=value)
                 probes.append(probe)
 
