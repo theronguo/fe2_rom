@@ -67,6 +67,7 @@ class MicroSolver:
                  output_dir: str = "output",
                  check_stability: bool = True,
                  perturb_post_buckling: bool = True,
+                 pert_amplitude_init: float = 1e-2,
                  visualize_fields: list[str] | None = None,
                  average_quantities: list | None = None,
                  stability_options: dict | None = None,
@@ -131,6 +132,11 @@ class MicroSolver:
         # bifurcation as closely as possible (used by the φ-extraction "lba"
         # strategy, which then does a linear buckling analysis there).
         self._perturb_post_buckling = perturb_post_buckling
+        # Default initial eigenmode-kick amplitude for post-buckling traversal,
+        # used by ``__call__`` when not overridden per-call. Exposed so the FE²
+        # driver / RVE factory can tune it (the solver default 1e-2 overshoots
+        # Newton's basin for thin-strut RVEs; ~1e-3 traverses isolated modes).
+        self._pert_amplitude_init = pert_amplitude_init
         # F̄ at the most recent accepted (stable) step — the near-critical state
         # the "lba" strategy hands to compute_buckling_spectrum. Re-initialised at
         # the start of every __call__ (F_bar is built later in __init__).
@@ -922,9 +928,15 @@ class MicroSolver:
         return out
 
     def __call__(self, Fbar: np.ndarray, *,
-                 pert_amplitude_init: float = 1e-2,
+                 pert_amplitude_init: float | None = None,
                  plot_time_start: float = 0.0) -> list[dict]:
         assert self._newton is not None, "Setup not complete."
+
+        # Fall back to the instance default (set at construction) so the FE²
+        # driver, which calls ``rve(F_qp)`` without a per-call amplitude, still
+        # honours the factory-configured kick.
+        if pert_amplitude_init is None:
+            pert_amplitude_init = self._pert_amplitude_init
 
         Fbar_prev = self.F_bar_conv.copy()
         self.F_bar.value[:] = Fbar_prev

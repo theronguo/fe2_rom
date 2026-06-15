@@ -162,6 +162,11 @@ class MacroSolver:
         # --- full-specific (full=True) ---
         rve_check_stability: bool = False,
         rve_stability_options: dict | None = None,
+        # Initial eigenmode-kick amplitude for each RVE's post-buckling
+        # traversal (only relevant with rve_check_stability=True). The
+        # MicroSolver default 1e-2 overshoots Newton's basin for thin-strut
+        # RVEs and stalls at the bifurcation; ~1e-3 traverses isolated modes.
+        rve_pert_amplitude_init: float = 1e-2,
         rve_save_snapshots: list | None = None,
         # Inner-RVE periodicity regime (FOM only): False (default) pins the
         # corner dofs to zero; True ties them periodically and removes the
@@ -225,6 +230,7 @@ class MacroSolver:
                     degree=rve_degree,
                     output_dir=f"{rve_output_dir}/rve_{rank}_{index}",
                     check_stability=rve_check_stability,
+                    pert_amplitude_init=rve_pert_amplitude_init,
                     visualize_fields=rve_visualize_fields,
                     average_quantities=_rve_average_quantities,
                     stability_options=rve_stability_options,
