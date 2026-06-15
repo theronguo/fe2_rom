@@ -88,6 +88,8 @@ class _WorkerConfig:
     rve_volume: object
     corner_periodic: bool
     check_stability: bool
+    perturb_post_buckling: bool
+    pert_amplitude_init: float
     save_fields: tuple
     newton_options: dict
     timestepper_options: dict
@@ -120,7 +122,7 @@ def _worker_task(task):
             mesh_path=cfg.mesh_path, comm=MPI.COMM_SELF, gdim=cfg.gdim,
             material=cfg.material, degree=cfg.degree,
             output_dir=work_dir, check_stability=cfg.check_stability,
-            perturb_post_buckling=False,
+            perturb_post_buckling=cfg.perturb_post_buckling,
             # Training-data solves are pure forward problems: an empty
             # average_quantities list means no effective quantities / tangents
             # and no macro-sensitivity (adjoint) solves are done.
@@ -135,7 +137,7 @@ def _worker_task(task):
             lattice_vectors=cfg.lattice_vectors,
             rve_volume=cfg.rve_volume,
         )
-        solver(Fbar)
+        solver(Fbar, pert_amplitude_init=cfg.pert_amplitude_init)
         return (idx, True, "")
     except RVEConvergenceError as e:
         return (idx, False, f"RVEConvergenceError: {e}")
@@ -298,6 +300,8 @@ def generate_training_data(
     n_workers: "int | None" = None,
     corner_periodic: bool = False,
     check_stability: bool = False,
+    perturb_post_buckling: bool = False,
+    pert_amplitude_init: float = 1e-2,
     newton_options: "dict | None" = None,
     timestepper_options: "dict | None" = None,
     save_fields: "tuple | list" = _DEFAULT_SAVE_FIELDS,
@@ -335,6 +339,22 @@ def generate_training_data(
     seed, n_workers : RNG seed and pool size (default ``cpu_count − 1``).
     check_stability : monitor RVE stability during the sample solves. Default
         ``False`` — we want the equilibrium fluctuation at the *prescribed* ``F̄``.
+    perturb_post_buckling : when an unstable equilibrium is detected (requires
+        ``check_stability=True``), perturb along the lowest eigenmode and re-solve
+        so the ramp follows the *buckled* branch instead of stalling at the
+        bifurcation. Set ``True`` to put post-buckling states into the snapshot
+        pool — otherwise (``False``, default) the solver halves ``dt`` to approach
+        the bifurcation and the sample is discarded once it can go no further, so
+        the ROM only ever sees the pre-buckling branch.
+    pert_amplitude_init : initial eigenmode-kick amplitude used when
+        ``perturb_post_buckling`` traverses a bifurcation (default ``1e-2``). The
+        usable window is narrow and RVE-dependent: too large overshoots Newton's
+        basin and the kicked solve diverges; too small fails to escape the
+        near-singular bifurcation point. For thin-strut RVEs that buckle early,
+        ``~1e-3`` traverses simple (isolated-mode) bifurcations where the default
+        ``1e-2`` does not. Degenerate (e.g. equibiaxial, square-symmetric)
+        bifurcations cannot be traversed by a single-eigenvector kick at any
+        amplitude. Ignored when ``perturb_post_buckling=False``.
     newton_options, timestepper_options : inner-solve options (sensible defaults).
     save_fields : snapshot fields to save (default ``("u_fluc", "P")``).
     rve_volume : exact cell volume ``|Q|`` (required for porous polygon cells).
@@ -381,6 +401,8 @@ def generate_training_data(
         mesh_path=mesh_path, gdim=gdim, degree=degree, material=material,
         lattice_vectors=lattice_vectors, rve_volume=rve_volume,
         corner_periodic=corner_periodic, check_stability=check_stability,
+        perturb_post_buckling=perturb_post_buckling,
+        pert_amplitude_init=pert_amplitude_init,
         save_fields=tuple(save_fields),
         newton_options=newton_options or _DEFAULT_NEWTON,
         timestepper_options=timestepper_options or _DEFAULT_TIMESTEP,
