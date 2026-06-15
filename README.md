@@ -1,8 +1,9 @@
 # fe2_rom
 
-**Reduced-order FE² for hyperelastic materials in DOLFINx** — first-order and
-**micromorphic** computational homogenization on periodic RVEs, with POD + ECM
-hyper-reduction and full-order buckling solvers included. Built on
+**Reduced-order FE² for hyperelastic materials in DOLFINx** — first-order,
+**micromorphic**, and **second-order (strain-gradient)** computational
+homogenization on periodic RVEs, with POD + ECM hyper-reduction and full-order
+buckling solvers included. Built on
 [FEniCSx / DOLFINx](https://fenicsproject.org/) and
 [`dolfinx_mpc`](https://github.com/jorgensd/dolfinx_mpc).
 
@@ -15,6 +16,10 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 - **micromorphic homogenization** (MM, [\[1\]](#references), [\[2\]](#references)) with a user-supplied enriched ansatz
   `u_total = (F̄ − I)·X + Σᵢ (vᵢ + X·gᵢ) φᵢ + w`, returning effective stresses
   `P̄`, `Πᵢ`, `Λᵢ` and the full 3 × 3 grid of tangents,
+- **second-order (strain-gradient) homogenization** (CH2, [\[4\]](#references)) with the
+  enriched ansatz `u_total = (F̄ − I)·X + ½ X·Ḡ·X + w`, returning the effective
+  stress `P̄`, the double stress `Q̄`, and the 2 × 2 grid of tangents
+  `d{P̄, Q̄} / d{F̄, Ḡ}`,
 - **reduced-order modelling** (POD + ECM hyper-reduction, [\[3\]](#references)) and matching reduced
   RVE solvers for both CH1 and micromorphic kinematics,
 - **two-scale FE² simulation** — a (higher-order) macroscopic continuum whose constitutive
@@ -25,7 +30,8 @@ The package ships with ready-to-use solvers in 2D and 3D for:
 <p align="center">
   <img src="gifs/lattice.gif" width="32%" />
   <img src="gifs/2d_rve.gif" width="32%" />
-  <img src="gifs/3d_rve.gif" width="32%" />
+  <!-- <img src="gifs/3d_rve.gif" width="32%" /> -->
+  <img src="gifs/3d_10x10x10.gif" width="32%" />
 </p>
 
 <sub>Compression and buckling of various 2D/3D microstructures.</sub>
@@ -61,6 +67,18 @@ The package ships with ready-to-use solvers in 2D and 3D for:
   are treated **co-rotationally** (`φ → R φ`), making the homogenized law
   frame-indifferent — a departure from the fixed-mode ansatz of the reference
   papers.
+- **Second-order (strain-gradient) homogenization** (`fe2_rom.ch2`) — extends the
+  classical RVE with the second-gradient term in the ansatz
+  `u_total = (F̄ − I)·X + ½ X·Ḡ·X + w`, where `Ḡ = ∇F̄` (symmetric in its last two
+  indices). Reports the effective stress `P̄` and the **double stress**
+  `Q̄_iJK = ⟨½(X_K P_iJ + X_J P_iK)⟩` together with the 2 × 2 grid of macro tangents
+  `d{P̄, Q̄} / d{F̄, Ḡ}` (string keys `"Qbar"`, `"dPbar_dG"`, `"dQbar_dFbar"`,
+  `"dQbar_dG"`). The macro continuum is the mixed `[u, F̂, L̄]` saddle-point
+  formulation with the inf-sup-stable **P2-P1-P0** (triangles) / **Q2-Q1-Q0**
+  (quads) element; macro buckling is detected from the saddle-point inertia
+  (a stable equilibrium has exactly `m` negative eigenvalues, `m` = number of
+  `L̄` multiplier DOFs). `fe2_rom.ch2` subclasses `fe2_rom.ch1` through the same
+  `_setup_macro_vars` / `_build_*` hooks used by the micromorphic layer.
 - **Projected linear constraint enforcement** — `⟨w⟩ = 0`, `⟨w·φᵢ⟩ = 0`,
   `⟨(w·φᵢ) X⟩ = 0`, etc. are imposed through a projected Newton solve
   (`P K P x = P b`); a `corner_periodic` flag toggles between fixed-corner BCs
@@ -97,8 +115,14 @@ The package ships with ready-to-use solvers in 2D and 3D for:
     displacement field `u` with `N_modes` scalar enrichment-amplitude fields
     `vᵢ`, with the constitutive response provided either by a `MicromorphicRVEMaterial`
     (nested RVE, FOM or ROM).
-  - Both drivers feature adaptive load stepping, optional macro-level
-    stability monitoring, and MPI parallelism over quadrature points.
+  - `fe2_rom.ch2.MacroSecondOrderSolver` solves the mixed `[u, F̂, L̄]`
+    second-order continuum (displacement, deformation gradient, and Lagrange
+    multiplier), with the constitutive response from a `Ch2RVEMaterial`
+    (nested second-order RVE, FOM or ROM) or a `DummyCh2Material` for verifying
+    the formulation.
+  - All drivers feature adaptive load stepping, optional macro-level
+    stability monitoring, checkpoint/restart, and MPI parallelism over
+    quadrature points.
 - **VTX (ADIOS2) output** for ParaView visualisation and CSV reaction-force
   logging.
 
@@ -153,11 +177,19 @@ fe2_rom/
 │   ├── material.py         # DummyMicromorphicMaterial, MicromorphicRVEMaterial
 │   ├── averages.py         # EffectivePi, EffectiveLambda
 │   └── constraints.py      # ZeroVolumeAverageDot, ZeroVolumeAverageOuter
+├── ch2/                    # second-order (strain-gradient) homogenization
+│   ├── microsolver.py      # MicroSolver — adds the ½ X·Ḡ·X second-gradient term
+│   ├── macrosolver.py      # MacroSecondOrderSolver — mixed [u, F̂, L̄] macro driver
+│   ├── material.py         # Ch2RVEMaterial, DummyCh2Material
+│   ├── averages.py         # EffectiveQ (double stress Q̄) + x-weighted tangent blocks
+│   ├── constraints.py      # ZeroBoundaryAverage
+│   └── training_data.py    # (F̄, Ḡ) snapshot generation for the ROM
 └── rom/                    # reduced-order modelling
     ├── pod.py              # POD basis construction (H¹ / L² inner products)
     ├── ecm.py              # ECM hyper-reduction (magic-point selection)
     ├── solver_ch1.py       # ReducedMicroSolver — CH1 reduced online stage
-    └── solver_mm.py        # ReducedMicroSolver — micromorphic reduced online stage
+    ├── solver_mm.py        # ReducedMicroSolver — micromorphic reduced online stage
+    └── solver_ch2.py       # ReducedMicroSolver — second-order reduced online stage
 
 examples/
 ├── hyperelastic_solver/
@@ -513,10 +545,83 @@ example_3 expects `phi_*.npy` and the `ecm/` directory to already exist in
 `example_1/output/snapshots/` and `example_1/ecm/` respectively — run
 `example_1` first.
 
-> Note: the FE² macro solvers (`ch1.MacroSolver`, `mm.MacroMicromorphicSolver`)
-> depend on
+> Note: the FE² macro solvers (`ch1.MacroSolver`, `mm.MacroMicromorphicSolver`,
+> `ch2.MacroSecondOrderSolver`) depend on
 > [`dolfinx_materials`](https://github.com/bleyerj/dolfinx_materials) — see the
 > install instructions above.
+
+### 8. Second-order (strain-gradient) homogenization (CH2)
+
+The second-order `MicroSolver` adds the second-gradient term `½ X·Ḡ·X` to the
+classical periodic ansatz and reports the double stress `Q̄` alongside `P̄`
+(see Kouznetsova et al. (2002) [\[4\]](#references)):
+
+```
+u_total = (F̄ − I)·X + ½ X·Ḡ·X + w        Ḡ_iJK = ∂F̄_iJ/∂X_K  (symmetric in J↔K)
+```
+
+```python
+import numpy as np
+from mpi4py import MPI
+from fe2_rom.hyperelastic_solver import NeoHookean
+from fe2_rom.ch2 import MicroSolver
+
+solver = MicroSolver(
+    mesh_path="rve.msh", comm=MPI.COMM_WORLD, gdim=2,
+    material=NeoHookean(mu=1153.8, lmbda=1730.8),
+    average_quantities=["Fbar", "Pbar", "Qbar",
+                        "dPbar_dFbar", "dPbar_dG", "dQbar_dFbar", "dQbar_dG"],
+    degree=2, check_stability=True,
+)
+
+Fbar = np.array([[0.9, 0.0], [0.0, 1.0]])
+G = np.zeros((2, 2, 2))            # Ḡ_iJK = ∂F̄_iJ/∂X_K
+G[1, 1, 1] = 0.01
+history = solver(Fbar, G, pert_amplitude_init=0.1)
+# history[i] keys: Fbar, Pbar, Qbar, dPbar_dFbar, dPbar_dG, dQbar_dFbar, dQbar_dG
+```
+
+The macro driver `MacroSecondOrderSolver` solves the mixed `[u, F̂, L̄]`
+saddle-point problem (displacement, deformation gradient, Lagrange multiplier)
+on the inf-sup-stable **P2-P1-P0** (triangles) / **Q2-Q1-Q0** (quads) element,
+with the constitutive response from a nested second-order RVE (`Ch2RVEMaterial`,
+FOM or ROM) or a `DummyCh2Material` for verifying the formulation:
+
+```python
+import numpy as np
+from mpi4py import MPI
+from dolfinx import fem
+from dolfinx.mesh import create_rectangle, CellType, GhostMode
+from fe2_rom.hyperelastic_solver import NeoHookean, TimeStepper
+from fe2_rom.ch2 import MacroSecondOrderSolver, Ch2RVEMaterial
+from fe2_rom.ch2.microsolver import MicroSolver
+
+def rve_factory(rank, index):
+    return MicroSolver(mesh_path="rve.msh", comm=MPI.COMM_SELF, gdim=2,
+                       material=NeoHookean(mu=1153.8, lmbda=1730.8), degree=2)
+
+material = Ch2RVEMaterial(rve_factory, gdim=2)
+mesh = create_rectangle(MPI.COMM_WORLD, [[0.0, 0.0], [1.0, 4.0]], [1, 4],
+                        CellType.triangle, ghost_mode=GhostMode.shared_facet)
+solver = MacroSecondOrderSolver(mesh, n_qp=2, material=material, degree=1,
+                                check_stability=True)  # P2-P1-P0; macro buckling via saddle inertia
+
+# BC signature: an int component targets a displacement component u_i (subspace 0);
+# a tuple (1, c) targets flattened component c (row-major i*gdim+j) of H = F̂ − I
+# (value 0 pins F̂_ij to δ_ij); (2, c) targets the multiplier L̄.
+zero, disp = fem.Constant(mesh, 0.0), fem.Constant(mesh, 0.0)
+solver.add_bc(0, lambda x: np.isclose(x[1], 0.0), zero)              # u_x
+solver.add_bc(1, lambda x: np.isclose(x[1], 0.0), zero)              # u_y
+solver.add_bc(1, lambda x: np.isclose(x[1], 4.0), disp, measure_reaction=True)
+solver.setup()
+
+solver.solve(
+    output_dir="output",
+    timestepper=TimeStepper(t_end=1.0, dt_init=0.05, dt_min=1e-6),
+    loadhistory=lambda t: setattr(disp, "value", -0.2 * t),
+    pert_amplitude_init=1e-2,    # eigenmode kick applied when macro buckling is detected
+)
+```
 
 ## Validation
 
@@ -576,6 +681,12 @@ The reference paper is bundled at
    microstructures under large deformations.* Computer Methods in Applied
    Mechanics and Engineering, **418**, 116467.
    [doi:10.1016/j.cma.2023.116467](https://doi.org/10.1016/j.cma.2023.116467).
+
+4. Kouznetsova, V. G., Geers, M. G. D., & Brekelmans, W. A. M. (2002).
+   *Multi-scale constitutive modelling of heterogeneous materials with a
+   gradient-enhanced computational homogenization scheme.* International Journal
+   for Numerical Methods in Engineering, **54**(8), 1235–1260.
+   [doi:10.1002/nme.541](https://doi.org/10.1002/nme.541).
 
 ## Contact
 
