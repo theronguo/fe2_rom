@@ -98,10 +98,21 @@ class ReducedMicroSolver:
         # --- ROM data ---
         indices          = np.load(os.path.join(rom_dir, "indices.npy"))
         self.basis_u_sub = np.load(os.path.join(rom_dir, "basis_u_sub.npy"))
-        omega_sub        = np.load(os.path.join(rom_dir, "omega_sub.npy"))
         self.basis_u     = np.load(os.path.join(rom_dir, "basis_u.npy"))
         self.N = self.basis_u_sub.shape[1]
-        logger.debug("ROM data loaded: N=%d modes", self.N)
+        # Per-qp ECM rule (quadrature_element weights at individual Gauss points)
+        # vs. the classic per-cell DG-0 rule, detected by qp_meta.json.
+        _qp_meta_path = os.path.join(rom_dir, "qp_meta.json")
+        self._per_qp = os.path.exists(_qp_meta_path)
+        if self._per_qp:
+            import json
+            with open(_qp_meta_path) as _f:
+                self._qp_meta = json.load(_f)
+            omega_data = np.load(os.path.join(rom_dir, "omega_q_sub.npy"))
+        else:
+            self._qp_meta = None
+            omega_data = np.load(os.path.join(rom_dir, "omega_sub.npy"))
+        logger.debug("ROM data loaded: N=%d modes (per_qp=%s)", self.N, self._per_qp)
 
         # --- Mesh & submesh ---
         with silence_c_stdout():
@@ -116,17 +127,36 @@ class ReducedMicroSolver:
         # arrays (e.g. φ) onto V_sub by *exact dof-copy* rather than the lossy
         # cross-mesh interpolation (which is inexact on curved/degree-2 meshes).
         self._sub_cell_map = sub_cell_map
-        self._dx_sub = ufl.Measure("dx", domain=submesh)
+        # Per-qp rules require the integration quadrature to match the
+        # quadrature_element used to build the rule exactly (same scheme+degree),
+        # otherwise the saved point weights are meaningless.
+        if self._per_qp:
+            self._dx_sub = ufl.Measure(
+                "dx", domain=submesh,
+                metadata={"quadrature_scheme": self._qp_meta["scheme"],
+                          "quadrature_degree": self._qp_meta["qdeg"]})
+        else:
+            self._dx_sub = ufl.Measure("dx", domain=submesh)
 
         # --- Function spaces ---
         V_sub  = fem.functionspace(submesh, ("Lagrange", degree, (gdim,)))
-        Q0_sub = fem.functionspace(submesh, ("DG", 0))
         self.V_sub = V_sub
         self.V_full = V_full
 
+        # --- ECM weight function: DG-0 (per-cell) or quadrature_element (per-qp) ---
+        if self._per_qp:
+            import basix.ufl
+            cell_name = submesh.topology.cell_type.name
+            q_el = basix.ufl.quadrature_element(
+                cell_name, value_shape=(),
+                scheme=self._qp_meta["scheme"], degree=self._qp_meta["qdeg"])
+            W_space = fem.functionspace(submesh, q_el)
+        else:
+            W_space = fem.functionspace(submesh, ("DG", 0))
+
         # --- Functions ---
-        self._omega_func = fem.Function(Q0_sub)
-        self._omega_func.x.array[:] = omega_sub
+        self._omega_func = fem.Function(W_space)
+        self._omega_func.x.array[:] = omega_data
 
         self.u_fluc = fem.Function(V_sub)
         self.u_full = fem.Function(V_full, name="u_fluc")
