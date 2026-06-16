@@ -194,7 +194,9 @@ class HyperelasticStabilitySolver:
             timestepper: TimeStepper | None = None,
             output_manager: VTXManager | None = None,
             reaction_logger: ReactionForceLogger | None = None,
-            pert_amplitude_init: float = 1e-2) -> None:
+            pert_amplitude_init: float = 1e-2,
+            output_dir: str | None = None,
+            enable_restart: bool = False) -> None:
         """Main time-stepping loop.
 
         load_schedule(t) is called once per trial time step to update any
@@ -205,6 +207,20 @@ class HyperelasticStabilitySolver:
         ``pert_amplitude_init * max|u|`` (or ``pert_amplitude_init *
         char_length`` if ``|u|`` is still ~0). Doubles on each stability
         retry; reset to this value each new time step.
+
+        output_dir / enable_restart: opt-in checkpoint/restart, mirroring the
+        full two-scale macros. When ``enable_restart=True`` (requires
+        ``output_dir``), a rolling checkpoint is written under
+        ``output_dir/checkpoint/`` after every accepted load step (atomic
+        write: ``checkpoint.tmp/`` → rename) holding the displacement field,
+        timestepper state, and reaction history. If that checkpoint exists on
+        entry it is loaded and the run resumes from the saved ``t`` — the
+        constitutive law is stateless, so the displacement field is the only
+        per-cell state. Restart requires the **same MPI rank count** (a
+        per-rank partition fingerprint is verified on load). The caller is
+        responsible for VTX (.bp) continuity on resume — see
+        :meth:`checkpoint_exists` to pick a fresh segment path before opening
+        the ``output_manager``.
         """
         assert self._newton is not None, "Call setup() before run()"
 
@@ -214,9 +230,20 @@ class HyperelasticStabilitySolver:
         comm = self.comm
         u = self.u
 
-        self._write_fields(output_manager, 0.0)
-        if reaction_logger is not None:
-            reaction_logger.record(0.0, 0.0)
+        if enable_restart and output_dir is None:
+            raise ValueError("enable_restart=True requires output_dir.")
+
+        self._step_index = 0
+        resumed = False
+        if enable_restart and self._checkpoint_complete(output_dir):
+            self._restore_checkpoint(output_dir, timestepper, reaction_logger,
+                                     load_schedule)
+            resumed = True
+
+        if not resumed:
+            self._write_fields(output_manager, 0.0)
+            if reaction_logger is not None:
+                reaction_logger.record(0.0, 0.0)
 
         simulation_finished = False
         while not timestepper.finished:
@@ -272,6 +299,11 @@ class HyperelasticStabilitySolver:
                                 probe.displacement, rf,
                             )
 
+                        self._step_index += 1
+                        if enable_restart:
+                            self._write_checkpoint(output_dir, timestepper,
+                                                   reaction_logger)
+
                 else:
                     ok = timestepper.reject()
                     if not ok:
@@ -289,6 +321,101 @@ class HyperelasticStabilitySolver:
 
             if simulation_finished:
                 break
+
+    # ------------------------------------------------------------------
+    # Checkpoint / restart (single-scale; stateless constitutive law)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _restart():
+        """Deferred import of the shared restart helpers.
+
+        ``fe2_rom.ch1.restart`` carries no ``fe2_rom`` dependencies, but
+        importing it triggers ``fe2_rom.ch1.__init__`` which pulls in the
+        macro solvers (and thus this layer back) — so it must be imported
+        lazily, after both packages are fully loaded, to avoid a circular
+        import.
+        """
+        from fe2_rom.ch1 import restart as _restart
+        return _restart
+
+    def _fingerprint(self) -> str:
+        if not hasattr(self, "_cached_fingerprint"):
+            self._cached_fingerprint = self._restart().compute_partition_fingerprint(
+                self._mesh)
+        return self._cached_fingerprint
+
+    def checkpoint_exists(self, output_dir: str) -> bool:
+        """Collective: True if a complete restart checkpoint lives under
+        ``output_dir``.
+
+        Useful to the caller *before* opening a VTX manager so it can pick a
+        fresh ``.bp`` segment on resume (the rolling checkpoint preserves the
+        physics; ParaView frames written before the last checkpoint live in
+        the prior ``.bp``).
+        """
+        return self._checkpoint_complete(output_dir)
+
+    def _checkpoint_complete(self, output_dir: str) -> bool:
+        return self._restart().checkpoint_complete(
+            self.comm, output_dir, require_rves=False)
+
+    def _write_checkpoint(self, output_dir, timestepper, reaction_logger):
+        rst = self._restart()
+        tmp = rst.prepare_tmp(self.comm, output_dir)
+        fp = self._fingerprint()
+        rst.save_meta(
+            self.comm, tmp,
+            t_current=float(timestepper.t_current),
+            dt=float(timestepper.dt),
+            step_index=int(getattr(self, "_step_index", 0)),
+            gdim=int(self._mesh.geometry.dim),
+            kind="dns",
+        )
+        rst.save_reaction(self.comm, reaction_logger, tmp)
+        rst.save_macro_field(self.comm, self.u, tmp, fp)
+        rst.atomic_finalize(self.comm, output_dir)
+
+    def _restore_checkpoint(self, output_dir, timestepper, reaction_logger,
+                            load_schedule):
+        rst = self._restart()
+        ckpt_dir, _ = rst.checkpoint_dirs(output_dir)
+        meta = rst.load_meta(self.comm, ckpt_dir)
+        if int(meta.get("n_ranks", -1)) != self.comm.size:
+            raise RuntimeError(
+                f"Checkpoint was written with n_ranks={meta.get('n_ranks')}, "
+                f"current run uses {self.comm.size}. Restart requires the "
+                "same MPI rank count."
+            )
+        gdim = self._mesh.geometry.dim
+        if int(meta.get("gdim", -1)) != gdim:
+            raise RuntimeError(
+                f"Checkpoint gdim={meta.get('gdim')} != current {gdim}."
+            )
+        timestepper.t_current = float(meta["t_current"])
+        self._step_index = int(meta.get("step_index", 0))
+        # Restore dt, but fall back to the configured dt if the saved value
+        # was clamped to ~0 by the previous run ending at its t_end (so a
+        # resume to a larger t_end can still make progress).
+        saved_dt = float(meta["dt"])
+        remaining = timestepper.t_end - timestepper.t_current
+        if saved_dt > 1e-15 and saved_dt <= remaining + 1e-15:
+            timestepper.dt = saved_dt
+        else:
+            timestepper.dt = min(timestepper.dt, max(remaining, 0.0))
+
+        fp = self._fingerprint()
+        rst.load_macro_field(self.comm, self.u, ckpt_dir, fp)
+        self._u_last.x.array[:] = self.u.x.array
+        self._u_last.x.scatter_forward()
+
+        rst.load_reaction(self.comm, reaction_logger, ckpt_dir)
+
+        load_schedule(timestepper.t_current)
+        logger.info(
+            "Resumed from checkpoint at t=%.6f, dt=%.2e",
+            timestepper.t_current, timestepper.dt,
+        )
 
     def run_arc_length(self, arc_solver: CylindricalArcLength,
                        load_fn: Callable[[float], None], *,

@@ -119,7 +119,16 @@ def atomic_finalize(comm, output_dir: str) -> None:
 # Completeness check (collective)
 # ----------------------------------------------------------------------
 
-def checkpoint_complete(comm, output_dir: str) -> bool:
+def checkpoint_complete(comm, output_dir: str, *,
+                        require_rves: bool = True) -> bool:
+    """Collective check that a complete checkpoint exists.
+
+    ``require_rves`` controls whether the per-rank RVE state files
+    (``rves/rank_{r}.npz``) must be present. The two-scale macros leave it
+    at the default ``True``; the single-scale DNS solver (stateless
+    constitutive law, no RVEs) passes ``False`` — its checkpoint holds only
+    the macro displacement field, reaction history, and meta.
+    """
     ckpt_dir, _ = checkpoint_dirs(output_dir)
     if comm.rank == 0:
         ok = (
@@ -127,11 +136,12 @@ def checkpoint_complete(comm, output_dir: str) -> bool:
             and os.path.isfile(_meta_file(ckpt_dir))
             and os.path.isfile(_macro_file(ckpt_dir))
             and os.path.isfile(_reaction_file(ckpt_dir))
-            and all(
+        )
+        if ok and require_rves:
+            ok = all(
                 os.path.isfile(_rank_file(ckpt_dir, r))
                 for r in range(comm.size)
             )
-        )
         flag = 1 if ok else 0
     else:
         flag = 0
