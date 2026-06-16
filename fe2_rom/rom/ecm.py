@@ -426,6 +426,16 @@ class ECM:
                 +2 on triangle6 meshes).
     cell_chunk : int — cells per tabulation chunk in the compressed path;
                 bounds peak memory (default 4096).
+    per_qp    : bool — **default True**. Select individual (cell, quadrature-point)
+                candidates (via a ``quadrature_element`` weight) instead of whole
+                cells. Reproduces the same constraint integrals to the same
+                tolerance while the online rule evaluates only the selected
+                points — ≈ ``n_q``× fewer integrand evaluations for degree≥2
+                elements (for linear elements ``n_q``=1 and the rule is identical
+                to per-cell). Combines with ``compress_uP``. The online solver
+                (``solver_ch1`` and subclasses) auto-detects the saved
+                ``qp_meta.json`` and integrates with the matching quadrature.
+                Set ``per_qp=False`` for the classic per-cell (DG-0 weight) rule.
     kwargs    : dict or None — extra volume-integral-only constraint blocks,
                 ``name -> {"basis": (n_dofs_X, M_x) ndarray, "space":
                 FunctionSpace, "sigma": optional (M_x,) singular values,
@@ -494,6 +504,7 @@ class ECM:
                  compress_uP: int | float | None = None,
                  quad_degree: int | None = None,
                  cell_chunk: int = 4096,
+                 per_qp: bool = True,
                  kwargs: dict | None = None):
         if include_uP:
             assert basis_u is not None and V is not None, \
@@ -525,6 +536,8 @@ class ECM:
         self.compress_uP = compress_uP
         self.quad_degree = quad_degree
         self.cell_chunk = cell_chunk
+        self.per_qp = bool(per_qp)
+        self._qp_meta = None         # set by _build_matrices_qp (n_q, qdeg, ...)
         self.kappa_uP = None
         self.kappa_uP_cells = None
         self.true_residual = None
@@ -695,8 +708,147 @@ class ECM:
         assert np.allclose(A @ np.ones(dofs_Q0), b)
         return A, b
 
-    def _compressed_uP_block(self):
+    def _build_matrices_qp(self):
+        """Per-quadrature-point candidate matrix A and rhs b.
+
+        Same constraint integrals as :meth:`_build_matrices`, but each candidate
+        column is one (cell, quadrature-point) pair instead of a whole cell: the
+        integrand is tabulated at the Gauss points with the scaled weight
+        ``W[m, q] = w_q |detJ(ξ_q)|`` rather than aggregated per cell with a DG-0
+        test function. The candidate set is ``n_cells * n_q`` wide, so the greedy
+        can keep individual points — a finer, typically sparser rule than the
+        all-or-nothing per-cell selection. Column index is ``m * n_q + q``
+        (cell-major); the volume row is ``W.ravel()``.
+        """
+        import basix
+        import basix.ufl
+
+        cell_name = self.mesh.topology.cell_type.name
+        deg_u = self.V.ufl_element().degree if self.V is not None else 1
+        deg_P = self.S.ufl_element().degree if self.S is not None else 1
+        qdeg = self.quad_degree if self.quad_degree is not None else (deg_u - 1) + deg_P
+        pts, wts = basix.make_quadrature(getattr(basix.CellType, cell_name), qdeg)
+        n_q = wts.size
+        n_cells = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
+        n_col = n_cells * n_q
+
+        # Scaled quadrature weights W[cell, q] = w_q |detJ(ξ_q)| via per-point
+        # indicator assembly in a matching quadrature space (cf. _compressed_uP_block).
+        q_el = basix.ufl.quadrature_element(cell_name, value_shape=(),
+                                            scheme="default", degree=qdeg)
+        Q = fem.functionspace(self.mesh, q_el)
+        ind = fem.Function(Q)
+        cell_avg = ufl.TestFunction(self._Q0)
+        dxq = ufl.dx(domain=self.mesh,
+                     metadata={"quadrature_scheme": "default", "quadrature_degree": qdeg})
+        form_w = fem.form(ind * cell_avg * dxq)
+        W = np.empty((n_cells, n_q))
+        for q in range(n_q):
+            ind.x.array[:] = 0.0
+            ind.x.array[q::n_q] = 1.0
+            W[:, q] = petsc.assemble_vector(form_w).array
+        assert np.isclose(W.sum(), self._volume), "quadrature weight tabulation failed"
+
+        su = self.sigma_u / self.sigma_u[0] if self.N else np.ones(0)
+        sp = self.sigma_P / self.sigma_P[0] if self.M else np.ones(0)
+        theta = 0.0 if self.row_weight_tol is None else self.row_weight_tol
+        chunks = [np.arange(s, min(s + self.cell_chunk, n_cells), dtype=np.int32)
+                  for s in range(0, n_cells, self.cell_chunk)]
+
+        def tab(expr, func, basis, n_modes, cells_, n_comp):
+            out = np.empty((n_modes, cells_.size, n_q, n_comp))
+            for k in range(n_modes):
+                func.x.array[:] = basis[:, k]
+                out[k] = expr.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+            return out
+
+        A_blocks, b_blocks = [], []
+        self._n_uP_rows = 0
+
+        # ── P:∇u block — per-qp columns. With compress_uP set, the N*M rows are
+        # structured-compressed to N*K_t rows (Pass 2 of _compressed_uP_block,
+        # per_qp=True); otherwise the full N*M rows are materialised directly. ──
+        if self._include_uP and self.compress_uP is not None:
+            A_uP = self._compressed_uP_block(per_qp=True)
+            A_blocks.append(A_uP)
+            b_blocks.append(A_uP.sum(axis=1))
+            self._n_uP_rows = A_uP.shape[0]
+        elif self._include_uP:
+            bu, bP = fem.Function(self.V), fem.Function(self.S)
+            expr_gu = fem.Expression(ufl.grad(bu), pts)
+            expr_P = fem.Expression(bP, pts)
+            n_comp = int(np.prod(bP.ufl_shape))
+            A_uP = np.zeros((self.N, self.M, n_cells, n_q))
+            for cells_ in tqdm(chunks, desc="per-qp uP", disable=len(chunks) == 1):
+                Uc = tab(expr_gu, bu, self.basis_u, self.N, cells_, n_comp)
+                Gc = tab(expr_P, bP, self.basis_P, self.M, cells_, n_comp)
+                cc = np.einsum("imqc,jmqc->ijmq", Uc, Gc, optimize=True)
+                A_uP[:, :, cells_, :] = cc * W[cells_][None, None, :, :]
+            A_uP *= self.ratio_uP * su[:, None, None, None] * sp[None, :, None, None]
+            A_uP = A_uP.reshape(self.N * self.M, n_col)
+            if self.row_weight_tol is not None:
+                keep = np.outer(su, sp).ravel() >= theta
+                print(f"[per-qp] uP block: keeping {keep.sum()}/{keep.size} rows")
+                A_uP = A_uP[keep]
+            A_blocks.append(A_uP)
+            b_blocks.append(A_uP.sum(axis=1))
+            self._n_uP_rows = A_uP.shape[0]
+
+        # ── ∫P block — A[(j,c),(m,q)] = ratio_P sp_j W[m,q] Pj_c(ξ) ──────────────
+        if self._include_P_int:
+            bP = fem.Function(self.S)
+            expr_P = fem.Expression(bP, pts)
+            n_comp = int(np.prod(bP.ufl_shape))
+            A_P = np.zeros((self.M, n_comp, n_cells, n_q))
+            for cells_ in chunks:
+                Gc = tab(expr_P, bP, self.basis_P, self.M, cells_, n_comp)
+                A_P[:, :, cells_, :] = Gc.transpose(0, 3, 1, 2) * W[cells_][None, None, :, :]
+            A_P *= self.ratio_P * sp[:, None, None, None]
+            A_P = A_P.reshape(self.M * n_comp, n_col)
+            if self.row_weight_tol is not None:
+                keep = np.repeat(sp, n_comp) >= theta
+                A_P = A_P[keep]
+            A_blocks.append(A_P)
+            b_blocks.append(A_P.sum(axis=1))
+
+        # ── extra volume-integral blocks (kwargs) — A[(j,c),(m,q)] = ratio sx_j W Xj_c ──
+        for name, entry in self.extras.items():
+            basis, space, M_x = entry["basis"], entry["space"], entry["M"]
+            sx = entry["sigma"] / entry["sigma"][0]
+            ratio = entry["ratio"]
+            bx = fem.Function(space)
+            expr_x = fem.Expression(bx, pts)
+            x_shape = bx.ufl_shape
+            n_comp_x = int(np.prod(x_shape)) if x_shape else 1
+            A_x = np.zeros((M_x, n_comp_x, n_cells, n_q))
+            for cells_ in chunks:
+                Xc = tab(expr_x, bx, basis, M_x, cells_, n_comp_x)
+                A_x[:, :, cells_, :] = Xc.transpose(0, 3, 1, 2) * W[cells_][None, None, :, :]
+            A_x *= ratio * sx[:, None, None, None]
+            A_x = A_x.reshape(M_x * n_comp_x, n_col)
+            if self.row_weight_tol is not None:
+                keep = np.repeat(sx, n_comp_x) >= theta
+                A_x = A_x[keep]
+            A_blocks.append(A_x)
+            b_blocks.append(A_x.sum(axis=1))
+
+        A = np.vstack(A_blocks + [W.reshape(1, -1)])
+        b = np.concatenate(b_blocks + [[self._volume]])
+        assert np.allclose(A @ np.ones(n_col), b), "per-qp assembly consistency failed"
+        self._qp_meta = {"n_q": int(n_q), "qdeg": int(qdeg),
+                         "cell_name": cell_name, "scheme": "default"}
+        print(f"[per-qp] candidate set: {n_cells} cells x {n_q} qp = {n_col} columns, "
+              f"{A.shape[0]} constraint rows")
+        return A, b
+
+    def _compressed_uP_block(self, per_qp: bool = False):
         """Build the P·∇u block via structured data compression.
+
+        With ``per_qp=True`` the materialised block has one column per
+        (cell, quadrature-point) pair (``n_cells*n_q`` columns, index
+        ``m*n_q + q``) instead of one per cell — Pass 2 contracts only over the
+        stress components, keeping the quadrature axis. Pass 1 (the Gram matrix,
+        K_t selection, and exact rhs ``_b_uP_full``) is identical.
 
         Implements the preprocessing of Liljegren-Sailer (structured
         compression of empirical-quadrature training data): instead of
@@ -779,7 +931,7 @@ class ECM:
             B_int += Uw @ Gc.reshape(self.M, -1).T
         self._b_uP_full = (self.ratio_uP * su[:, None] * B_int).ravel()
         self._uP_tab = {"pts": pts, "W": W, "n_q": n_q, "n_comp": n_comp,
-                        "su": su, "sp": sp}
+                        "su": su, "sp": sp, "per_qp": per_qp, "n_cells": n_cells}
 
         evals, evecs = np.linalg.eigh(H)
         order = np.argsort(evals)[::-1]
@@ -811,22 +963,36 @@ class ECM:
               f"rows {self.N * self.M} -> {self.N * K_t}, "
               f"kappa={self.kappa_uP:.3e} (cell-aggregated {self.kappa_uP_cells:.3e})")
 
-        # Pass 2: materialise A_t[(i,t), m] = ratio_uP su_i Σ_{q∈m,c} W U_i Ĝ·V₁
-        # (batched GEMM per cell: (n_cells, N, n_q·n_comp) @ (n_cells, n_q·n_comp, K_t))
+        # Pass 2: materialise the compressed rows. Per-cell contracts over both
+        # the quadrature points and the components (one column per cell); per-qp
+        # contracts only over the components, keeping one column per (cell, q).
         Vt = evecs[:, :K_t]
-        A_t = np.empty((self.N, K_t, n_cells))
-        for cells_ in tqdm(chunks, desc="uP compression: rows"):
-            nc = cells_.size
-            Uc = tab(expr_gu, basis_func_u, self.basis_u, self.N, cells_)
-            Gc = tab(expr_P, basis_func_P, self.basis_P, self.M, cells_) \
-                 * sp[:, None, None, None]
-            Gt = np.tensordot(Vt, Gc, axes=(0, 0))           # (K_t, nc, q, c)
-            Gt *= W[cells_][None, :, :, None]
-            U_b = Uc.reshape(self.N, nc, -1).transpose(1, 0, 2)
-            G_b = Gt.reshape(K_t, nc, -1).transpose(1, 2, 0)
-            A_t[:, :, cells_] = np.matmul(U_b, G_b).transpose(1, 2, 0)
-        A_t *= self.ratio_uP * su[:, None, None]
-        A_t = A_t.reshape(self.N * K_t, n_cells)
+        if per_qp:
+            A_t = np.empty((self.N, K_t, n_cells, n_q))
+            for cells_ in tqdm(chunks, desc="uP compression: rows (per-qp)"):
+                Uc = tab(expr_gu, basis_func_u, self.basis_u, self.N, cells_)
+                Gc = tab(expr_P, basis_func_P, self.basis_P, self.M, cells_) \
+                     * sp[:, None, None, None]
+                Gt = np.tensordot(Vt, Gc, axes=(0, 0))       # (K_t, nc, q, c)
+                Gt *= W[cells_][None, :, :, None]
+                # A_t[i,t,m,q] = Σ_c U_i[m,q,c] Gt_t[m,q,c]
+                A_t[:, :, cells_, :] = np.einsum("imqc,tmqc->itmq", Uc, Gt, optimize=True)
+            A_t *= self.ratio_uP * su[:, None, None, None]
+            A_t = A_t.reshape(self.N * K_t, n_cells * n_q)
+        else:
+            A_t = np.empty((self.N, K_t, n_cells))
+            for cells_ in tqdm(chunks, desc="uP compression: rows"):
+                nc = cells_.size
+                Uc = tab(expr_gu, basis_func_u, self.basis_u, self.N, cells_)
+                Gc = tab(expr_P, basis_func_P, self.basis_P, self.M, cells_) \
+                     * sp[:, None, None, None]
+                Gt = np.tensordot(Vt, Gc, axes=(0, 0))           # (K_t, nc, q, c)
+                Gt *= W[cells_][None, :, :, None]
+                U_b = Uc.reshape(self.N, nc, -1).transpose(1, 0, 2)
+                G_b = Gt.reshape(K_t, nc, -1).transpose(1, 2, 0)
+                A_t[:, :, cells_] = np.matmul(U_b, G_b).transpose(1, 2, 0)
+            A_t *= self.ratio_uP * su[:, None, None]
+            A_t = A_t.reshape(self.N * K_t, n_cells)
 
         if self.row_weight_tol is not None:
             row_norms = np.linalg.norm(A_t, axis=1)
@@ -858,27 +1024,57 @@ class ECM:
         expr_gu = fem.Expression(ufl.grad(basis_func_u), pts)
         expr_P = fem.Expression(basis_func_P, pts)
 
-        points = np.asarray(magic_points, dtype=np.int32)
+        per_qp = self._uP_tab.get("per_qp", False)
+        points = np.asarray(magic_points, dtype=np.int64)
         weights = np.asarray(weights)
         r_uP = self._b_uP_full.copy()
-        for s in range(0, points.size, self.cell_chunk):
-            cells_ = points[s:s + self.cell_chunk]
-            w_ = weights[s:s + self.cell_chunk]
-            U_S = np.empty((self.N, cells_.size, n_q, n_comp))
-            for i in range(self.N):
-                basis_func_u.x.array[:] = self.basis_u[:, i]
-                U_S[i] = expr_gu.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
-            G_S = np.empty((self.M, cells_.size, n_q, n_comp))
-            for j in range(self.M):
-                basis_func_P.x.array[:] = self.basis_P[:, j]
-                G_S[j] = expr_P.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
-            G_S *= sp[:, None, None, None]
-            Uw = (U_S * W[cells_][None, :, :, None]).reshape(self.N, cells_.size, -1)
-            # A_cols[(i,j), s] = ratio_uP su_i Σ_{q,c} W U_i G_j
-            cols = np.matmul(Uw.transpose(1, 0, 2),
-                             G_S.reshape(self.M, cells_.size, -1).transpose(1, 2, 0))
-            cols = cols.transpose(1, 2, 0) * (self.ratio_uP * su[:, None, None])
-            r_uP -= cols.reshape(self.N * self.M, cells_.size) @ w_
+        if per_qp:
+            # magic points are (cell, q) pairs; reconstruct the uncompressed uP
+            # columns at exactly those points and subtract ω·col from b_uP_full.
+            cells_pt = (points // n_q).astype(np.int32)
+            q_pt = (points % n_q).astype(np.int64)
+            uniq = np.unique(cells_pt)
+            for s in range(0, uniq.size, self.cell_chunk):
+                cells_ = uniq[s:s + self.cell_chunk]
+                sel = np.flatnonzero(np.isin(cells_pt, cells_))
+                if sel.size == 0:
+                    continue
+                U_S = np.empty((self.N, cells_.size, n_q, n_comp))
+                for i in range(self.N):
+                    basis_func_u.x.array[:] = self.basis_u[:, i]
+                    U_S[i] = expr_gu.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+                G_S = np.empty((self.M, cells_.size, n_q, n_comp))
+                for j in range(self.M):
+                    basis_func_P.x.array[:] = self.basis_P[:, j]
+                    G_S[j] = expr_P.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+                G_S *= sp[:, None, None, None]
+                loc = np.searchsorted(cells_, cells_pt[sel])
+                qs = q_pt[sel]
+                UW = U_S[:, loc, qs, :] * W[cells_pt[sel], qs][None, :, None]
+                G_pt = G_S[:, loc, qs, :]
+                # contrib[(i,j)] = ratio_uP su_i Σ_p ω_p W_p Σ_c U_i(ξ_p) G_j(ξ_p)
+                ijp = np.einsum("ipc,jpc->ijp", UW, G_pt, optimize=True)
+                contrib = (ijp @ weights[sel]) * (self.ratio_uP * su[:, None])
+                r_uP -= contrib.ravel()
+        else:
+            for s in range(0, points.size, self.cell_chunk):
+                cells_ = points[s:s + self.cell_chunk].astype(np.int32)
+                w_ = weights[s:s + self.cell_chunk]
+                U_S = np.empty((self.N, cells_.size, n_q, n_comp))
+                for i in range(self.N):
+                    basis_func_u.x.array[:] = self.basis_u[:, i]
+                    U_S[i] = expr_gu.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+                G_S = np.empty((self.M, cells_.size, n_q, n_comp))
+                for j in range(self.M):
+                    basis_func_P.x.array[:] = self.basis_P[:, j]
+                    G_S[j] = expr_P.eval(self.mesh, cells_).reshape(cells_.size, n_q, n_comp)
+                G_S *= sp[:, None, None, None]
+                Uw = (U_S * W[cells_][None, :, :, None]).reshape(self.N, cells_.size, -1)
+                # A_cols[(i,j), s] = ratio_uP su_i Σ_{q,c} W U_i G_j
+                cols = np.matmul(Uw.transpose(1, 0, 2),
+                                 G_S.reshape(self.M, cells_.size, -1).transpose(1, 2, 0))
+                cols = cols.transpose(1, 2, 0) * (self.ratio_uP * su[:, None, None])
+                r_uP -= cols.reshape(self.N * self.M, cells_.size) @ w_
 
         omega = np.zeros(A.shape[1])
         omega[points] = weights
@@ -910,6 +1106,27 @@ class ECM:
         """
         if ecm_func is None:
             ecm_func = my_ecm
+        if self.per_qp:
+            auto = self._include_uP and isinstance(self.compress_uP, str)
+            if auto:
+                self._auto_tol = tol
+                self._auto_K_t_floor = 1
+            for round_ in range(max_auto_rounds if auto else 1):
+                A, b = self._build_matrices_qp()
+                self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
+                if not auto:
+                    return
+                self.true_residual = self._full_residual(
+                    A, b, self.magic_points, self.magic_weights)
+                print(f"[per-qp] auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
+                      f"{len(self.magic_points)} qps, true full-system residual "
+                      f"{self.true_residual:.3e} (tol {tol:g})")
+                if self.true_residual <= tol or self._K_t_used >= self.M:
+                    return
+                self._auto_K_t_floor = int(min(self.M, max(len(self.magic_points) + 10,
+                                                           1.5 * self._K_t_used)))
+            print("[per-qp] auto-K_t: max_auto_rounds reached, keeping last result")
+            return
         auto = self._include_uP and isinstance(self.compress_uP, str)
         if auto:
             self._auto_tol = tol
@@ -936,7 +1153,10 @@ class ECM:
         assert self.magic_points is not None, "Call compute_magic first"
         tdim = self.mesh.topology.dim
         self.mesh.topology.create_entities(tdim)
-        indices = np.unique(np.asarray(self.magic_points, dtype=np.int32))
+        mp = np.asarray(self.magic_points, dtype=np.int64)
+        # per-qp magic points are (cell, q) pairs flattened as m*n_q+q → reduce to cells
+        cells = mp // self._qp_meta["n_q"] if self.per_qp else mp
+        indices = np.unique(cells).astype(np.int32)
         values = 999 * np.ones_like(indices, dtype=np.int32)
         cell_tags = dmesh.meshtags(self.mesh, tdim, indices, values)
         with XDMFFile(self.mesh.comm, filename, "w") as xdmf:
@@ -978,6 +1198,8 @@ class ECM:
         import os
         assert self.magic_points is not None, "Call compute_magic first"
         os.makedirs(output_dir, exist_ok=True)
+        if self.per_qp:
+            return self._save_variant2_qp(output_dir)
 
         _, indices = self._make_cell_tags_and_indices()
         tdim = self.mesh.topology.dim
@@ -1000,6 +1222,69 @@ class ECM:
             np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
             np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
 
+    def _save_variant2_qp(self, output_dir):
+        """Save the per-qp rule: active-cell submesh + quadrature_element weights.
+
+        Saves
+        -----
+        indices.npy      : (n_active,) int32 — parent cell indices of active cells
+        omega_q_sub.npy  : (n_dofs_Qq_sub,)  — ECM weights at the magic qps, 0 else
+        qp_meta.json     : {mode, qdeg, n_q, scheme, gdim, degree}
+        basis_u_sub.npy  : (n_dofs_V_sub, N) — displacement modes on the submesh
+        basis_u.npy      : (n_dofs_V, N)     — full-mesh displacement modes
+
+        The online side rebuilds the same quadrature_element on the submesh and
+        integrates ``integrand * omega_q * dx`` with metadata
+        ``{"quadrature_scheme": scheme, "quadrature_degree": qdeg}`` — the qps
+        with omega_q == 0 (non-magic) contribute nothing.
+        """
+        import os
+        import json
+        import basix.ufl
+        assert self._qp_meta is not None, "per-qp build did not run"
+        n_q = self._qp_meta["n_q"]
+        qdeg = self._qp_meta["qdeg"]
+        cell_name = self._qp_meta["cell_name"]
+        scheme = self._qp_meta["scheme"]
+
+        mp = np.asarray(self.magic_points, dtype=np.int64)
+        mw = np.asarray(self.magic_weights, dtype=float)
+        cells = (mp // n_q).astype(np.int32)
+        localq = (mp % n_q).astype(np.int64)
+        indices = np.unique(cells)
+
+        tdim = self.mesh.topology.dim
+        self.mesh.topology.create_entities(tdim)
+        submesh, cell_map, _, _ = dmesh.create_submesh(self.mesh, tdim, indices)
+        cell_map_arr = _cell_map_to_array(cell_map, submesh)   # sub -> parent
+        parent_to_sub = {int(p): s for s, p in enumerate(cell_map_arr)}
+
+        q_el = basix.ufl.quadrature_element(cell_name, value_shape=(),
+                                            scheme=scheme, degree=qdeg)
+        Qq_sub = fem.functionspace(submesh, q_el)
+        omega_q = fem.Function(Qq_sub)
+        omega_q.x.array[:] = 0.0
+        for k in range(mp.size):
+            sub_c = parent_to_sub[int(cells[k])]
+            dofs = Qq_sub.dofmap.cell_dofs(sub_c)
+            omega_q.x.array[dofs[int(localq[k])]] = mw[k]
+
+        np.save(os.path.join(output_dir, "indices.npy"), indices)
+        np.save(os.path.join(output_dir, "omega_q_sub.npy"), omega_q.x.array.copy())
+        with open(os.path.join(output_dir, "qp_meta.json"), "w") as f:
+            json.dump({"mode": "per_qp", "qdeg": int(qdeg), "n_q": int(n_q),
+                       "scheme": scheme, "gdim": int(self.gdim),
+                       "degree": int(self.degree)}, f)
+
+        if self.basis_u is not None:
+            V_sub = fem.functionspace(submesh, ("Lagrange", self.degree, (self.gdim,)))
+            basis_u_sub = np.stack([
+                _parent_to_sub_array(self.basis_u[:, i], self.V, V_sub, cell_map)
+                for i in range(self.N)
+            ]).T
+            np.save(os.path.join(output_dir, "basis_u_sub.npy"), basis_u_sub)
+            np.save(os.path.join(output_dir, "basis_u.npy"), self.basis_u)
+
     # ── integration test variants ─────────────────────────────────────────────
 
     def test_variant1(self, n_trials=10000):
@@ -1011,6 +1296,11 @@ class ECM:
         `n_trials` random mode pairs. Requires basis_u and basis_P.
         """
         assert self.magic_points is not None, "Call compute_magic first"
+        if self.per_qp:
+            raise NotImplementedError(
+                "test_variant* are per-cell (DG-0) diagnostics; a per_qp rule is "
+                "verified by compute_magic's true_residual and consumed online by "
+                "solver_ch1 (quadrature_element weight). Pass per_qp=False to use these.")
         dx = ufl.dx(domain=self.mesh)
         cell_tags, _ = self._make_cell_tags_and_indices()
         dx_hr = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags)
@@ -1058,6 +1348,11 @@ class ECM:
         saved by :meth:`save_variant2`. Requires basis_u and basis_P.
         """
         assert self.magic_points is not None, "Call compute_magic first"
+        if self.per_qp:
+            raise NotImplementedError(
+                "test_variant* are per-cell (DG-0) diagnostics; a per_qp rule is "
+                "verified by compute_magic's true_residual and consumed online by "
+                "solver_ch1 (quadrature_element weight). Pass per_qp=False to use these.")
         dx = ufl.dx(domain=self.mesh)
         _, indices = self._make_cell_tags_and_indices()
         tdim = self.mesh.topology.dim
@@ -1119,6 +1414,11 @@ class ECM:
         :func:`_write_submesh_to_gmsh`). Requires basis_u and basis_P.
         """
         assert self.magic_points is not None, "Call compute_magic first"
+        if self.per_qp:
+            raise NotImplementedError(
+                "test_variant* are per-cell (DG-0) diagnostics; a per_qp rule is "
+                "verified by compute_magic's true_residual and consumed online by "
+                "solver_ch1 (quadrature_element weight). Pass per_qp=False to use these.")
         dx = ufl.dx(domain=self.mesh)
         _, indices = self._make_cell_tags_and_indices()
         tdim = self.mesh.topology.dim
