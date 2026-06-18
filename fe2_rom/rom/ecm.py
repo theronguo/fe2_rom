@@ -25,7 +25,8 @@ def petsc_to_scipy(mat):
 # ── Built-in ECM algorithm (replaceable by user) ──────────────────────────────
 
 def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
-           backward_prune=True):
+           backward_prune=True, checkpoint_dir=None, checkpoint_interval=50,
+           prune_interval=None, prune_weight_tol=1e-6, on_checkpoint=None):
     """Empirical cubature method via greedy non-negative pursuit.
 
     Greedy max-correlation selection with a Lawson-Hanson-style
@@ -56,13 +57,41 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
         (greedy never revisits a point once added, so the final set usually
         contains some). Costs one Gram re-factorisation per attempted
         removal. Default True.
+    checkpoint_dir : str or None
+        If set, save a checkpoint every `checkpoint_interval` greedy steps
+        and a final checkpoint on completion. On startup, if a checkpoint
+        file already exists in this directory the run resumes from it.
+        The directory is created if it does not exist.
+    checkpoint_interval : int
+        Save a checkpoint every this many greedy iterations (default 50).
+        Also triggers a save whenever the tolerance or max_points cap is
+        reached, and after the final backward pruning.
+    prune_interval : int or None
+        If set, remove near-zero weight points every this many greedy
+        iterations. Any point with ``alpha[i] < prune_weight_tol * max(alpha)``
+        is dropped and becomes a candidate again (``in_S`` is cleared), so the
+        greedy can re-select it later if needed. This shrinks the active Gram
+        system and can avoid accumulating dead-weight points. The budget-based
+        backward pruning (``backward_prune``) still runs at the end. Default
+        None (no mid-run pruning).
+    prune_weight_tol : float
+        Relative weight threshold for mid-run pruning: drop any point whose
+        weight is below ``prune_weight_tol * max(alpha)`` (default 1e-6).
+    on_checkpoint : callable(S, alpha) or None
+        If set, called after every checkpoint save with the current selected
+        indices and weights. Useful for saving derived artefacts (e.g.
+        ``ECM.save_variant2``) at checkpoint frequency.
 
     Returns
     -------
     magic_points : list of int   — selected candidate indices
     alpha        : ndarray       — non-negative weights
     """
-    print(f"A shape: {A.shape}, b shape: {b.shape}, tol: {tol}, candidate_batch: {candidate_batch}")
+    import os
+    import pickle
+
+    print(f"A shape: {A.shape}, b shape: {b.shape}, tol: {tol}, "
+          f"candidate_batch: {candidate_batch}, max_points: {max_points}")
     n_rows, n_cand = A.shape
     rng = np.random.default_rng(seed)
     col_norms = np.linalg.norm(A, axis=0)
@@ -113,7 +142,153 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
         beta[:m] = beta[kept]
         return m
 
-    print((k_iter, len(alpha), n_repair), 1.0)
+    def _save_ckpt():
+        k = len(S)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        tmp = os.path.join(checkpoint_dir, "ecm_checkpoint.tmp.npz")
+        np.savez(tmp,
+                 S_arr=np.array(S, dtype=np.int64),
+                 alpha=alpha,
+                 k_iter=np.array([k_iter]),
+                 n_repair=np.array([n_repair]),
+                 r=r,
+                 AS_k=AS[:, :k].copy(),
+                 G_k=G[:k, :k].copy(),
+                 beta_k=beta[:k].copy())
+        os.replace(tmp, os.path.join(checkpoint_dir, "ecm_checkpoint.npz"))
+        with open(os.path.join(checkpoint_dir, "ecm_rng_state.pkl"), "wb") as fh:
+            pickle.dump(rng.bit_generator.state, fh)
+        print(f"ECM checkpoint saved: {k} points, step {k_iter}, "
+              f"residual {np.linalg.norm(r) / b_norm:.3e}")
+        if on_checkpoint is not None:
+            on_checkpoint(list(S), alpha.copy())
+
+    def _prune_pass():
+        """One full backward-pruning pass; returns number of points removed."""
+        nonlocal alpha, r
+        n_removed = 0
+        while len(S) > 1:
+            k = len(S)
+            try:
+                cf = cho_factor(G[:k, :k], lower=True)
+            except np.linalg.LinAlgError:
+                break
+            Ginv_diag = np.abs(np.diagonal(cho_solve(cf, np.eye(k))))
+            sq_inc = alpha ** 2 / Ginv_diag
+            pos = int(np.argmin(sq_inc))
+            if np.linalg.norm(r) ** 2 + sq_inc[pos] > (tol * b_norm) ** 2:
+                break
+            # trial removal on copies, with Lawson-Hanson repair
+            idx = np.delete(np.arange(k), pos)
+            G_t = G[np.ix_(idx, idx)]
+            beta_t = beta[idx]
+            alpha_feas = np.clip(alpha[idx], 0.0, None)
+            alpha_t = None
+            while True:
+                try:
+                    alpha_t = cho_solve(cho_factor(G_t, lower=True), beta_t)
+                except np.linalg.LinAlgError:
+                    alpha_t = None
+                    break
+                if np.all(alpha_t >= 0.0):
+                    break
+                neg = alpha_t < 0.0
+                t = alpha_feas[neg] / (alpha_feas[neg] - alpha_t[neg])
+                theta = min(float(t.min()), 1.0)
+                alpha_feas = alpha_feas + theta * (alpha_t - alpha_feas)
+                keep_t = alpha_feas > 1e-12 * alpha_feas.max()
+                if keep_t.all():
+                    keep_t[int(np.argmin(alpha_feas))] = False
+                idx = idx[keep_t]
+                G_t = G_t[np.ix_(keep_t, keep_t)]
+                beta_t = beta_t[keep_t]
+                alpha_feas = np.clip(alpha_feas[keep_t], 0.0, None)
+            if alpha_t is None:
+                break
+            r_t = b - AS[:, idx] @ alpha_t
+            if np.linalg.norm(r_t) / b_norm > tol:
+                break
+            keep = np.zeros(k, dtype=bool)
+            keep[idx] = True
+            drop(keep)
+            n_removed += k - len(S)
+            alpha = alpha_t
+            r = r_t
+        return n_removed
+
+    def _weight_prune_pass():
+        """Drop points with alpha < prune_weight_tol*max(alpha) and re-solve.
+
+        These points contribute essentially nothing; freeing them (in_S cleared)
+        lets the greedy potentially re-select them later at a better moment.
+        Works mid-run (no residual-budget requirement). Returns number removed.
+        """
+        nonlocal alpha, r
+        if len(S) < 2 or alpha.size == 0:
+            return 0
+        threshold = prune_weight_tol * float(alpha.max())
+        keep_mask = alpha >= threshold
+        n_removed = int((~keep_mask).sum())
+        if n_removed == 0:
+            return 0
+        alpha_kept = alpha[keep_mask].copy()
+        drop(keep_mask)
+        k_new = len(S)
+        if k_new == 0:
+            alpha = np.empty(0)
+            r = b.copy()
+            return n_removed
+        # Re-solve with Lawson-Hanson repair so alpha stays non-negative.
+        alpha_feas = np.clip(alpha_kept, 0.0, None)
+        alpha_new = solve(k_new)
+        while np.any(alpha_new < 0.0):
+            neg = alpha_new < 0.0
+            t_vals = alpha_feas[neg] / (alpha_feas[neg] - alpha_new[neg])
+            theta = min(float(t_vals.min()), 1.0)
+            alpha_feas = alpha_feas + theta * (alpha_new - alpha_feas)
+            keep2 = alpha_feas > 1e-12 * alpha_feas.max()
+            if keep2.all():
+                keep2[int(np.argmin(alpha_feas))] = False
+            prev_k = len(S)
+            drop(keep2)
+            n_removed += prev_k - len(S)
+            k_new = len(S)
+            if k_new == 0:
+                alpha = np.empty(0)
+                r = b.copy()
+                return n_removed
+            alpha_feas = np.clip(alpha_feas[keep2], 0.0, None)
+            alpha_new = solve(k_new)
+        alpha = alpha_new
+        r = b - AS[:, :k_new] @ alpha
+        return n_removed
+
+    # ── Checkpoint restart ────────────────────────────────────────────────────
+    if checkpoint_dir is not None:
+        ckpt_file = os.path.join(checkpoint_dir, "ecm_checkpoint.npz")
+        if os.path.exists(ckpt_file):
+            data = np.load(ckpt_file)
+            S_loaded = data["S_arr"].tolist()
+            k_loaded = len(S_loaded)
+            while cap < k_loaded:
+                grow()
+            S.extend(S_loaded)
+            in_S[S_loaded] = True
+            alpha = data["alpha"]
+            k_iter = int(data["k_iter"][0])
+            n_repair = int(data["n_repair"][0])
+            r = data["r"].copy()
+            AS[:, :k_loaded] = data["AS_k"]
+            G[:k_loaded, :k_loaded] = data["G_k"]
+            beta[:k_loaded] = data["beta_k"]
+            rng_pkl = os.path.join(checkpoint_dir, "ecm_rng_state.pkl")
+            if os.path.exists(rng_pkl):
+                with open(rng_pkl, "rb") as fh:
+                    rng.bit_generator.state = pickle.load(fh)
+            print(f"ECM restarted from checkpoint: {k_loaded} points, step {k_iter}, "
+                  f"residual {np.linalg.norm(r) / b_norm:.3e}")
+
+    print((k_iter, len(S), n_repair), np.linalg.norm(r) / b_norm)
     while np.linalg.norm(r) / b_norm > tol:
         if max_points is not None and len(S) >= max_points:
             print(f"ECM: max_points={max_points} reached, stopping early")
@@ -163,6 +338,17 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
         k_iter += 1
         print((k_iter, len(alpha), n_repair), np.linalg.norm(r) / b_norm)
 
+        # periodic checkpoint save
+        if checkpoint_dir is not None and k_iter % checkpoint_interval == 0:
+            _save_ckpt()
+
+        # periodic weight-threshold pruning (works mid-run unlike budget pruning)
+        if prune_interval is not None and k_iter % prune_interval == 0 and len(S) > 1:
+            n_rem = _weight_prune_pass()
+            if n_rem:
+                print(f"[step {k_iter}] periodic prune: removed {n_rem} -> {len(S)} points, "
+                      f"residual {np.linalg.norm(r) / b_norm:.3e}")
+
     # ── backward pruning: drop points made redundant by later additions ─────
     # The greedy never revisits a point once added. Removing column j from an
     # unconstrained least-squares fit increases the squared residual by
@@ -170,57 +356,14 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
     # removal candidates. Each removal is verified on trial copies (including
     # the non-negativity repair) before being committed.
     if backward_prune and len(S) > 1:
-        n_removed = 0
-        while len(S) > 1:
-            k = len(S)
-            try:
-                cf = cho_factor(G[:k, :k], lower=True)
-            except np.linalg.LinAlgError:
-                break
-            Ginv_diag = np.abs(np.diagonal(cho_solve(cf, np.eye(k))))
-            sq_inc = alpha ** 2 / Ginv_diag
-            pos = int(np.argmin(sq_inc))
-            if np.linalg.norm(r) ** 2 + sq_inc[pos] > (tol * b_norm) ** 2:
-                break
-            # trial removal on copies, with Lawson-Hanson repair
-            idx = np.delete(np.arange(k), pos)
-            G_t = G[np.ix_(idx, idx)]
-            beta_t = beta[idx]
-            alpha_feas = np.clip(alpha[idx], 0.0, None)
-            alpha_t = None
-            while True:
-                try:
-                    alpha_t = cho_solve(cho_factor(G_t, lower=True), beta_t)
-                except np.linalg.LinAlgError:
-                    alpha_t = None
-                    break
-                if np.all(alpha_t >= 0.0):
-                    break
-                neg = alpha_t < 0.0
-                t = alpha_feas[neg] / (alpha_feas[neg] - alpha_t[neg])
-                theta = min(float(t.min()), 1.0)
-                alpha_feas = alpha_feas + theta * (alpha_t - alpha_feas)
-                keep_t = alpha_feas > 1e-12 * alpha_feas.max()
-                if keep_t.all():
-                    keep_t[int(np.argmin(alpha_feas))] = False
-                idx = idx[keep_t]
-                G_t = G_t[np.ix_(keep_t, keep_t)]
-                beta_t = beta_t[keep_t]
-                alpha_feas = np.clip(alpha_feas[keep_t], 0.0, None)
-            if alpha_t is None:
-                break
-            r_t = b - AS[:, idx] @ alpha_t
-            if np.linalg.norm(r_t) / b_norm > tol:
-                break
-            keep = np.zeros(k, dtype=bool)
-            keep[idx] = True
-            drop(keep)
-            n_removed += k - len(S)
-            alpha = alpha_t
-            r = r_t
+        n_removed = _prune_pass()
         if n_removed:
             print(f"backward prune: removed {n_removed} -> {len(S)} points, "
                   f"residual {np.linalg.norm(r) / b_norm:.3e}")
+
+    if checkpoint_dir is not None:
+        _save_ckpt()
+
     return S, alpha
 
 
@@ -1084,7 +1227,10 @@ class ECM:
                       + np.linalg.norm(b[self._n_uP_rows:]) ** 2)
         return float(num / den)
 
-    def compute_magic(self, ecm_func=None, tol=1e-6, max_auto_rounds=4, **ecm_func_kwargs):
+    def compute_magic(self, ecm_func=None, tol=1e-6, max_auto_rounds=4,
+                      max_points=None, checkpoint_dir=None,
+                      checkpoint_interval=50, prune_interval=None,
+                      prune_weight_tol=1e-6, **ecm_func_kwargs):
         """Compute magic points and weights.
 
         Parameters
@@ -1093,9 +1239,18 @@ class ECM:
         tol      : relative residual tolerance passed to ecm_func
         max_auto_rounds : int — with ``compress_uP="auto"``, maximum number of
             train-verify-retry rounds (K_t doubles each retry).
-        **ecm_func_kwargs : forwarded to ecm_func — e.g. ``candidate_batch=100``
-            (and optional ``seed``) to use the stochastic-greedy subset selection
-            in :func:`my_ecm`.
+        max_points : int or None — hard cap on the number of selected points;
+            the greedy stops as soon as this many have been selected.
+        checkpoint_dir : str or None — directory for periodic checkpoints so a
+            long run can be resumed after interruption (see :func:`my_ecm`).
+        checkpoint_interval : int — save a checkpoint every this many greedy
+            steps (default 50; only used when checkpoint_dir is set).
+        prune_interval : int or None — drop near-zero weight points every this
+            many greedy steps (default None = no mid-run pruning).
+        prune_weight_tol : float — relative weight threshold for mid-run pruning
+            (default 1e-6; see :func:`my_ecm`).
+        **ecm_func_kwargs : remaining kwargs forwarded to ecm_func — e.g.
+            ``candidate_batch=100`` for stochastic-greedy subset selection.
 
         Results are stored in ``self.magic_points`` (active cell indices) and
         ``self.magic_weights`` (their non-negative quadrature weights). With
@@ -1106,6 +1261,24 @@ class ECM:
         """
         if ecm_func is None:
             ecm_func = my_ecm
+        # Inject convenience params; explicit **ecm_func_kwargs take precedence
+        # if the same key appears in both.
+        _extra = {}
+        if max_points is not None:
+            _extra["max_points"] = max_points
+        if checkpoint_dir is not None:
+            _extra["checkpoint_dir"] = checkpoint_dir
+            _extra["checkpoint_interval"] = checkpoint_interval
+            def _ckpt_cb(S_curr, alpha_curr):
+                self.magic_points = S_curr
+                self.magic_weights = alpha_curr
+                self.save_variant2(checkpoint_dir)
+            _extra["on_checkpoint"] = _ckpt_cb
+        if prune_interval is not None:
+            _extra["prune_interval"] = prune_interval
+            _extra["prune_weight_tol"] = prune_weight_tol
+        _call_kw = {**_extra, **ecm_func_kwargs}
+
         if self.per_qp:
             auto = self._include_uP and isinstance(self.compress_uP, str)
             if auto:
@@ -1113,7 +1286,7 @@ class ECM:
                 self._auto_K_t_floor = 1
             for round_ in range(max_auto_rounds if auto else 1):
                 A, b = self._build_matrices_qp()
-                self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
+                self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **_call_kw)
                 if not auto:
                     return
                 self.true_residual = self._full_residual(
@@ -1133,7 +1306,7 @@ class ECM:
             self._auto_K_t_floor = 1
         for round_ in range(max_auto_rounds if auto else 1):
             A, b = self._build_matrices()
-            self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **ecm_func_kwargs)
+            self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **_call_kw)
             if not auto:
                 return
             self.true_residual = self._full_residual(A, b, self.magic_points, self.magic_weights)
