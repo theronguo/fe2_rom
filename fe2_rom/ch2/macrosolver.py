@@ -72,8 +72,8 @@ class MacroSecondOrderSolver:
         *,
         degree: int = 1,
         u_degree: int | None = None,
-        lagrange_degree: int = 0,
-        lagrange_discontinuous: bool = True,
+        lagrange_degree: int | None = None,
+        lagrange_discontinuous: bool | None = None,
         snes_options: dict | None = None,
         check_stability: bool = False,
         perturb_post_buckling: bool = False,
@@ -101,15 +101,28 @@ class MacroSecondOrderSolver:
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
         # ---- Mixed space [u, H = F̂−I, L̄ (multiplier)] ----
-        # Paper element (Guo et al.): Q2 displacement, Q1 deformation gradient,
-        # Q0 (DG0) multiplier — the inf-sup-stable Taylor-Hood-like triple with
-        # the displacement one order above F̂. The extra order on u makes ⟨λ:∇u⟩
-        # rich enough to pin the DG0 multiplier, so there is no Q1–P0
-        # checkerboard and no stabilization is needed. ``degree`` is the F̂
-        # degree (1); ``u_degree`` defaults to ``degree + 1`` (2). Setting
-        # ``u_degree = degree`` recovers the unstable Q1–Q1–DG0 element, for which
-        # the ``lagrange_stab`` multiplier regularization (−ε⟨L̄:δL̄⟩) is required.
+        # ``degree`` is the F̂ (P1) degree; ``u_degree`` defaults to ``degree + 1``
+        # (P2) — the displacement one order above F̂ makes ⟨L̄:∇u⟩ rich.
+        #
+        # Multiplier (L̄) default: a *continuous* P1 multiplier in the same space
+        # as F̂  ⇒  P2-P1-P1, both 2D and 3D (override via ``lagrange_degree`` /
+        # ``lagrange_discontinuous``). With L̄ in the F̂ space the ⟨L̄:F̂⟩ coupling
+        # is a coercive mass matrix (multiplier dofs ∝ vertices), which is
+        # inf-sup (LBB) stable in 2D and 3D with no ``lagrange_stab``, and is
+        # better-conditioned at fine meshes than the DG0 alternative.
+        #
+        # The original paper element (Guo et al.) is P2-P1-DG0 — recover it with
+        # ``lagrange_degree=0, lagrange_discontinuous=True``. DG0 is inf-sup
+        # stable on 2D triangles but UNSTABLE on 3D tetrahedra (the DG0
+        # multiplier has more modes, ∝ cells, than (u, F̂) can pin, and the
+        # spurious-mode count grows with refinement). For unstable choices the
+        # ``lagrange_stab`` regularization (−ε⟨L̄:δL̄⟩) is a fallback, but it
+        # biases the solution by O(ε).
         u_deg = degree + 1 if u_degree is None else int(u_degree)
+        if lagrange_degree is None:
+            lagrange_degree = degree
+        if lagrange_discontinuous is None:
+            lagrange_discontinuous = False
         cell = mesh.topology.cell_type.name
         P_u = basix.ufl.element("Lagrange", cell, u_deg, shape=(g,))
         P_H = basix.ufl.element("Lagrange", cell, degree, shape=(g, g))
