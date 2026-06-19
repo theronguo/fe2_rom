@@ -66,17 +66,23 @@ class MacroFit:
         ``V, w, qmap, Res, _test, comm`` and (after ``setup``) ``_bcs,
         _reaction_specs, _Jac_form, _Res_form, _problem``.
     model
-        The :class:`EnergyNet` whose weights are fit. Its parameters are set
-        ``requires_grad=True`` so they are visible to the sensitivity machinery.
+        The :class:`EnergyNet` whose weights are fit.
     material
         The NN material wrapping ``model`` (must provide ``refresh_from_model``).
+    field_attr, test_attr
+        Names of the solver's solution :class:`fem.Function` and test
+        :class:`ufl.Argument` — ``("w", "_test")`` for the mixed MM/CH2 drivers,
+        ``("u", "_v")`` for the CH1 ``MacroSolver``.
     """
 
-    def __init__(self, solver, model, material):
+    def __init__(self, solver, model, material, *,
+                 field_attr="w", test_attr="_test"):
         self.solver = solver
         self.model = model
         self.material = material
         self.comm = solver.comm
+        self._field_attr = field_attr
+        self._test_attr = test_attr
         self._levels: list[float] | None = None
         self._loadhistory = None
         # forward cache keyed by the exact theta vector
@@ -85,6 +91,16 @@ class MacroFit:
         self._cache_w: list[np.ndarray] | None = None
         self._cache_ok: bool = True
         self._is_setup = False
+
+    @property
+    def _field(self):
+        """The solver's solution Function (``w`` for MM/CH2, ``u`` for CH1)."""
+        return getattr(self.solver, self._field_attr)
+
+    @property
+    def _testfn(self):
+        """The solver's test Argument (``_test`` for MM/CH2, ``_v`` for CH1)."""
+        return getattr(self.solver, self._test_attr)
 
     # -- construction -------------------------------------------------------
 
@@ -113,6 +129,25 @@ class MacroFit:
             snes_options=snes_options, check_stability=False,
         )
         return cls(solver, model, material)
+
+    @classmethod
+    def for_ch1(cls, model, mesh, *, n_qp=2, degree=1, gdim=None,
+                snes_options=None, torch_threads=1):
+        """Build the CH1 stack: ``NNRVEMaterial`` + ``MacroSolver`` (closed-form
+        law, no inner RVE). ``add_bc`` takes an integer displacement component."""
+        from fe2_rom.ch1.macrosolver import MacroSolver
+        from fe2_rom.ch1.nn_material import NNRVEMaterial
+
+        if model.flavor != "ch1":
+            raise ValueError(
+                f"for_ch1 needs a flavor='ch1' EnergyNet, got {model.flavor!r}.")
+        material = NNRVEMaterial(model, torch_threads=torch_threads)
+        solver = MacroSolver(
+            mesh, n_qp=n_qp, material=material,
+            gdim=model.gdim if gdim is None else gdim,
+            degree=degree, snes_options=snes_options, check_stability=False,
+        )
+        return cls(solver, model, material, field_attr="u", test_attr="_v")
 
     # -- registration (passthrough to the solver) ---------------------------
 
@@ -166,9 +201,10 @@ class MacroFit:
 
         self._set_weights(theta)
         s = self.solver
+        w = self._field
         # Start each trajectory from the reference state; continue level-to-level.
-        s.w.x.array[:] = 0.0
-        s.w.x.scatter_forward()
+        w.x.array[:] = 0.0
+        w.x.scatter_forward()
 
         R = np.zeros(len(self._levels))
         w_states: list[np.ndarray] = []
@@ -182,7 +218,7 @@ class MacroFit:
                 conv = False
             ok = ok and conv
             R[k] = self._reaction_value()
-            w_states.append(s.w.x.array.copy())
+            w_states.append(w.x.array.copy())
 
         self._cache_theta = theta.copy()
         self._cache_R = R
@@ -215,13 +251,14 @@ class MacroFit:
         theta = np.asarray(theta, dtype=np.float64)
         self._run_forward(theta)  # ensures cached w-states for this theta
         s = self.solver
+        w = self._field
         J = np.zeros((len(self._levels), self.n_params))
         for k, level in enumerate(self._levels):
             # Restore the converged state of this level and refresh the qmap
             # (fluxes + tangent) at (w_k, theta).
             self._loadhistory(level)
-            s.w.x.array[:] = self._cache_w[k]
-            s.w.x.scatter_forward()
+            w.x.array[:] = self._cache_w[k]
+            w.x.scatter_forward()
             s.qmap.update()
             J[k, :] = self._level_sensitivity()
         return J
@@ -277,7 +314,7 @@ class MacroFit:
         ``replace(Res, {test: c})`` w.r.t. each flux quadrature-function."""
         s = self.solver
         qmap = s.qmap
-        Rc = ufl.replace(s.Res, {s._test: c})
+        Rc = ufl.replace(s.Res, {self._testfn: c})
         blocks = []
         for name in self.material.fluxes.keys():
             flux_qf = qmap.fluxes[name]
