@@ -149,6 +149,27 @@ class MacroFit:
         )
         return cls(solver, model, material, field_attr="u", test_attr="_v")
 
+    @classmethod
+    def for_mm(cls, model, mesh, *, n_qp=2, degree=1, snes_options=None,
+               torch_threads=1):
+        """Build the MM stack: ``NNMicromorphicMaterial`` + ``MacroMicromorphicSolver``.
+
+        ``N_modes`` is taken from the model. ``add_bc`` uses the mixed-space
+        signature: ``(0, comp)`` for displacement, ``(i+1,)`` for amplitude
+        ``v_i`` (see the solver)."""
+        from fe2_rom.mm.macrosolver import MacroMicromorphicSolver
+        from fe2_rom.mm.nn_material import NNMicromorphicMaterial
+
+        if model.flavor != "mm":
+            raise ValueError(
+                f"for_mm needs a flavor='mm' EnergyNet, got {model.flavor!r}.")
+        material = NNMicromorphicMaterial(model, torch_threads=torch_threads)
+        solver = MacroMicromorphicSolver(
+            mesh, n_qp=n_qp, N_modes=model.n_modes, material=material,
+            degree=degree, snes_options=snes_options, check_stability=False,
+        )
+        return cls(solver, model, material)
+
     # -- registration (passthrough to the solver) ---------------------------
 
     def add_bc(self, *args, **kwargs):
