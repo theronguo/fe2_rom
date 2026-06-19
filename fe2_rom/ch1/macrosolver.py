@@ -135,12 +135,12 @@ class MacroSolver:
     def __init__(
         self,
         mesh,
-        full: bool,
-        n_qp: int,
+        full: bool = None,
+        n_qp: int = 2,
         *,
-        # --- inner RVE configuration (required) ---
-        rve_mesh_path: str,
-        rve_material,
+        # --- inner RVE configuration (required unless ``material`` is given) ---
+        rve_mesh_path: str | None = None,
+        rve_material=None,
         # --- common to MicroSolver and ReducedMicroSolver ---
         gdim: int = 3,
         rve_degree: int = 2,
@@ -179,18 +179,31 @@ class MacroSolver:
         snes_options: dict | None = None,
         check_stability: bool = False,
         stability_options: dict | None = None,
+        # --- closed-form / surrogate constitutive law (no inner RVE) ---
+        # A ready-made dolfinx_materials Material (gradients={"F"}, fluxes=
+        # {"PK1"}) used directly — exactly like passing a material to
+        # MacroMicromorphicSolver. When given, the inner-RVE configuration and
+        # the RVE checkpoint/restart are skipped (the law is stateless).
+        material=None,
     ):
-        if not full and rom_dir is None:
-            raise ValueError("rom_dir is required when full=False (reduced inner RVE).")
+        self._closed_form = material is not None
         if mesh.geometry.dim != gdim:
             raise ValueError(
                 f"mesh.geometry.dim ({mesh.geometry.dim}) != gdim ({gdim})."
             )
+        if not self._closed_form:
+            if full is None:
+                raise ValueError(
+                    "MacroSolver needs either material=... (a closed-form law) "
+                    "or full=True/False with an inner-RVE configuration."
+                )
+            if not full and rom_dir is None:
+                raise ValueError("rom_dir is required when full=False (reduced inner RVE).")
 
         self._mesh = mesh
         self.comm = mesh.comm
         self.gdim = gdim
-        self._full = bool(full)
+        self._full = (not self._closed_form) and bool(full)
         self._n_qp_per_cell = int(n_qp)
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
 
@@ -265,7 +278,10 @@ class MacroSolver:
 
         # Material bridge + qmap (RVEMaterial needs gdim so its F-vector
         # convention matches the macro grad(u) — 5 entries in 2D, 9 in 3D).
-        self.material = RVEMaterial(self._make_rve, gdim=gdim)
+        if self._closed_form:
+            self.material = material
+        else:
+            self.material = RVEMaterial(self._make_rve, gdim=gdim)
         # OwnedCellQuadratureMap evaluates the (expensive) RVE on owned cells
         # only and scatters flux/tangent to the ghost layer, avoiding redundant
         # ghost-cell RVE solves under MPI (see fe2_rom.ch1.quadrature).
