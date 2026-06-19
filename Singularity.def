@@ -21,6 +21,10 @@ dependencies:
     - scikit-learn==1.8.0
     - jax==0.10.0
     - jaxmat==0.0.3
+    - --extra-index-url https://download.pytorch.org/whl/cpu
+    - torch==2.12.0
+    - lightning==2.6.5
+    - tensorboard==2.20.0
 EOF
     mamba env create -f /tmp/environment.yml
     mamba clean --all --yes
