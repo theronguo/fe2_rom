@@ -51,9 +51,8 @@ class NNRVEMaterial(Material):
 
     def __init__(self, model, gdim: int | None = None, torch_threads: int = 1):
         # fe2_rom.nn guards the dolfinx-before-torch load order.
-        from fe2_rom.nn.model import EnergyNet, make_lab_energy
+        from fe2_rom.nn.model import EnergyNet
         import torch
-        from torch.func import grad, jacfwd, vmap
 
         torch.set_num_threads(torch_threads)
 
@@ -72,7 +71,20 @@ class NNRVEMaterial(Material):
         self._gdim = model.gdim
         _, self._F_dim = _f_order(self._gdim)
 
-        W_fn = make_lab_energy(model)  # detached reference correction
+        self._torch = torch
+        self.refresh_from_model()
+
+        self.step_failed: bool = False
+        self.failure_reason: str = ""
+        super().__init__()
+
+    def refresh_from_model(self) -> None:
+        """Rebuild the flux/tangent closures from the model's *current* weights
+        (the reference-state correction is captured at build time)."""
+        from fe2_rom.nn.model import make_lab_energy
+        from torch.func import grad, jacfwd, vmap
+
+        W_fn = make_lab_energy(self._model)  # detached reference correction
 
         def grad_with_aux(z):
             G = grad(W_fn)(z)
@@ -80,11 +92,6 @@ class NNRVEMaterial(Material):
 
         # One batched forward-over-reverse pass returns Hessian + gradient.
         self._flux_tangent_fn = vmap(jacfwd(grad_with_aux, has_aux=True))
-        self._torch = torch
-
-        self.step_failed: bool = False
-        self.failure_reason: str = ""
-        super().__init__()
 
     @property
     def gradients(self):
