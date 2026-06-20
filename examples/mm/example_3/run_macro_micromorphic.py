@@ -114,7 +114,7 @@ logger.info("Loaded %d φ mode(s) from %s", N_MODES, PHI_DIR)
 # RVE factory — one RVE instance per macro quadrature point
 # ---------------------------------------------------------------------------
 if USE_ROM:
-    from fe2_rom.rom import ReducedMicroSolver
+    from fe2_rom.rom.solver_mm import ReducedMicroSolver
 
     def rve_factory(rank: int, index: int):
         out_dir = os.path.join(HERE, "output_macro_rve", f"rve_{rank}_{index}")

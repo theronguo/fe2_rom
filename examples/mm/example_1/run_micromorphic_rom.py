@@ -28,7 +28,7 @@ import numpy as np
 from mpi4py import MPI
 
 from fe2_rom.hyperelastic_solver import NeoHookean, setup_logging
-from fe2_rom.rom import ReducedMicroSolver
+from fe2_rom.rom.solver_mm import ReducedMicroSolver
 
 
 # --- Logging ----------------------------------------------------------------

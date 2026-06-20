@@ -60,7 +60,8 @@ class POD:
 
     @staticmethod
     def load_snapshots(pattern):
-        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        files = [f for f in sorted(glob(pattern))
+                 if "dof_coords" not in f and "dof_cells" not in f]
         return np.array([np.load(f) for f in files])
 
     @staticmethod
@@ -78,7 +79,8 @@ class POD:
         found the snapshots are returned as-is (correct for serial saves).
         """
         import os, re
-        files = [f for f in sorted(glob(pattern)) if "dof_coords" not in f]
+        files = [f for f in sorted(glob(pattern))
+                 if "dof_coords" not in f and "dof_cells" not in f]
         snapshots = np.array([np.load(f) for f in files])
         if not files:
             return snapshots
