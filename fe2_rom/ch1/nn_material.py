@@ -40,21 +40,15 @@ class NNRVEMaterial(Material):
     Parameters
     ----------
     model : str | fe2_rom.nn.model.EnergyNet
-        Path to a ``.pt`` file written by ``EnergyNet.save`` (flavor ``"ch1"``)
+        Path to a checkpoint written by ``EnergyNet.save`` (flavor ``"ch1"``)
         or a model instance. Weights are frozen; evaluation is float64.
     gdim : int, optional
         Validated against the model config (which is the source of truth);
         defaults to the model's ``gdim``.
-    torch_threads : int
-        Torch intra-op threads per MPI rank (keep 1 for FE²-style runs).
     """
 
-    def __init__(self, model, gdim: int | None = None, torch_threads: int = 1):
-        # fe2_rom.nn guards the dolfinx-before-torch load order.
-        from fe2_rom.nn.model import EnergyNet
-        import torch
-
-        torch.set_num_threads(torch_threads)
+    def __init__(self, model, gdim: int | None = None):
+        from fe2_rom.nn.model import EnergyNet, cast_f64
 
         if isinstance(model, str):
             model = EnergyNet.load(model)
@@ -62,36 +56,42 @@ class NNRVEMaterial(Material):
             raise ValueError(
                 f"NNRVEMaterial needs a flavor='ch1' EnergyNet, "
                 f"got flavor={model.flavor!r}.")
-        model = model.double().eval()
-        model.requires_grad_(False)
-        self._model = model
+        self._model = cast_f64(model)
 
         if gdim is not None and gdim != model.gdim:
             raise ValueError(f"gdim={gdim} != model.gdim={model.gdim}")
         self._gdim = model.gdim
         _, self._F_dim = _f_order(self._gdim)
 
-        self._torch = torch
         self.refresh_from_model()
 
         self.step_failed: bool = False
         self.failure_reason: str = ""
         super().__init__()
 
-    def refresh_from_model(self) -> None:
-        """Rebuild the flux/tangent closures from the model's *current* weights
-        (the reference-state correction is captured at build time)."""
-        from fe2_rom.nn.model import make_lab_energy
-        from torch.func import grad, jacfwd, vmap
+    def update_model(self, model) -> None:
+        """Swap in a new (immutable) model and rebuild the closures — used when
+        the weights are refit (see :class:`~fe2_rom.fit.MacroFit`)."""
+        from fe2_rom.nn.model import cast_f64
+        self._model = cast_f64(model)
+        self.refresh_from_model()
 
-        W_fn = make_lab_energy(self._model)  # detached reference correction
+    def refresh_from_model(self) -> None:
+        """(Re)build the jitted flux/tangent closure from the model's *current*
+        weights (the reference-state correction is captured at build time)."""
+        import jax
+        from fe2_rom.nn.model import make_lab_energy
+
+        W_fn = make_lab_energy(self._model)  # reference correction baked in
+        grad_fn = jax.grad(W_fn)
 
         def grad_with_aux(z):
-            G = grad(W_fn)(z)
+            G = grad_fn(z)
             return G, G
 
         # One batched forward-over-reverse pass returns Hessian + gradient.
-        self._flux_tangent_fn = vmap(jacfwd(grad_with_aux, has_aux=True))
+        self._flux_tangent_fn = jax.jit(
+            jax.vmap(jax.jacfwd(grad_with_aux, has_aux=True)))
 
     @property
     def gradients(self):
@@ -103,11 +103,10 @@ class NNRVEMaterial(Material):
 
     def integrate(self, gradients: np.ndarray, dt: float = 0.0):
         n_qp = gradients.shape[0]
-        z = self._torch.from_numpy(
-            np.ascontiguousarray(gradients, dtype=np.float64))
+        z = np.ascontiguousarray(gradients, dtype=np.float64)
         H_t, G_t = self._flux_tangent_fn(z)
-        P_flat = G_t.numpy()          # (n_qp, F_dim)
-        A_flat = H_t.numpy()          # (n_qp, F_dim, F_dim) = dP/dF, symmetric
+        P_flat = np.asarray(G_t)      # (n_qp, F_dim)
+        A_flat = np.asarray(H_t)      # (n_qp, F_dim, F_dim) = dP/dF, symmetric
 
         bad = ~(np.isfinite(P_flat).all(axis=1) & np.isfinite(A_flat).all(axis=(1, 2)))
         if bad.any():

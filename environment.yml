@@ -16,9 +16,6 @@ dependencies:
     - scikit-learn==1.8.0
     - jax==0.10.0
     - jaxmat==0.0.3
-    # NN surrogate (fe2_rom.nn): CPU-only torch — the extra index makes pip
-    # prefer the +cpu wheel on Linux; on macOS it resolves the plain wheel.
-    - --extra-index-url https://download.pytorch.org/whl/cpu
-    - torch==2.12.0
-    - lightning==2.6.5
-    - tensorboard==2.20.0
+    # NN surrogate (fe2_rom.nn): JAX/equinox EnergyNet + optax training.
+    - equinox==0.13.8
+    - optax==0.2.8

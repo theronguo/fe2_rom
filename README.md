@@ -123,6 +123,27 @@ The package ships with ready-to-use solvers in 2D and 3D for:
   - All drivers feature adaptive load stepping, optional macro-level
     stability monitoring, checkpoint/restart, and MPI parallelism over
     quadrature points.
+- **Neural-network effective-energy surrogate** (`fe2_rom.nn`) — a single
+  JAX / [equinox](https://github.com/patrick-kidger/equinox) `EnergyNet` learns
+  the homogenized strain energy `W̄` and replaces the nested RVE solve with a
+  closed-form macro law, collapsing the two-scale problem to a single
+  macroscopic one. One `flavor` switch covers all three homogenization layers
+  (`"ch1"`: `W̄(F̄)`, `"mm"`: `W̄(F̄, v, g)`, `"ch2"`: `W̄(F̄, Ḡ)`); every stress
+  and tangent is an automatic derivative of one scalar, so frame indifference
+  (objectivity via the polar decomposition), the micromorphic sign symmetry
+  `W̄(U, −v, −g) = W̄(U, v, g)`, and the exact zero-energy/zero-stress reference
+  state hold **by construction**. Trained with a Sobolev loss (energy + stresses)
+  via [optax](https://github.com/google-deepmind/optax) (`fe2_rom.nn.training`).
+  Deployed through drop-in `dolfinx_materials` laws (`NNRVEMaterial`,
+  `NNMicromorphicMaterial`, `NNCh2Material`) that plug straight into the macro
+  drivers above. Custom architectures (e.g. a constitutive-ANN) subclass via the
+  `_build_core` hook.
+- **Differentiable weight fitting** (`fe2_rom.fit.MacroFit`) — fit the
+  `EnergyNet` weights to a macro observation (e.g. a DNS reaction curve):
+  `fit(θ)` runs the macro solve and returns the reaction at each load level,
+  `fit.jac(θ)` returns `d(reaction)/dθ` through a per-level discrete adjoint
+  (JAX vector–Jacobian product for the flux–weight term), ready for
+  `scipy.optimize.least_squares`.
 - **VTX (ADIOS2) output** for ParaView visualisation and CSV reaction-force
   logging.
 
@@ -184,12 +205,23 @@ fe2_rom/
 │   ├── averages.py         # EffectiveQ (double stress Q̄) + x-weighted tangent blocks
 │   ├── constraints.py      # ZeroBoundaryAverage
 │   └── training_data.py    # (F̄, Ḡ) snapshot generation for the ROM
-└── rom/                    # reduced-order modelling
-    ├── pod.py              # POD basis construction (H¹ / L² inner products)
-    ├── ecm.py              # ECM hyper-reduction (magic-point selection)
-    ├── solver_ch1.py       # ReducedMicroSolver — CH1 reduced online stage
-    ├── solver_mm.py        # ReducedMicroSolver — micromorphic reduced online stage
-    └── solver_ch2.py       # ReducedMicroSolver — second-order reduced online stage
+├── rom/                    # reduced-order modelling
+│   ├── pod.py              # POD basis construction (H¹ / L² inner products)
+│   ├── ecm.py              # ECM hyper-reduction (magic-point selection)
+│   ├── solver_ch1.py       # ReducedMicroSolver — CH1 reduced online stage
+│   ├── solver_mm.py        # ReducedMicroSolver — micromorphic reduced online stage
+│   └── solver_ch2.py       # ReducedMicroSolver — second-order reduced online stage
+├── nn/                     # JAX/equinox effective-energy surrogate
+│   ├── model.py            # EnergyNet (flavor ch1/mm/ch2), make_lab_energy
+│   ├── polar.py            # differentiable polar decomposition (Newton–Schulz)
+│   ├── training.py         # optax Sobolev training (train_energy)
+│   └── sensitivity.py      # weight VJP + params<->vector (for MacroFit)
+└── fit/                    # differentiable weight fitting
+    └── macrofit.py         # MacroFit: fit(θ)->reaction, fit.jac via adjoint
+
+# NN materials live next to their homogenization layer:
+#   ch1/nn_material.py (NNRVEMaterial), mm/nn_material.py
+#   (NNMicromorphicMaterial), ch2/nn_material.py (NNCh2Material)
 
 examples/
 ├── hyperelastic_solver/

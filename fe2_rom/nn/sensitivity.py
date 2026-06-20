@@ -11,24 +11,26 @@ needs, per accepted load level,
 where ``c`` is the co-state field and ``a_q`` is its quadrature-weighted gradient
 mapped into flux space at quadrature point ``q``. :func:`flux_weight_vjp` returns
 exactly this contraction as a flat vector over the trainable parameters — one
-extra differentiation of the same graph the material already builds for
+extra differentiation of the same scalar the material already differentiates for
 ``P = grad_z W``, now also w.r.t. θ.
 
-The reference-state correction (``W0``/``g0`` in :meth:`EnergyNet.reference_terms`)
-itself depends on θ, so it is rebuilt with ``create_graph=True`` here — the
-gradient is taken w.r.t. the *deployed, corrected* model, matching what the macro
-solver evaluates.
+Everything is functional in JAX: the reference-state correction
+(``W0``/``g0`` in :meth:`EnergyNet.reference_terms`) is recomputed inside
+:func:`make_lab_energy` from the substituted weights, so the gradient is taken
+w.r.t. the *deployed, corrected* model — exactly what the macro solver evaluates.
 
 ``params_to_vector`` / ``set_params_from_vector`` give scipy a flat float64 view
-of the trainable weights (deterministic order = ``model.named_parameters()``),
-and define the column order of the returned VJP.
+of the trainable weights (deterministic leaf order = ``model.trainable_filter()``
+partition), and define the column order of the returned VJP. Because an
+:class:`EnergyNet` is an immutable equinox pytree, ``set_params_from_vector``
+returns a *new* model rather than mutating in place.
 """
 from __future__ import annotations
 
 import numpy as np
-import torch
-from torch import nn
-from torch.func import functional_call, grad, vmap
+import jax
+import jax.numpy as jnp
+import equinox as eqx
 
 from fe2_rom.nn.model import make_lab_energy
 
@@ -40,49 +42,47 @@ __all__ = [
 ]
 
 
-def trainable_param_names(model: nn.Module) -> list[str]:
-    """Parameter names in the canonical (vector/VJP) order.
-
-    All :meth:`nn.Module.parameters` are fit; the calibration *buffers*
-    (``x_mean`` / ``x_std`` / ``W_scale`` / ``x_ref``) are not parameters and are
-    intentionally excluded. The model's ``requires_grad`` flag is irrelevant —
-    the VJP differentiates these weights functionally — so the NN material may
-    stay frozen for the forward pass."""
-    return [n for n, _ in model.named_parameters()]
+def _trainable_partition(model):
+    """``(params, static)`` split on the model's trainable/buffer filter."""
+    return eqx.partition(model, model.trainable_filter())
 
 
-def params_to_vector(model: nn.Module) -> np.ndarray:
-    """Flat float64 copy of the weights (scipy ``x0``)."""
-    ps = list(model.parameters())
-    return torch.nn.utils.parameters_to_vector(ps).detach().cpu().numpy()
+def trainable_param_names(model) -> list[str]:
+    """Key-path strings of the trainable leaves, in canonical (vector/VJP) order.
+
+    Diagnostic only — the calibration buffers are excluded by
+    :meth:`EnergyNet.trainable_filter`, mirroring torch's ``named_parameters``
+    selection."""
+    params, _ = _trainable_partition(model)
+    paths = jax.tree_util.tree_leaves_with_path(params)
+    return [jax.tree_util.keystr(p) for p, _ in paths]
 
 
-def set_params_from_vector(model: nn.Module, vec) -> None:
-    """In-place write of a flat vector back into the weights."""
-    ps = list(model.parameters())
-    t = torch.as_tensor(np.asarray(vec, dtype=np.float64))
-    torch.nn.utils.vector_to_parameters(t, ps)
+def params_to_vector(model) -> np.ndarray:
+    """Flat float64 copy of the trainable weights (scipy ``x0``)."""
+    params, _ = _trainable_partition(model)
+    leaves = jax.tree_util.tree_leaves(params)
+    if not leaves:
+        return np.zeros(0)
+    return np.concatenate([np.asarray(p, dtype=np.float64).ravel() for p in leaves])
 
 
-class _LabEnergyModule(nn.Module):
-    """Wrap an :class:`EnergyNet` so ``forward(z)`` is the lab-frame scalar
-    ``W(z)`` — lets :func:`torch.func.functional_call` substitute parameters so
-    we can differentiate ``W`` w.r.t. θ functionally. The reference correction is
-    rebuilt inside ``forward`` so it tracks the substituted parameters."""
+def set_params_from_vector(model, vec):
+    """Return a copy of ``model`` with the trainable weights set from ``vec``.
 
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, z):
-        # reference_terms uses requires_grad_()/autograd.grad, which functorch
-        # transforms forbid — recompute the same (W0, g0) with torch.func.grad
-        # so the correction stays differentiable w.r.t. the substituted θ.
-        m = self.model
-        x_ref = m.x_ref
-        W0 = m.raw_energy_x(x_ref)
-        g0 = grad(m.raw_energy_x)(x_ref)
-        return make_lab_energy(m, ref=(W0, g0))(z)
+    (Equinox models are immutable, so this does **not** mutate ``model``.)
+    """
+    params, static = _trainable_partition(model)
+    leaves, treedef = jax.tree_util.tree_flatten(params)
+    vec = np.asarray(vec, dtype=np.float64)
+    new_leaves, off = [], 0
+    for leaf in leaves:
+        n = leaf.size
+        new_leaves.append(jnp.asarray(
+            vec[off:off + n].reshape(leaf.shape), dtype=jnp.float64))
+        off += n
+    params = jax.tree_util.tree_unflatten(treedef, new_leaves)
+    return eqx.combine(params, static)
 
 
 def flux_weight_vjp(model, z_batch, a_batch) -> np.ndarray:
@@ -91,8 +91,8 @@ def flux_weight_vjp(model, z_batch, a_batch) -> np.ndarray:
     Parameters
     ----------
     model : EnergyNet
-        The effective-energy network (only ``requires_grad=True`` parameters
-        contribute, in :func:`trainable_param_names` order).
+        The effective-energy network (the trainable leaves contribute, in
+        :func:`params_to_vector` order).
     z_batch : array (n_q, z_dim)
         Per-qp gradients in the MFront packing (same layout the material's
         ``integrate`` consumes).
@@ -104,24 +104,18 @@ def flux_weight_vjp(model, z_batch, a_batch) -> np.ndarray:
     -------
     np.ndarray, shape (n_params,)
     """
-    wrapper = _LabEnergyModule(model)
-    params = {n: p for n, p in wrapper.named_parameters()}
-    buffers = dict(wrapper.named_buffers())
+    params, static = _trainable_partition(model)
+    z = jnp.asarray(np.asarray(z_batch, dtype=np.float64))
+    a = jnp.asarray(np.asarray(a_batch, dtype=np.float64))
 
-    z = torch.as_tensor(np.asarray(z_batch, dtype=np.float64))
-    a = torch.as_tensor(np.asarray(a_batch, dtype=np.float64))
+    def total(params):
+        m = eqx.combine(params, static)
+        W_fn = make_lab_energy(m)              # ref tracks substituted weights
+        flux = jax.vmap(jax.grad(W_fn))(z)     # (n_q, z_dim) = ∂W/∂z per qp
+        return jnp.sum(a * flux)
 
-    def W_of(p, z_single):
-        return functional_call(wrapper, (p, buffers), (z_single,))
-
-    flux_of = grad(W_of, argnums=1)  # ∂W/∂z for a single z → (z_dim,)
-
-    def per_qp(p, z_single, a_single):
-        return (a_single * flux_of(p, z_single)).sum()
-
-    def total(p):
-        return vmap(per_qp, in_dims=(None, 0, 0))(p, z, a).sum()
-
-    g = grad(total)(params)
-    flat = torch.nn.utils.parameters_to_vector([g[n] for n in params])
-    return flat.detach().cpu().numpy()
+    grads = jax.grad(total)(params)
+    leaves = jax.tree_util.tree_leaves(grads)
+    if not leaves:
+        return np.zeros(0)
+    return np.concatenate([np.asarray(g, dtype=np.float64).ravel() for g in leaves])

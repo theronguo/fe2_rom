@@ -15,17 +15,19 @@ Reproduces the protocol of section 4.1 / Appendix B (Table B1):
 Run inside the dolfinx-rve container:
     conda activate fe2_rom_env && python validation/cann/validate_mooney_rivlin.py
 """
-import fe2_rom  # noqa: F401  (dolfinx-before-torch import order)
+import fe2_rom  # noqa: F401  (enables jax x64 via fe2_rom.nn)
 import os
 import sys
 
 import numpy as np
-import torch
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+import optax
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cann import CANN  # noqa: E402  (local: validation/cann/cann.py)
 
-torch.manual_seed(0)
 np.random.seed(0)
 OUT = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(OUT, exist_ok=True)
@@ -36,7 +38,7 @@ C01, C02, C03 = 1.5e-2, -2.0e-6, 1.0e-10
 
 
 # ---------------------------------------------------------------------------
-# Mooney–Rivlin reference (eq. 18)
+# Mooney–Rivlin reference (eq. 18) — numpy, no autodiff needed
 # ---------------------------------------------------------------------------
 def mr_energy(Ic, IIc):
     a, b = Ic - 3.0, IIc - 3.0
@@ -52,17 +54,18 @@ def mr_dWdI(Ic, IIc):
 
 
 def invariants(C):
-    Ic = torch.einsum("...ii->...", C)
-    trC2 = torch.einsum("...ij,...ji->...", C, C)
+    Ic = np.einsum("...ii->...", C)
+    trC2 = np.einsum("...ij,...ji->...", C, C)
     IIc = 0.5 * (Ic**2 - trC2)
     return Ic, IIc
 
 
 def mr_stress_S(C):
     """Constitutive 2nd PK S = 2 ∂Ψ_MR/∂C (no pressure)."""
+    C = np.asarray(C, dtype=np.float64)
     Ic, IIc = invariants(C)
     W1, W2 = mr_dWdI(Ic, IIc)
-    eye = torch.eye(3, dtype=C.dtype).expand_as(C)
+    eye = np.broadcast_to(np.eye(3), C.shape)
     return 2.0 * ((W1 + Ic * W2)[..., None, None] * eye - W2[..., None, None] * C)
 
 
@@ -88,7 +91,7 @@ def make_dataset(n_per_case=15):
         for lam in np.linspace(lo, hi, n_per_case):
             F = F_of(load, lam)
             Cs.append(F.T @ F)
-    C = torch.tensor(np.stack(Cs), dtype=torch.float64)
+    C = np.stack(Cs).astype(np.float64)
     return C, mr_stress_S(C)
 
 
@@ -103,7 +106,7 @@ def nominal_P1(s_diag_fn, load, lam):
     """
     F = F_of(load, lam)
     lams = np.diag(F)
-    C = torch.tensor(F.T @ F, dtype=torch.float64)
+    C = (F.T @ F).astype(np.float64)
     s = s_diag_fn(C)
     lat = {"UT": 1, "EBT": 2, "PS": 2}[load]      # index of a free lateral axis
     p = lams[lat] ** 2 * s[lat]
@@ -137,11 +140,11 @@ def triangle_grid(n=60):
             if Cmat is None:
                 continue
             pts.append([Ic, IIc]); Cs.append(Cmat)
-    return np.array(pts), torch.tensor(np.stack(Cs), dtype=torch.float64)
+    return np.array(pts), np.stack(Cs).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
-# Training (Table B1)
+# Training (Table B1) — optax Adam over the trainable equinox leaves
 # ---------------------------------------------------------------------------
 def train(model, C, S, epochs=4000, batch=4, lr=1e-3, val_frac=0.2, seed=0):
     n = C.shape[0]
@@ -149,66 +152,71 @@ def train(model, C, S, epochs=4000, batch=4, lr=1e-3, val_frac=0.2, seed=0):
     perm = rng.permutation(n)
     n_val = max(1, int(round(val_frac * n)))
     vi, ti = perm[:n_val], perm[n_val:]
-    Ct, St, Cv, Sv = C[ti], S[ti], C[vi], S[vi]
-    model.set_input_norm(Ct)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-7)
+    Ct, St = jnp.asarray(C[ti]), jnp.asarray(S[ti])
+    Cv, Sv = jnp.asarray(C[vi]), jnp.asarray(S[vi])
 
-    def mse_S(Cb, Sb):
-        return ((model.stress_S(Cb) - Sb) ** 2).sum(dim=(-1, -2)).mean()
+    model = model.set_input_norm(Ct)
+    params, static = eqx.partition(model, model.trainable_filter())
+    opt = optax.adam(lr, b1=0.9, b2=0.999, eps=1e-7)
+    opt_state = opt.init(params)
 
-    best_val, best_state = float("inf"), None
+    def loss_of(params, Cb, Sb):
+        m = eqx.combine(params, static)
+        return jnp.mean(jnp.sum((m.stress_S(Cb) - Sb) ** 2, axis=(-1, -2)))
+
+    @eqx.filter_jit
+    def step(params, opt_state, Cb, Sb):
+        loss, grads = jax.value_and_grad(loss_of)(params, Cb, Sb)
+        updates, opt_state = opt.update(grads, opt_state, params)
+        return eqx.apply_updates(params, updates), opt_state, loss
+
+    best_val, best_params = np.inf, params
     for ep in range(epochs):
-        model.train()
-        order = torch.as_tensor(rng.permutation(len(ti)))
+        order = rng.permutation(len(ti))
         for k in range(0, len(order), batch):
             idx = order[k:k + batch]
-            opt.zero_grad()
-            loss = mse_S(Ct[idx], St[idx])
-            loss.backward()
-            opt.step()
-        model.eval()
-        tr = mse_S(Ct, St).item()   # stress_S re-enables grad internally
-        vl = mse_S(Cv, Sv).item()
+            params, opt_state, _ = step(params, opt_state, Ct[idx], St[idx])
+        tr = float(loss_of(params, Ct, St))
+        vl = float(loss_of(params, Cv, Sv))
         if vl < best_val:
-            best_val = vl
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            best_val, best_params = vl, params
         if ep % 400 == 0 or ep == epochs - 1:
             print(f"  epoch {ep:4d}  train {tr:.3e}  val {vl:.3e}  best {best_val:.3e}")
-    model.load_state_dict(best_state)
-    return model
+    return eqx.combine(best_params, static)
 
 
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 def rel_l2(pred, ref):
-    return float(torch.linalg.norm((pred - ref).reshape(-1))
-                 / torch.linalg.norm(ref.reshape(-1)))
+    pred = np.asarray(pred); ref = np.asarray(ref)
+    return float(np.linalg.norm((pred - ref).reshape(-1))
+                 / np.linalg.norm(ref.reshape(-1)))
 
 
 def main():
     C, S = make_dataset(15)
     print(f"dataset: {C.shape[0]} points (UT/EBT/PS × 15)")
     model = CANN(structure_tensors=None, hidden=(8, 8), incompressible=True)
+    from fe2_rom.nn.sensitivity import params_to_vector
     print(f"CANN: R={model.R}, n_inv={model.n_inv}, "
-          f"params={sum(p.numel() for p in model.parameters())}")
-    train(model, C, S)
-    model.eval()
+          f"params={params_to_vector(model).size}")
+    model = train(model, C, S)
 
     # --- error across the admissible invariant-plane triangle ---
     pts, Cgrid = triangle_grid(60)
-    S_cann = model.stress_S(Cgrid, create_graph=False).detach()
+    S_cann = np.asarray(model.stress_S(Cgrid))
     S_ref = mr_stress_S(Cgrid)
     err_S = rel_l2(S_cann, S_ref)
     # per-point relative stress error (Fig 3d analogue)
-    num = torch.linalg.norm((S_cann - S_ref).reshape(len(pts), -1), dim=1)
-    den = torch.linalg.norm(S_ref.reshape(len(pts), -1), dim=1).clamp_min(1e-12)
-    relP = (num / den).numpy() * 100
+    num = np.linalg.norm((S_cann - S_ref).reshape(len(pts), -1), axis=1)
+    den = np.clip(np.linalg.norm(S_ref.reshape(len(pts), -1), axis=1), 1e-12, None)
+    relP = (num / den) * 100
 
     # energy error (offset so Ψ(C=I)=0 for both; MR is already 0 there)
-    eye = torch.eye(3, dtype=torch.float64)[None]
-    psi0 = model.energy(eye).item()
-    psi_cann = (model.energy(Cgrid) - psi0).detach()
+    eye = np.eye(3)[None]
+    psi0 = float(model.energy(eye)[0])
+    psi_cann = np.asarray(model.energy(Cgrid)) - psi0
     Ic, IIc = invariants(Cgrid)
     psi_ref = mr_energy(Ic, IIc)
     err_W = rel_l2(psi_cann, psi_ref)
@@ -219,10 +227,10 @@ def main():
 
     # --- stress-stretch curves with pressure elimination ---
     def cann_s_diag(Cmat):
-        return model.stress_S(Cmat[None], create_graph=False)[0].diagonal().detach().numpy()
+        return np.asarray(model.stress_S(Cmat[None])[0]).diagonal()
 
     def mr_s_diag(Cmat):
-        return mr_stress_S(Cmat[None])[0].diagonal().numpy()
+        return mr_stress_S(Cmat[None])[0].diagonal()
 
     curves = {}
     for load, (lo, hi) in LOADS.items():

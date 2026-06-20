@@ -1,18 +1,17 @@
 """Neural-network surrogates for the effective energy (CH1 / MM / CH2).
 
-The Lightning training utilities live in ``fe2_rom.nn.training`` and are
-imported lazily.
+The effective energy is a JAX / :mod:`equinox` :class:`~fe2_rom.nn.model.EnergyNet`;
+stresses and tangents are automatic derivatives of one scalar (see
+:func:`~fe2_rom.nn.model.make_lab_energy`). The optax training utilities live in
+:mod:`fe2_rom.nn.training` and are imported lazily.
 
-IMPORTANT — import order: torch's pip wheel bundles an old ``libgfortran``
-that breaks dolfinx's MUMPS if torch is loaded first
-(``GFORTRAN_10 not found``). dolfinx must be imported before torch; the
-guard below enforces that whenever ``fe2_rom.nn`` is the entry point.
-Never ``import torch`` before ``fe2_rom`` in scripts.
+Float64 is enabled process-wide (``jax_enable_x64``) so the deployed materials
+feed consistent tangents to SNES — matching ``dolfinx_materials`` / ``jaxmat``,
+which run in double precision.
 """
-try:  # load conda's libgfortran before torch's bundled (older) copy
-    import dolfinx  # noqa: F401
-except ImportError:
-    pass
+import jax
+
+jax.config.update("jax_enable_x64", True)
 
 from fe2_rom.nn.polar import right_stretch, polar
 from fe2_rom.nn.model import EnergyNet, make_lab_energy

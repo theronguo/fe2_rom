@@ -107,8 +107,7 @@ class MacroFit:
     @classmethod
     def for_ch2(cls, model, mesh, *, n_qp=2, degree=1, u_degree=None,
                 lagrange_degree=None, lagrange_discontinuous=None,
-                compat_penalty=0.0, lagrange_stab=0.0, snes_options=None,
-                torch_threads=1):
+                compat_penalty=0.0, lagrange_stab=0.0, snes_options=None):
         """Build the CH2 stack: ``NNCh2Material`` + ``MacroSecondOrderSolver``.
 
         The multiplier element defaults to the inf-sup-stable P2-P1-P1
@@ -120,7 +119,7 @@ class MacroFit:
         if model.flavor != "ch2":
             raise ValueError(
                 f"for_ch2 needs a flavor='ch2' EnergyNet, got {model.flavor!r}.")
-        material = NNCh2Material(model, torch_threads=torch_threads)
+        material = NNCh2Material(model)
         solver = MacroSecondOrderSolver(
             mesh, n_qp=n_qp, material=material, degree=degree, u_degree=u_degree,
             lagrange_degree=lagrange_degree,
@@ -132,7 +131,7 @@ class MacroFit:
 
     @classmethod
     def for_ch1(cls, model, mesh, *, n_qp=2, degree=1, gdim=None,
-                snes_options=None, torch_threads=1):
+                snes_options=None):
         """Build the CH1 stack: ``NNRVEMaterial`` + ``MacroSolver`` (closed-form
         law, no inner RVE). ``add_bc`` takes an integer displacement component."""
         from fe2_rom.ch1.macrosolver import MacroSolver
@@ -141,7 +140,7 @@ class MacroFit:
         if model.flavor != "ch1":
             raise ValueError(
                 f"for_ch1 needs a flavor='ch1' EnergyNet, got {model.flavor!r}.")
-        material = NNRVEMaterial(model, torch_threads=torch_threads)
+        material = NNRVEMaterial(model)
         solver = MacroSolver(
             mesh, n_qp=n_qp, material=material,
             gdim=model.gdim if gdim is None else gdim,
@@ -150,8 +149,7 @@ class MacroFit:
         return cls(solver, model, material, field_attr="u", test_attr="_v")
 
     @classmethod
-    def for_mm(cls, model, mesh, *, n_qp=2, degree=1, snes_options=None,
-               torch_threads=1):
+    def for_mm(cls, model, mesh, *, n_qp=2, degree=1, snes_options=None):
         """Build the MM stack: ``NNMicromorphicMaterial`` + ``MacroMicromorphicSolver``.
 
         ``N_modes`` is taken from the model. ``add_bc`` uses the mixed-space
@@ -163,7 +161,7 @@ class MacroFit:
         if model.flavor != "mm":
             raise ValueError(
                 f"for_mm needs a flavor='mm' EnergyNet, got {model.flavor!r}.")
-        material = NNMicromorphicMaterial(model, torch_threads=torch_threads)
+        material = NNMicromorphicMaterial(model)
         solver = MacroMicromorphicSolver(
             mesh, n_qp=n_qp, N_modes=model.n_modes, material=material,
             degree=degree, snes_options=snes_options, check_stability=False,
@@ -203,8 +201,10 @@ class MacroFit:
         return int(self.get_weights().size)
 
     def _set_weights(self, theta) -> None:
-        set_params_from_vector(self.model, theta)
-        self.material.refresh_from_model()
+        # EnergyNet is an immutable equinox pytree: rebuild it and hand the new
+        # object to the material (which rebuilds its jitted closures).
+        self.model = set_params_from_vector(self.model, theta)
+        self.material.update_model(self.model)
 
     # -- forward ------------------------------------------------------------
 
