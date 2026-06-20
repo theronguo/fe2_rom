@@ -15,7 +15,7 @@ heterogeneous near the clamp. Both materials share the same volumetric penalty
 Run inside the dolfinx-rve container:
     conda activate fe2_rom_env && python validation/cann/macro/run_comparison.py
 """
-import fe2_rom  # noqa: F401  (dolfinx-before-torch import order)
+import fe2_rom  # noqa: F401  (enables jax x64 via fe2_rom.nn)
 
 import logging
 import os
@@ -82,8 +82,7 @@ def main():
         print("Training CANN on Mooney–Rivlin data ...")
     C, S = mrv.make_dataset(15)
     model = CANN(gdim=3, structure_tensors=None, hidden=(8, 8), incompressible=True)
-    mrv.train(model, C, S, epochs=EPOCHS)
-    model.eval()
+    model = mrv.train(model, C, S, epochs=EPOCHS)
 
     mesh = dmesh.create_box(
         comm, [np.array([0.0, 0.0, 0.0]), np.array([L, H, W])],

@@ -13,8 +13,8 @@ volumetric penalty as the Mooney–Rivlin reference::
 
     W(F) = Ψ_CANN(C) + ½ κ (J − 1)²,   C = FᵀF,  J = det F
 
-with ``P = ∂W/∂F`` and ``A = ∂²W/∂F²`` by torch automatic differentiation
-(one batched forward-over-reverse pass per ``integrate`` call). 3D only.
+with ``P = ∂W/∂F`` and ``A = ∂²W/∂F²`` by JAX automatic differentiation
+(one batched, jitted forward-over-reverse pass per ``integrate`` call). 3D only.
 """
 from __future__ import annotations
 
@@ -40,30 +40,27 @@ class CANNMaterial(Material):
         Bulk penalty for ``½κ(J−1)²`` (match the Mooney–Rivlin reference).
     gdim : int
         Geometric dimension (3).
-    torch_threads : int
-        Torch intra-op threads (keep 1 for FE-style runs).
     """
 
-    def __init__(self, model, kappa: float, gdim: int = 3, torch_threads: int = 1):
-        import torch
-        from torch.func import grad, jacfwd, vmap
-        from fe2_rom.nn.model import _F_ORDER
+    def __init__(self, model, kappa: float, gdim: int = 3):
+        import jax
+        import jax.numpy as jnp
+        from fe2_rom.nn.model import _F_ORDER, cast_f64
         from cann import _det3   # explicit 3×3 det (hessian-safe, unlike linalg.det)
 
-        torch.set_num_threads(torch_threads)
         if gdim != 3:
             raise ValueError("CANNMaterial is 3D only (gdim=3).")
-        model = model.double().eval()
-        model.requires_grad_(False)
+        model = cast_f64(model)
         self._model = model
         self._gdim = gdim
         _, self._F_dim = _f_order(gdim)
 
         # F-vector (MFront ordering) -> 3x3 matrix basis
-        basis = torch.zeros(self._F_dim, gdim, gdim, dtype=torch.float64)
+        basis_np = np.zeros((self._F_dim, gdim, gdim))
         for k, ij in enumerate(_F_ORDER[gdim]):
             if ij is not None:
-                basis[k, ij[0], ij[1]] = 1.0
+                basis_np[k, ij[0], ij[1]] = 1.0
+        basis = jnp.asarray(basis_np)
         kap = float(kappa)
 
         def W_fn(z):                       # z: (F_dim,) MFront F-vector
@@ -72,15 +69,15 @@ class CANNMaterial(Material):
             J = _det3(F)
             return model.energy(C) + 0.5 * kap * (J - 1.0) ** 2
 
-        grad_fn = grad(W_fn)
+        grad_fn = jax.grad(W_fn)
 
         def grad_with_aux(z):
             G = grad_fn(z)
             return G, G
 
         # forward-over-reverse: returns (Hessian, gradient) batched over qp
-        self._flux_tangent_fn = vmap(jacfwd(grad_with_aux, has_aux=True))
-        self._torch = torch
+        self._flux_tangent_fn = jax.jit(
+            jax.vmap(jax.jacfwd(grad_with_aux, has_aux=True)))
 
         self.step_failed: bool = False
         self.failure_reason: str = ""
@@ -96,10 +93,10 @@ class CANNMaterial(Material):
 
     def integrate(self, gradients: np.ndarray, dt: float = 0.0):
         n_qp = gradients.shape[0]
-        z = self._torch.from_numpy(np.ascontiguousarray(gradients, dtype=np.float64))
+        z = np.ascontiguousarray(gradients, dtype=np.float64)
         H_t, G_t = self._flux_tangent_fn(z)
-        P_flat = G_t.numpy()              # (n_qp, F_dim) = ∂W/∂F = PK1
-        A_flat = H_t.numpy()              # (n_qp, F_dim, F_dim) = dP/dF
+        P_flat = np.asarray(G_t)          # (n_qp, F_dim) = ∂W/∂F = PK1
+        A_flat = np.asarray(H_t)          # (n_qp, F_dim, F_dim) = dP/dF
 
         bad = ~(np.isfinite(P_flat).all(axis=1) & np.isfinite(A_flat).all(axis=(1, 2)))
         if bad.any():

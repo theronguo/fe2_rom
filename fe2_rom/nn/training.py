@@ -1,5 +1,5 @@
-"""Lightning training of :class:`~fe2_rom.nn.model.EnergyNet` with a Sobolev
-loss, shared across the CH1 / MM / CH2 flavors.
+"""Optax training of :class:`~fe2_rom.nn.model.EnergyNet` with a Sobolev loss,
+shared across the CH1 / MM / CH2 flavors.
 
 The loss matches the effective energy *and* its first derivatives — by
 Hellmann–Feynman the homogenized stresses are exactly the partial derivatives
@@ -25,19 +25,21 @@ Dataset ``.npz`` layout (n samples) by flavor::
     ch2:     G (n, gdim, gdim, gdim)   gradient Ḡ (symmetric in last two indices)
              Q (n, gdim, gdim, gdim)   double stress Q̄
 
-Everything runs in float64 (use ``Trainer(precision="64-true")``) — the
-deployed material feeds consistent tangents to SNES.
+Everything runs in float64 — the deployed material feeds consistent tangents to
+SNES. Train with :func:`train_energy`, which calibrates the input/output
+normalisation, runs Adam with a reduce-on-plateau schedule, and returns the
+trained (immutable) model plus a loss history.
 """
 from __future__ import annotations
 
 import numpy as np
-import torch
-import lightning as L
-from torch.func import grad_and_value, vmap
-from torch.utils.data import DataLoader, TensorDataset
+import jax
+import jax.numpy as jnp
+import equinox as eqx
+import optax
 
 from fe2_rom.nn.model import (
-    EnergyNet, make_lab_energy, _F_DIM, _F_ORDER, _U_COMPONENTS,
+    EnergyNet, make_lab_energy, cast_f64, _F_DIM, _F_ORDER, _U_COMPONENTS,
 )
 
 
@@ -66,36 +68,36 @@ def flux_spec(model: EnergyNet) -> list[tuple[str, int]]:
 # Data packing
 # ---------------------------------------------------------------------------
 
-def _mat_to_fvec_batch(T: torch.Tensor, gdim: int) -> torch.Tensor:
+def _mat_to_fvec_batch(T: np.ndarray, gdim: int) -> np.ndarray:
     """(n, gdim, gdim) → (n, F_dim) in MFront ordering (zero placeholder)."""
     n = T.shape[0]
-    out = torch.zeros(n, _F_DIM[gdim], dtype=T.dtype)
+    out = np.zeros((n, _F_DIM[gdim]), dtype=np.float64)
     for k, ij in enumerate(_F_ORDER[gdim]):
         if ij is not None:
             out[:, k] = T[:, ij[0], ij[1]]
     return out
 
 
-def pack_dataset(data: dict, model: EnergyNet) -> tuple[torch.Tensor, ...]:
-    """Arrays → (z, W, dWdz) tensors in the MFront packing of make_lab_energy."""
+def pack_dataset(data: dict, model: EnergyNet):
+    """Arrays → (z, W, dWdz) float64 arrays in the MFront packing of make_lab_energy."""
     gdim, flavor = model.gdim, model.flavor
-    as_t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float64)
-    F = as_t(data["F"])
+    asf = lambda a: np.asarray(a, dtype=np.float64)
+    F = asf(data["F"])
     n = F.shape[0]
     z_parts = [_mat_to_fvec_batch(F, gdim)]
-    g_parts = [_mat_to_fvec_batch(as_t(data["P"]), gdim)]
+    g_parts = [_mat_to_fvec_batch(asf(data["P"]), gdim)]
     if flavor == "mm":
-        z_parts += [as_t(data["v"]), as_t(data["g"]).reshape(n, -1)]
-        g_parts += [as_t(data["Pi"]), as_t(data["Lambda"]).reshape(n, -1)]
+        z_parts += [asf(data["v"]), asf(data["g"]).reshape(n, -1)]
+        g_parts += [asf(data["Pi"]), asf(data["Lambda"]).reshape(n, -1)]
     elif flavor == "ch2":
-        z_parts += [as_t(data["G"]).reshape(n, -1)]
-        g_parts += [as_t(data["Q"]).reshape(n, -1)]
-    z = torch.cat(z_parts, dim=1)
-    dWdz = torch.cat(g_parts, dim=1)
-    return z, as_t(data["W"]), dWdz
+        z_parts += [asf(data["G"]).reshape(n, -1)]
+        g_parts += [asf(data["Q"]).reshape(n, -1)]
+    z = np.concatenate(z_parts, axis=1)
+    dWdz = np.concatenate(g_parts, axis=1)
+    return z, asf(data["W"]), dWdz
 
 
-def reduced_coords(z: torch.Tensor, model: EnergyNet) -> torch.Tensor:
+def reduced_coords(z: np.ndarray, model: EnergyNet) -> np.ndarray:
     """z (lab packing) → x (model input) for input-standardisation calibration.
 
     Uses the symmetric-stretch approximation (R ≈ I, so Ū = F̄ components and
@@ -105,141 +107,147 @@ def reduced_coords(z: torch.Tensor, model: EnergyNet) -> torch.Tensor:
     gdim, F_dim = model.gdim, _F_DIM[model.gdim]
     order = _F_ORDER[gdim]
     cols = [z[:, order.index((i, j))] for (i, j) in _U_COMPONENTS[gdim]]
-    return torch.cat([torch.stack(cols, dim=1), z[:, F_dim:]], dim=1)
+    return np.concatenate([np.stack(cols, axis=1), z[:, F_dim:]], axis=1)
 
 
 # ---------------------------------------------------------------------------
-# DataModule
+# Normalisation calibration
 # ---------------------------------------------------------------------------
 
-class EnergyDataModule(L.LightningDataModule):
-    """Loads a dataset .npz, packs MFront vectors, splits train/val."""
+def calibrate_normalization(model: EnergyNet, z_train: np.ndarray,
+                            W_train: np.ndarray) -> EnergyNet:
+    """Return a copy of ``model`` with the input standardisation (``x_mean`` /
+    ``x_std``) and output scale (``W_scale``) calibrated from the training split."""
+    x = reduced_coords(np.asarray(z_train), model)
+    x_mean = jnp.asarray(x.mean(0), dtype=jnp.float64)
+    x_std = jnp.asarray(np.clip(x.std(0), 1e-8, None), dtype=jnp.float64)
+    W_scale = jnp.asarray(max(float(np.asarray(W_train).std()), 1e-12),
+                          dtype=jnp.float64)
+    return eqx.tree_at(lambda m: (m.x_mean, m.x_std, m.W_scale),
+                       model, replace=(x_mean, x_std, W_scale))
 
-    def __init__(self, npz_path: str, model: EnergyNet, batch_size: int = 256,
-                 val_fraction: float = 0.1, seed: int = 0):
-        super().__init__()
-        self.npz_path = npz_path
-        self.model = model
-        self.batch_size = batch_size
-        self.val_fraction = val_fraction
-        self.seed = seed
-        self.scales: dict | None = None
 
-    def setup(self, stage: str | None = None) -> None:
-        if self.scales is not None:
-            return
-        with np.load(self.npz_path) as data:
-            z, W, dWdz = pack_dataset(data, self.model)
-        n = z.shape[0]
-        rng = np.random.default_rng(self.seed)
-        perm = torch.as_tensor(rng.permutation(n))
-        n_val = max(1, int(round(self.val_fraction * n)))
-        val_idx, train_idx = perm[:n_val], perm[n_val:]
-        self._train = TensorDataset(z[train_idx], W[train_idx], dWdz[train_idx])
-        self._val = TensorDataset(z[val_idx], W[val_idx], dWdz[val_idx])
-
-        # Per-target scales (from the training split) so loss weights are O(1).
-        G = dWdz[train_idx]
-        std = lambda t: max(float(t.std()), 1e-12)
-        scales = {"W": std(W[train_idx])}
-        off = 0
-        for name, dim in flux_spec(self.model):
-            scales[name] = std(G[:, off:off + dim])
-            off += dim
-        self.scales = scales
-        self._train_x = reduced_coords(z[train_idx], self.model)
-        self._train_W = W[train_idx]
-
-    def attach_normalization(self, model: EnergyNet) -> None:
-        """Calibrate the model's input standardisation and output scale."""
-        self.setup()
-        x = self._train_x
-        std = x.std(dim=0).clamp_min(1e-8)
-        model.x_mean.copy_(x.mean(dim=0))
-        model.x_std.copy_(std)
-        model.W_scale.fill_(max(float(self._train_W.std()), 1e-12))
-
-    def train_dataloader(self):
-        return DataLoader(self._train, batch_size=self.batch_size, shuffle=True)
-
-    def val_dataloader(self):
-        return DataLoader(self._val, batch_size=self.batch_size)
+def _target_scales(model: EnergyNet, W: np.ndarray, dWdz: np.ndarray) -> dict:
+    """Per-target std (energy + each flux block) so loss weights stay O(1)."""
+    std = lambda a: max(float(np.asarray(a).std()), 1e-12)
+    scales = {"W": std(W)}
+    off = 0
+    for name, dim in flux_spec(model):
+        scales[name] = std(dWdz[:, off:off + dim])
+        off += dim
+    return scales
 
 
 # ---------------------------------------------------------------------------
-# LightningModule
+# Sobolev loss + training loop
 # ---------------------------------------------------------------------------
 
-class EnergyModule(L.LightningModule):
-    """Sobolev training: ``w_W·MSE(W̄) + Σ_flux w_flux·MSE(flux)``, each target
-    normalised by its training-set std.
+def _make_loss(model: EnergyNet, scales: dict, weights: dict):
+    """Build ``loss(model, z, W, dWdz) -> (total, parts)`` for the given flavor."""
+    spec = flux_spec(model)
+    names = ["W"] + [name for name, _ in spec]
+    w = {k: float(weights.get(k, 1.0)) for k in names}
+    s = {k: float(scales.get(k, 1.0)) for k in names}
 
-    Parameters
-    ----------
-    model : EnergyNet
-    lr : float
-    weights : dict, optional
-        Per-target loss weights, e.g. ``{"W": 1.0, "P": 1.0, "Q": 1.0}``;
-        missing entries default to 1.0.
-    scales : dict, optional
-        Per-target normalisation (typically ``EnergyDataModule.scales``).
-    """
-
-    def __init__(self, model: EnergyNet, lr: float = 1e-3,
-                 weights: dict | None = None, scales: dict | None = None):
-        super().__init__()
-        self.model = model
-        self.save_hyperparameters(ignore=["model"])
-        self._spec = flux_spec(model)
-        names = ["W"] + [name for name, _ in self._spec]
-        weights = weights or {}
-        scales = scales or {}
-        self.register_buffer("_weights", torch.tensor(
-            [float(weights.get(k, 1.0)) for k in names], dtype=torch.float64))
-        self.register_buffer("_scales", torch.tensor(
-            [float(scales.get(k, 1.0)) for k in names], dtype=torch.float64))
-        self._names = names
-
-    def _losses(self, batch):
-        z, W_t, G_t = batch
-        # Keep the parameter dependence of the reference correction so the
-        # optimiser trains exactly the deployed (corrected) model.
-        ref = self.model.reference_terms(create_graph=True)
-        W_fn = make_lab_energy(self.model, ref)
-        G_p, W_p = vmap(grad_and_value(W_fn))(z)
-
-        mse = lambda a, b, s: torch.mean(((a - b) / s) ** 2)
-        loss_W = mse(W_p, W_t, self._scales[0])
-        total = self._weights[0] * loss_W
+    def loss(model, z, W_t, G_t):
+        W_fn = make_lab_energy(model)               # ref tracks weights
+        W_p, G_p = jax.vmap(jax.value_and_grad(W_fn))(z)
+        mse = lambda a, b, sc: jnp.mean(((a - b) / sc) ** 2)
+        loss_W = mse(W_p, W_t, s["W"])
+        total = w["W"] * loss_W
         parts = {"W": loss_W}
         off = 0
-        for k, (name, dim) in enumerate(self._spec, start=1):
+        for name, dim in spec:
             sl = slice(off, off + dim)
             off += dim
-            li = mse(G_p[:, sl], G_t[:, sl], self._scales[k])
-            total = total + self._weights[k] * li
+            li = mse(G_p[:, sl], G_t[:, sl], s[name])
+            total = total + w[name] * li
             parts[name] = li
         return total, parts
 
-    def training_step(self, batch, batch_idx):
-        total, parts = self._losses(batch)
-        self.log("train_loss", total, prog_bar=True)
-        for k, val in parts.items():
-            self.log(f"train_{k}", val)
+    return loss
+
+
+def train_energy(model: EnergyNet, npz_path: str, *, epochs: int = 2000,
+                 batch_size: int = 256, lr: float = 1e-3,
+                 weights: dict | None = None, val_fraction: float = 0.1,
+                 seed: int = 0, lr_factor: float = 0.5, lr_patience: int = 50,
+                 verbose: bool = True):
+    """Sobolev-train ``model`` on the dataset ``npz_path``.
+
+    Adam + reduce-on-plateau (``lr_factor`` after ``lr_patience`` stagnant val
+    epochs), float64 throughout. Calibrates the model's normalisation from the
+    training split first.
+
+    Returns ``(trained_model, history)`` where ``history`` is a list of
+    ``{"epoch", "train_loss", "val_loss", "lr"}`` dicts.
+    """
+    model = cast_f64(model)
+    weights = weights or {}
+
+    with np.load(npz_path) as data:
+        z, W, dWdz = pack_dataset(dict(data), model)
+
+    n = z.shape[0]
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n)
+    n_val = max(1, int(round(val_fraction * n)))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    model = calibrate_normalization(model, z[train_idx], W[train_idx])
+    scales = _target_scales(model, W[train_idx], dWdz[train_idx])
+    loss_fn = _make_loss(model, scales, weights)
+
+    z_tr = jnp.asarray(z[train_idx]); W_tr = jnp.asarray(W[train_idx])
+    G_tr = jnp.asarray(dWdz[train_idx])
+    z_va = jnp.asarray(z[val_idx]); W_va = jnp.asarray(W[val_idx])
+    G_va = jnp.asarray(dWdz[val_idx])
+
+    filter_spec = model.trainable_filter()
+    params, static = eqx.partition(model, filter_spec)
+    optimizer = optax.inject_hyperparams(optax.adam)(learning_rate=jnp.asarray(lr))
+    opt_state = optimizer.init(params)
+
+    @eqx.filter_jit
+    def train_step(params, opt_state, z, W_t, G_t):
+        def lo(p):
+            return loss_fn(eqx.combine(p, static), z, W_t, G_t)
+        (total, parts), grads = jax.value_and_grad(lo, has_aux=True)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = eqx.apply_updates(params, updates)
+        return params, opt_state, total
+
+    @eqx.filter_jit
+    def val_loss(params, z, W_t, G_t):
+        total, _ = loss_fn(eqx.combine(params, static), z, W_t, G_t)
         return total
 
-    def validation_step(self, batch, batch_idx):
-        # Sobolev loss needs autograd through the model — re-enable grad.
-        with torch.enable_grad():
-            total, parts = self._losses(batch)
-        self.log("val_loss", total, prog_bar=True)
-        for k, val in parts.items():
-            self.log(f"val_{k}", val)
-        return total
+    n_tr = z_tr.shape[0]
+    n_batches = max(1, n_tr // batch_size)
+    best_val, stale, history = np.inf, 0, []
 
-    def configure_optimizers(self):
-        opt = torch.optim.Adam(self.model.parameters(), lr=self.hparams.lr)
-        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, factor=0.5, patience=50)
-        return {"optimizer": opt,
-                "lr_scheduler": {"scheduler": sched, "monitor": "val_loss"}}
+    for epoch in range(epochs):
+        order = rng.permutation(n_tr)
+        for b in range(n_batches):
+            idx = order[b * batch_size:(b + 1) * batch_size]
+            params, opt_state, _ = train_step(
+                params, opt_state, z_tr[idx], W_tr[idx], G_tr[idx])
+
+        tr = float(val_loss(params, z_tr, W_tr, G_tr))
+        va = float(val_loss(params, z_va, W_va, G_va))
+        cur_lr = float(opt_state.hyperparams["learning_rate"])
+        history.append({"epoch": epoch, "train_loss": tr, "val_loss": va,
+                        "lr": cur_lr})
+
+        if va < best_val - 1e-12:
+            best_val, stale = va, 0
+        else:
+            stale += 1
+            if stale >= lr_patience:
+                opt_state.hyperparams["learning_rate"] = jnp.asarray(
+                    cur_lr * lr_factor)
+                stale = 0
+        if verbose and (epoch % 50 == 0 or epoch == epochs - 1):
+            print(f"[{epoch:5d}] train={tr:.4e} val={va:.4e} lr={cur_lr:.2e}")
+
+    return eqx.combine(params, static), history

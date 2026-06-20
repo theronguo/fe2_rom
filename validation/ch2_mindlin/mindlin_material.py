@@ -22,7 +22,7 @@ first symmetrised in its last two indices (its physical symmetry) so ``Q`` comes
 out symmetric and conjugate to ``Ḡ`` (verified against eq. 4.86 in
 ``check_eq486.py``).
 
-Everything is a torch automatic derivative of the one scalar ``W₀`` (no manual
+Everything is a JAX automatic derivative of the one scalar ``W₀`` (no manual
 ⁶D), and ``W₀`` is polynomial so the tangent (Hessian) is exact and finite.
 Same ``gradients`` / ``fluxes`` / ``tangent_blocks`` contract as
 ``DummyCh2Material`` / ``Ch2RVEMaterial`` → drops straight into
@@ -46,10 +46,10 @@ def mindlin_energy_grad(g, a1, a2, a3, a4, a5):
     """Gradient strain-energy density (eq. 4.79, terms in a₁…a₅), thesis indices.
 
     ``g`` is the thesis third-order tensor (…here passed as ``swapaxes(Ḡ,0,1)``),
-    shape ``(gdim, gdim, gdim)``. Returns a scalar (torch or numpy via einsum).
+    shape ``(gdim, gdim, gdim)``. Returns a scalar via einsum.
     """
-    import torch
-    ee = torch.einsum
+    import jax.numpy as jnp
+    ee = jnp.einsum
     t1 = ee("ijj,ikk->", g, g) + ee("jji,kki->", g, g)
     t2 = ee("iki,kjj->", g, g) + ee("iki,jjk->", g, g)
     t3 = ee("iki,jkj->", g, g)
@@ -74,17 +74,14 @@ class MindlinCh2Material(Material):
         Material length scale; sets ``a₁=…=a₅ = ½ μ Z²``.
     gdim : int
         Geometric dimension (2 or 3).
-    torch_threads : int
-        Torch intra-op threads.
     """
 
     def __init__(self, mu: float, Z: float, *, lmbda: float | None = None,
-                 kappa: float | None = None, gdim: int = 2, torch_threads: int = 1):
-        import torch
-        from torch.func import grad, jacfwd, vmap
+                 kappa: float | None = None, gdim: int = 2):
+        import jax
+        import jax.numpy as jnp
         from fe2_rom.nn.model import _F_ORDER
 
-        torch.set_num_threads(torch_threads)
         if gdim not in (2, 3):
             raise ValueError("gdim must be 2 or 3.")
         if lmbda is None:
@@ -98,31 +95,32 @@ class MindlinCh2Material(Material):
         mu_t = float(mu)
         lam_t = float(lmbda)
 
-        basis = torch.zeros(self._F_dim, gdim, gdim, dtype=torch.float64)
+        basis_np = np.zeros((self._F_dim, gdim, gdim))
         for k, ij in enumerate(_F_ORDER[gdim]):
             if ij is not None:
-                basis[k, ij[0], ij[1]] = 1.0
-        eye = torch.eye(gdim, dtype=torch.float64)
+                basis_np[k, ij[0], ij[1]] = 1.0
+        basis = jnp.asarray(basis_np)
+        eye = jnp.eye(gdim)
 
         def W_fn(z):
             F = (z[:self._F_dim, None, None] * basis).sum(0)        # (g,g)
             E = 0.5 * (F.T @ F - eye)
-            trE = torch.einsum("ii->", E)
-            W_strain = 0.5 * lam_t * trE * trE + mu_t * torch.einsum("ij,ij->", E, E)
+            trE = jnp.einsum("ii->", E)
+            W_strain = 0.5 * lam_t * trE * trE + mu_t * jnp.einsum("ij,ij->", E, E)
             G = z[self._F_dim:].reshape(gdim, gdim, gdim)           # Ḡ_iJK (code)
-            G = 0.5 * (G + G.transpose(-1, -2))                     # symmetrise (J,K)
-            g = G.transpose(0, 1)                                   # thesis G_ijk = Ḡ_jik
+            G = 0.5 * (G + jnp.swapaxes(G, -1, -2))                 # symmetrise (J,K)
+            g = jnp.swapaxes(G, 0, 1)                               # thesis G_ijk = Ḡ_jik
             W_grad = mindlin_energy_grad(g, a, a, a, a, a)
             return W_strain + W_grad
 
-        grad_fn = grad(W_fn)
+        grad_fn = jax.grad(W_fn)
 
         def grad_with_aux(z):
             G = grad_fn(z)
             return G, G
 
-        self._flux_tangent_fn = vmap(jacfwd(grad_with_aux, has_aux=True))
-        self._torch = torch
+        self._flux_tangent_fn = jax.jit(
+            jax.vmap(jax.jacfwd(grad_with_aux, has_aux=True)))
 
         self.step_failed: bool = False
         self.failure_reason: str = ""
@@ -143,10 +141,10 @@ class MindlinCh2Material(Material):
     def integrate(self, gradients: np.ndarray, dt: float = 0.0):
         F_dim, G_dim = self._F_dim, self._G_dim
         n_qp = gradients.shape[0]
-        z = self._torch.from_numpy(np.ascontiguousarray(gradients, dtype=np.float64))
+        z = np.ascontiguousarray(gradients, dtype=np.float64)
         H_t, G_t = self._flux_tangent_fn(z)
-        flux_vals = G_t.numpy()           # (n_qp, F_dim + G_dim) = [P | Q]
-        H = H_t.numpy()                   # (n_qp, dim, dim)
+        flux_vals = np.asarray(G_t)       # (n_qp, F_dim + G_dim) = [P | Q]
+        H = np.asarray(H_t)               # (n_qp, dim, dim)
 
         sF = slice(0, F_dim)
         sG = slice(F_dim, F_dim + G_dim)
