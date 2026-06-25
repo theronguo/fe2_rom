@@ -64,6 +64,7 @@ class MicroSolver:
     def __init__(self, mesh_path, comm, gdim,
                  material: MaterialModel, *,
                  degree: int = 1,
+                 quadrature_degree: int | None = None,
                  output_dir: str = "output",
                  check_stability: bool = True,
                  perturb_post_buckling: bool = True,
@@ -105,7 +106,19 @@ class MicroSolver:
         self._cell_tags = mesh_data.cell_tags
         self._facet_tags = mesh_data.facet_tags
         self._mesh.topology.create_connectivity(self._mesh.topology.dim - 1, self._mesh.topology.dim)
-        self.dx = ufl.Measure("dx", domain=self._mesh, subdomain_data=self._cell_tags)
+        # Quadrature degree for every form built off ``self.dx`` (residual,
+        # Jacobian, tangent-RHS adjoints, volume, effective averages, the
+        # fluctuation constraints and the H¹ stability form). ``None`` keeps
+        # DOLFINx's automatic estimate, which over-integrates higher-order
+        # elements (e.g. 6 points for a tri6, 14+ for a tet10); pass an explicit
+        # degree to use the cheaper rule that is accurate enough in practice.
+        self._quadrature_degree = quadrature_degree
+        dx_metadata = (
+            {"quadrature_degree": int(quadrature_degree)}
+            if quadrature_degree is not None else None
+        )
+        self.dx = ufl.Measure("dx", domain=self._mesh,
+                              subdomain_data=self._cell_tags, metadata=dx_metadata)
         self.gdim = gdim
 
         # Objectivity (F̄ = R U) reduction. When enabled, ``__call__`` drives the

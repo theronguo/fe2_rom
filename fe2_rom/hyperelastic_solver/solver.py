@@ -36,7 +36,8 @@ class HyperelasticStabilitySolver:
     """
 
     def __init__(self, mesh, cell_tags, facet_tags, material: MaterialModel, *,
-                 degree: int = 1, body_force=None, neumann_terms=None,
+                 degree: int = 1, quadrature_degree: int | None = None,
+                 body_force=None, neumann_terms=None,
                  enable_viz_fields: bool = True):
         self.comm = mesh.comm
         self._mesh = mesh
@@ -44,6 +45,10 @@ class HyperelasticStabilitySolver:
         self._facet_tags = facet_tags
         self._material = material
         self._degree = degree
+        # Quadrature degree for the volume forms (residual + tangent). ``None``
+        # keeps DOLFINx's automatic estimate, which over-integrates higher-order
+        # elements; pass an explicit degree to use a cheaper rule.
+        self._quadrature_degree = quadrature_degree
         self._body_force = body_force
         self._neumann_terms = neumann_terms
         self._enable_viz_fields = enable_viz_fields
@@ -120,7 +125,12 @@ class HyperelasticStabilitySolver:
         mesh = self._mesh
         fdim = mesh.topology.dim - 1
         V = self.V
-        dx = ufl.Measure("dx", domain=mesh, subdomain_data=self._cell_tags)
+        dx_metadata = (
+            {"quadrature_degree": int(self._quadrature_degree)}
+            if self._quadrature_degree is not None else None
+        )
+        dx = ufl.Measure("dx", domain=mesh, subdomain_data=self._cell_tags,
+                         metadata=dx_metadata)
 
         R_form, J_form, F_var, P_ufl, J_ufl = build_weak_forms(
             mesh, V, self.u, self._material,
