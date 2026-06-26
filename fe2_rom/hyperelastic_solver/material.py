@@ -31,6 +31,25 @@ class NeoHookean(MaterialModel):
         return (mu / 2) * (ufl.tr(C) - 3) - mu * ufl.ln(J) + (lmbda / 2) * (ufl.ln(J)) ** 2
 
 
+class StVenantKirchhoff(MaterialModel):
+    """St. Venant–Kirchhoff: S = ℂ:E with E = ½(FᵀF − I).
+
+    For isotropic ℂ this is S = λ tr(E) I + 2μ E, whose energy potential is
+        W(F) = ½ E:ℂ:E = (λ/2) (tr E)² + μ (E:E),
+    so that S = dW/dE and the solver's P = dW/dF = F·S follow by autodiff.
+    """
+
+    def __init__(self, mu: float, lmbda: float):
+        self.mu = mu
+        self.lmbda = lmbda
+
+    def strain_energy(self, F):
+        mu, lmbda = self.mu, self.lmbda
+        d = F.ufl_shape[0]
+        E = 0.5 * (F.T * F - ufl.Identity(d))
+        return (lmbda / 2) * ufl.tr(E) ** 2 + mu * ufl.inner(E, E)
+
+
 class BertoldiHyperelastic(MaterialModel):
     """ψ = c1(I1−3) + c2(I1−3)² − 2c1 ln J + ½K(J−1)²  (van Bree 2020, Eq. 55).
 
