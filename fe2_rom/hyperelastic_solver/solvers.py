@@ -10,6 +10,7 @@ import dolfinx_mpc
 import numpy as np
 from dolfinx import fem
 from dolfinx.fem import petsc as fem_petsc
+from mpi4py import MPI
 from petsc4py import PETSc
 
 logger = logging.getLogger(__name__)
@@ -70,32 +71,102 @@ class NewtonSolver:
         self.rebuild_constraint_vecs()
 
     def _make_projector(self):
-        """Build and return (G_inv, apply_P) from the current constraint vecs.
+        """Build and return (G_pinv, apply_P) from the current constraint vecs.
 
-        G = C C^T (m×m, m = number of constraints).
-        apply_P(v) projects v in-place: v <- P v = v - C^T G^{-1} (C v).
+        ``apply_P(v)`` projects v in-place onto the constraint null space:
+        ``v <- P v = v - C^T (C C^T)^+ (C v)``.
+
+        The constraint basis is **normalised** before forming the Gram matrix,
+        so ``G`` is a well-scaled correlation matrix (unit diagonal). This
+        matters for the second-order (ch2) solver, which mixes volume integrals
+        ``⟨w⟩`` with face integrals ``∫_Γ w``: their raw magnitudes differ by
+        orders of magnitude, so the unnormalised ``C C^T`` is severely
+        ill-conditioned and its explicit inverse **overflows** — projecting a
+        non-constraint-satisfying vector (e.g. a raw buckling eigenmode, where
+        ``C v = O(1)``) then blows it up to ~1e308 and injects NaNs downstream.
+        A Moore–Penrose pseudo-inverse additionally tolerates a genuinely
+        redundant / linearly-dependent constraint (it projects onto the actual
+        span instead of dividing by ~0). Scaling the rows of ``C`` leaves the
+        projector ``P`` mathematically unchanged.
         """
         c_vecs = self._constraint_vecs
         m = len(c_vecs)
+        norms = np.array([float(np.sqrt(max(ci.dot(ci), 0.0))) for ci in c_vecs])
+        norms = np.where(norms > 0.0, norms, 1.0)
         G = np.empty((m, m))
         for i, ci in enumerate(c_vecs):
             for j, cj in enumerate(c_vecs):
-                G[i, j] = ci.dot(cj)
-        try:
-            G_inv = np.linalg.inv(G)
-        except np.linalg.LinAlgError as exc:
-            raise RuntimeError(
-                "Constraint Gram matrix G = C C^T is singular — "
-                "constraints may be linearly dependent."
-            ) from exc
+                G[i, j] = ci.dot(cj) / (norms[i] * norms[j])
+        G_pinv = np.linalg.pinv(G, rcond=1e-10)
 
         def apply_P(v: PETSc.Vec) -> None:
-            Cv = np.array([ci.dot(v) for ci in c_vecs])
-            alpha = G_inv @ Cv
+            Cv = np.array([c_vecs[i].dot(v) / norms[i] for i in range(m)])
+            alpha = G_pinv @ Cv
             for i, ci in enumerate(c_vecs):
-                v.axpy(-alpha[i], ci)
+                v.axpy(-alpha[i] / norms[i], ci)
 
-        return G_inv, apply_P
+        return G_pinv, apply_P
+
+    def project_direction(self, func) -> float:
+        """Make a perturbation direction consistent with the constraint
+        manifold and the periodic ties, in place; return the fraction of the
+        direction that survives projection, ``‖P v‖ / ‖v‖``.
+
+        The projected Newton step only ever adds C-orthogonal increments
+        (``du`` is re-projected, so ``C·du = 0``); ``C·u`` is therefore a
+        conserved quantity of the solve and is never restored to zero. An
+        eigenmode kick ``u += s·φ`` taken from the raw tangent generally has
+        ``C·φ ≠ 0`` (and is not periodic at the MPC slaves), so it pushes
+        ``u`` off the manifold and the projected Newton then freezes that
+        violation in. Projecting ``φ`` into ``range(P)`` and MPC-back-
+        substituting it — in the same order the Newton increment is handled
+        (project → forward-scatter → backsubstitute) — keeps the kicked state
+        on the manifold.
+
+        The returned ratio is the cheap Mechanism-2 test: a raw-tangent
+        eigenmode that lies (almost) entirely in the constraint subspace —
+        a *constraint-forbidden* direction, not a physical instability —
+        survives projection as ``≈ 0``, so a tiny ratio flags a spurious mode
+        the caller should not perturb along. It is measured as the ratio of
+        owned ``‖·‖_∞`` *after* the full project→backsubstitute (the exact
+        direction the kick will use) to the raw ``‖·‖_∞`` *before* — so it
+        agrees with the magnitude ``apply_eigenmode_perturbation`` sees
+        (measuring before backsubstitution can disagree, since the periodic
+        backsubstitution relocates the projected mode's energy at the slave
+        dofs).
+
+        Returns ``1.0`` (no-op) when there are no integral constraints (e.g.
+        the default CH1 corner-pinned regime), so that well-tested
+        unconstrained path is left untouched.
+        """
+        if not self._constraint_vecs:
+            return 1.0
+        imap = func.function_space.dofmap.index_map
+        bs = func.function_space.dofmap.index_map_bs
+        n_local = imap.size_local * bs
+        comm = func.function_space.mesh.comm
+
+        def owned_inf_norm() -> float:
+            a = func.x.array[:n_local]
+            local = float(np.max(np.abs(a))) if a.size else 0.0
+            return comm.allreduce(local, op=MPI.MAX)
+
+        raw_inf = owned_inf_norm()
+        vec = func.x.petsc_vec
+        # Project the (condensed) eigenmode onto the integral-constraint null
+        # space — and stop there. We deliberately do NOT MPC-backsubstitute:
+        # composing the constraint projector with the periodic backsubstitution
+        # on a raw buckling eigenmode overflows to ~1e308 (in either order —
+        # apply_P's constraint correction at a master fans out through the
+        # periodic ties), injecting NaNs into the kick. apply_P alone is stable,
+        # and keeping the kick C-orthogonal is the property that matters (the
+        # original solver never backsubstituted the eigenmode at all); the
+        # subsequent Newton solve enforces the periodic ties on its increments.
+        _, apply_P = self._make_projector()
+        apply_P(vec)
+        func.x.scatter_forward()
+        proj_inf = owned_inf_norm()
+        return float(proj_inf / raw_inf) if raw_inf > 0.0 else 0.0
 
     def _solve_projected(self, K: PETSc.Mat, residual: PETSc.Vec) -> int:
         """Solve P K P du = -P R via MINRES on a shell matrix; recover λ.
@@ -137,8 +208,6 @@ class NewtonSolver:
             def mult(self_inner, mat, x, y):
                 Px = x.copy()
                 apply_P(Px)
-                Px.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                               mode=PETSc.ScatterMode.FORWARD)
                 K.mult(Px, y)
                 PETSc.Vec.destroy(Px)
                 apply_P(y)

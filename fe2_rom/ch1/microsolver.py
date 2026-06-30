@@ -993,6 +993,7 @@ class MicroSolver:
 
             stable_configuration = False
             pert_amplitude = pert_amplitude_init
+            pert_attempts = 0
             iter_newton = 0
             self._newton.reset_for_new_timestep()
 
@@ -1002,8 +1003,18 @@ class MicroSolver:
                 if converged:
                     if self._stability is not None:
                         K = self._newton.assemble_stiffness()
+                        # When the equilibrium is constrained (projected Newton),
+                        # judge stability on the constraint manifold: the raw
+                        # tangent over-reports instabilities that the integral
+                        # constraints actually stabilise. apply_P lets the check
+                        # use reduced-Hessian curvatures and return the projected
+                        # (followable) buckling mode.
+                        apply_P_stab = None
+                        if self._newton._constraint_vecs:
+                            _, apply_P_stab = self._newton._make_projector()
                         try:
-                            is_stable, eigenvalues = self._stability.check(K, self._eigenfunction)
+                            is_stable, eigenvalues = self._stability.check(
+                                K, self._eigenfunction, apply_P=apply_P_stab)
                         except (PETSc.Error, SystemError):
                             logger.error("Stability check failed.")
                             ok = self._timestepper.reject()
@@ -1028,6 +1039,24 @@ class MicroSolver:
                             break
                     else:
                         is_stable, eigenvalues = True, np.array([])
+
+                    # Mechanism-2 filter: an instability flagged on the raw
+                    # tangent whose eigenvector lies in the constraint subspace
+                    # (∫_face w=0, ⟨w⟩=0) is constraint-forbidden, not physical.
+                    # project_direction projects φ onto the manifold (also
+                    # readying it for an on-manifold kick) and reports how much
+                    # survives; if almost nothing does, the mode is spurious and
+                    # the equilibrium is treated as stable. No-op without
+                    # integral constraints (returns 1.0), so CH1 is unaffected.
+                    if (not is_stable) and self._perturb_post_buckling:
+                        surviving = self._newton.project_direction(self._eigenfunction)
+                        if surviving < 1e-3:
+                            logger.info(
+                                "Instability mode is constraint-subspace "
+                                "(‖Pφ‖/‖φ‖=%.2e < 1e-3) — filtering as spurious; "
+                                "treating equilibrium as stable", surviving,
+                            )
+                            is_stable = True
 
                     if is_stable:
                         stable_configuration = True
@@ -1082,8 +1111,14 @@ class MicroSolver:
                                         f"dw_d{var_name}_{suffix}", p, t_save,
                                     )
                     elif self._perturb_post_buckling:
-                        # Unstable: perturb onto the buckled branch and re-solve
-                        # (the eigenvector kick doubles on each retry).
+                        # Unstable (genuine, on-manifold mode): perturb onto the
+                        # buckled branch and re-solve (the eigenvector kick
+                        # doubles on each retry). The eigenmode was already
+                        # projected onto the constraint manifold + MPC-back-
+                        # substituted by the Mechanism-2 filter above, so the
+                        # kick keeps u on the manifold (the projected Newton
+                        # conserves C·u and would otherwise freeze any violation
+                        # in).
                         target = np.where(eigenvalues < self._stability._neg_tol)[0]
                         scale, info = apply_eigenmode_perturbation(
                             u, self._eigenfunction, pert_amplitude, self.comm,
@@ -1098,6 +1133,39 @@ class MicroSolver:
                             scale * phi_max,
                         )
                         pert_amplitude *= 2
+                        pert_attempts += 1
+                        # Safety net: a kick that produces no actual displacement
+                        # (an unperturbable / constraint-subspace mode the
+                        # Mechanism-2 filter did not catch) would otherwise double
+                        # its amplitude forever. After many fruitless retries,
+                        # reject the step and let dt halve rather than spin.
+                        kick = scale * phi_max
+                        if pert_attempts >= 8 or not np.isfinite(kick):
+                            logger.warning(
+                                "Eigenmode kick ineffective after %d retries "
+                                "(‖perturbation‖_∞=%.2e) — rejecting step and "
+                                "halving dt.", pert_attempts, kick,
+                            )
+                            ok = self._timestepper.reject()
+                            u.x.array[:] = self._u_last.x.array[:]
+                            u.x.scatter_forward()
+                            if not ok:
+                                raise RVEConvergenceError(
+                                    f"Eigenmode perturbation ineffective and "
+                                    f"dt_min={self._timestepper.dt_min:.2e} reached "
+                                    f"at t={self._timestepper.t_current:.4f}"
+                                )
+                            break
+                        # Re-solve the kicked state as a FRESH Newton solve: reset
+                        # the iteration count so the convergence reference
+                        # (abs_b_norm_init) is recomputed at the perturbed state.
+                        # The kick deliberately raises the residual; without this
+                        # reset it is compared against the pre-kick reference and
+                        # the div_rel_tol guard mis-flags it as divergence before
+                        # any Newton iteration is taken — the buckled branch is
+                        # then never actually re-solved for.
+                        iter_newton = 0
+                        self._newton.reset_for_new_timestep()
                     else:
                         # Approach mode (perturb_post_buckling=False): don't jump
                         # onto the buckled branch — reject and halve dt to step as
@@ -1119,6 +1187,27 @@ class MicroSolver:
                         break
 
                 else:
+                    # If this divergence is the re-solve *after* an eigenmode
+                    # kick, don't collapse dt — halving dt walks the trial state
+                    # back toward the critical point, where the buckled branch
+                    # is not yet separated, so the deadlock only deepens.
+                    # Instead fall back to the last converged state and let the
+                    # loop re-kick with a larger amplitude (it has already been
+                    # doubled): a genuine post-bifurcation branch needs a kick
+                    # big enough to reach its basin, and reject-on-divergence
+                    # would otherwise never let the amplitude grow.
+                    if 0 < pert_attempts < 8:
+                        logger.warning(
+                            "Re-solve diverged after eigenmode kick — retrying "
+                            "from the last converged state with a larger kick "
+                            "(factor=%.2e, attempt %d).",
+                            pert_amplitude, pert_attempts,
+                        )
+                        u.x.array[:] = self._u_last.x.array[:]
+                        u.x.scatter_forward()
+                        iter_newton = 0
+                        self._newton.reset_for_new_timestep()
+                        continue
                     ok = self._timestepper.reject()
                     if not ok:
                         logger.error(

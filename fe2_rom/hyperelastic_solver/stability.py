@@ -182,7 +182,7 @@ class StabilityAnalyzer:
         # buckling modes.
         self._n_skip = n_skip_eigenvalues
 
-    def check(self, K: PETSc.Mat, eigenfunction) -> tuple[bool, np.ndarray]:
+    def check(self, K: PETSc.Mat, eigenfunction, apply_P=None) -> tuple[bool, np.ndarray]:
         """Run eigenvalue analysis on K.
 
         If any eigenvalue is below neg_tol, writes the first corresponding
@@ -192,6 +192,17 @@ class StabilityAnalyzer:
         The extraction threshold for the eigenvector (< 1e-12) intentionally
         includes slightly positive eigenvalues to match the original solver's
         behaviour of perturbing near-zero modes.
+
+        ``apply_P`` (optional): the orthogonal projector onto the constraint
+        null space. When the equilibrium is *constrained* (the projected Newton
+        of ch2 / corner-periodic ch1 / mm), the raw tangent ``K`` is **not** the
+        physical Hessian — it over-reports instabilities whose eigenvectors are
+        stabilised by the integral constraints. With ``apply_P`` the check
+        instead judges each mode by its curvature **on the constraint manifold**
+        ``ρ = (Pφ)ᵀK(Pφ) / |Pφ|²`` (a Rayleigh quotient of the reduced Hessian),
+        flags instability only when ``ρ < neg_tol``, and writes the *projected*
+        most-unstable mode ``Pφ`` into ``eigenfunction`` — the descent direction
+        the projected Newton can actually follow onto the buckled branch.
         """
         # Solve for nev physical modes PLUS n_skip gauge-mode buffer, so the
         # check has nev real eigenvalues to inspect even after skipping the
@@ -204,6 +215,13 @@ class StabilityAnalyzer:
             K, self._comm, nev=total_nev, tol=self._tol,
             petsc_options=self._petsc_options,
         )
+        if apply_P is not None:
+            try:
+                return self._check_on_manifold(K, eigensolver, n_conv,
+                                                total_nev, eigenfunction, apply_P)
+            finally:
+                eigensolver.destroy()
+                PETSc.Mat.destroy(K)
         try:
             all_eigenvalues = np.array([
                 eigensolver.getEigenvalue(i).real
@@ -248,3 +266,53 @@ class StabilityAnalyzer:
             PETSc.Mat.destroy(K)
 
         return is_stable, eigenvalues
+
+    def _check_on_manifold(self, K, eigensolver, n_conv, total_nev,
+                           eigenfunction, apply_P) -> tuple[bool, np.ndarray]:
+        """Stability on the constraint manifold via reduced-Hessian Rayleigh
+        quotients ``ρ = (Pφ)ᵀK(Pφ)/|Pφ|²`` of the raw eigenvectors.
+
+        A raw negative eigenvalue with ``ρ ≥ neg_tol`` is a constraint-subspace
+        artifact (the integral constraints stabilise it); only ``ρ < neg_tol``
+        is a genuine instability. The gauge / near-null modes project to ``ρ``
+        well above ``neg_tol`` and so are excluded automatically. The projected
+        most-unstable mode ``Pφ`` is written into ``eigenfunction``.
+        """
+        n = min(n_conv, total_nev)
+        phi = K.createVecRight()
+        Pphi = K.createVecRight()
+        KPphi = K.createVecLeft()
+        rhos = np.full(n, np.nan)
+        best_idx, best_rho, best_Pphi = -1, np.inf, None
+        for i in range(n):
+            eigensolver.getEigenvector(i, phi)
+            phi.copy(Pphi)
+            apply_P(Pphi)
+            denom = Pphi.dot(Pphi)
+            if denom <= 0.0:
+                continue
+            K.mult(Pphi, KPphi)
+            rho = float(Pphi.dot(KPphi) / denom)
+            rhos[i] = rho
+            if rho < best_rho:
+                best_rho, best_idx = rho, i
+                if best_Pphi is None:
+                    best_Pphi = Pphi.duplicate()
+                Pphi.copy(best_Pphi)
+        physical = rhos[np.isfinite(rhos)]
+        logger.info(
+            "Stability on constraint manifold: reduced-Hessian ρ = %s",
+            np.array2string(np.sort(physical), precision=4),
+        )
+
+        is_stable = True
+        if best_idx >= 0 and best_rho < self._neg_tol:
+            is_stable = False
+            best_Pphi.copy(eigenfunction.x.petsc_vec)
+            eigenfunction.x.scatter_forward()
+            logger.info("Physical instability on manifold: ρ_min=%.4e", best_rho)
+
+        phi.destroy(); Pphi.destroy(); KPphi.destroy()
+        if best_Pphi is not None:
+            best_Pphi.destroy()
+        return is_stable, physical
