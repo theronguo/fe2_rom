@@ -1259,67 +1259,152 @@ class ECM:
         training repeated if verification fails; the verified residual is
         stored in ``self.true_residual``.
         """
-        if ecm_func is None:
-            ecm_func = my_ecm
-        # Inject convenience params; explicit **ecm_func_kwargs take precedence
-        # if the same key appears in both.
-        _extra = {}
-        if max_points is not None:
-            _extra["max_points"] = max_points
-        if checkpoint_dir is not None:
-            _extra["checkpoint_dir"] = checkpoint_dir
-            _extra["checkpoint_interval"] = checkpoint_interval
-            def _ckpt_cb(S_curr, alpha_curr):
-                self.magic_points = S_curr
-                self.magic_weights = alpha_curr
-                self.save_variant2(checkpoint_dir)
-            _extra["on_checkpoint"] = _ckpt_cb
-        if prune_interval is not None:
-            _extra["prune_interval"] = prune_interval
-            _extra["prune_weight_tol"] = prune_weight_tol
-        _call_kw = {**_extra, **ecm_func_kwargs}
+        try:
+            if ecm_func is None:
+                ecm_func = my_ecm
+            # Inject convenience params; explicit **ecm_func_kwargs take precedence
+            # if the same key appears in both.
+            _extra = {}
+            if max_points is not None:
+                _extra["max_points"] = max_points
+            if checkpoint_dir is not None:
+                _extra["checkpoint_dir"] = checkpoint_dir
+                _extra["checkpoint_interval"] = checkpoint_interval
+                def _ckpt_cb(S_curr, alpha_curr):
+                    self.magic_points = S_curr
+                    self.magic_weights = alpha_curr
+                    self.save_variant2(checkpoint_dir)
+                _extra["on_checkpoint"] = _ckpt_cb
+            if prune_interval is not None:
+                _extra["prune_interval"] = prune_interval
+                _extra["prune_weight_tol"] = prune_weight_tol
+            _call_kw = {**_extra, **ecm_func_kwargs}
 
-        if self.per_qp:
+            if self.per_qp:
+                auto = self._include_uP and isinstance(self.compress_uP, str)
+                if auto:
+                    self._auto_tol = tol
+                    self._auto_K_t_floor = 1
+                for round_ in range(max_auto_rounds if auto else 1):
+                    A, b = self._build_matrices_qp()
+                    self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **_call_kw)
+                    if not auto:
+                        return
+                    self.true_residual = self._full_residual(
+                        A, b, self.magic_points, self.magic_weights)
+                    print(f"[per-qp] auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
+                          f"{len(self.magic_points)} qps, true full-system residual "
+                          f"{self.true_residual:.3e} (tol {tol:g})")
+                    if self.true_residual <= tol or self._K_t_used >= self.M:
+                        return
+                    self._auto_K_t_floor = int(min(self.M, max(len(self.magic_points) + 10,
+                                                               1.5 * self._K_t_used)))
+                print("[per-qp] auto-K_t: max_auto_rounds reached, keeping last result")
+                return
             auto = self._include_uP and isinstance(self.compress_uP, str)
             if auto:
                 self._auto_tol = tol
                 self._auto_K_t_floor = 1
             for round_ in range(max_auto_rounds if auto else 1):
-                A, b = self._build_matrices_qp()
+                A, b = self._build_matrices()
                 self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **_call_kw)
                 if not auto:
                     return
-                self.true_residual = self._full_residual(
-                    A, b, self.magic_points, self.magic_weights)
-                print(f"[per-qp] auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
-                      f"{len(self.magic_points)} qps, true full-system residual "
-                      f"{self.true_residual:.3e} (tol {tol:g})")
+                self.true_residual = self._full_residual(A, b, self.magic_points, self.magic_weights)
+                print(f"auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
+                      f"{len(self.magic_points)} points, "
+                      f"true full-system residual {self.true_residual:.3e} (tol {tol:g})")
                 if self.true_residual <= tol or self._K_t_used >= self.M:
                     return
+                # paper's rule (K_t = M_c + 10) with the measured point count,
+                # guarded by geometric growth; saturates at M (= exact system)
                 self._auto_K_t_floor = int(min(self.M, max(len(self.magic_points) + 10,
                                                            1.5 * self._K_t_used)))
-            print("[per-qp] auto-K_t: max_auto_rounds reached, keeping last result")
+            print("auto-K_t: max_auto_rounds reached, keeping last result")
+        finally:
+            # Always report the rule's coverage, on every return path.
+            self._report_coverage()
+
+    def _report_coverage(self):
+        """Print how many points/cells the selected rule keeps vs the full
+        quadrature. Called automatically at the end of :meth:`compute_magic` and
+        :meth:`use_full_quadrature`."""
+        if self.magic_points is None:
             return
-        auto = self._include_uP and isinstance(self.compress_uP, str)
-        if auto:
-            self._auto_tol = tol
-            self._auto_K_t_floor = 1
-        for round_ in range(max_auto_rounds if auto else 1):
-            A, b = self._build_matrices()
-            self.magic_points, self.magic_weights = ecm_func(A, b, tol=tol, **_call_kw)
-            if not auto:
-                return
-            self.true_residual = self._full_residual(A, b, self.magic_points, self.magic_weights)
-            print(f"auto-K_t round {round_ + 1}: K_t={self._K_t_used}, "
-                  f"{len(self.magic_points)} points, "
-                  f"true full-system residual {self.true_residual:.3e} (tol {tol:g})")
-            if self.true_residual <= tol or self._K_t_used >= self.M:
-                return
-            # paper's rule (K_t = M_c + 10) with the measured point count,
-            # guarded by geometric growth; saturates at M (= exact system)
-            self._auto_K_t_floor = int(min(self.M, max(len(self.magic_points) + 10,
-                                                       1.5 * self._K_t_used)))
-        print("auto-K_t: max_auto_rounds reached, keeping last result")
+        n_cells = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
+        n_sel = len(self.magic_points)
+        if self.per_qp and self._qp_meta is not None:
+            n_q = self._qp_meta["n_q"]
+            total_qp = n_cells * n_q
+            active_cells = int(np.unique(np.asarray(self.magic_points) // n_q).size)
+            print(f"ECM rule: {n_sel} / {total_qp} quadrature points "
+                  f"({n_sel / total_qp:.2%})  |  active elements: "
+                  f"{active_cells} / {n_cells} ({active_cells / n_cells:.2%})  "
+                  f"[n_q={n_q}/element]")
+        else:
+            print(f"ECM rule: {n_sel} / {n_cells} elements ({n_sel / n_cells:.2%})")
+
+    def use_full_quadrature(self):
+        """Set the 'magic' rule to the **full** quadrature instead of running the
+        greedy: every candidate point gets its exact quadrature weight, so a
+        subsequent :meth:`save_variant2` writes a reduced model whose cubature is
+        *exact* (no hyper-reduction).
+
+        The only approximation left in the resulting online solve is then the POD
+        (Galerkin projection) itself — so comparing a ``use_full_quadrature`` ROM
+        against a ``compute_magic`` ROM isolates the ECM (cubature) error from the
+        POD error. Sets :attr:`magic_points` / :attr:`magic_weights` (and
+        :attr:`_qp_meta` in the per-qp case) directly; no greedy is run and
+        :attr:`true_residual` is 0. Uses the same quadrature (``quad_degree``,
+        scheme) the ECM build would, so the two rules are directly comparable.
+        """
+        n_cells = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
+        if not self.per_qp:
+            # Per-cell (DG-0) rule: every cell active, weight = exact cell volume.
+            self.magic_points = np.arange(n_cells, dtype=np.int64)
+            self.magic_weights = np.asarray(self._weights, dtype=float).copy()
+            self.true_residual = 0.0
+            print(f"[full-quad] exact cell volumes "
+                  f"(sum={self.magic_weights.sum():.6g}, volume={self._volume:.6g})")
+            self._report_coverage()
+            return
+
+        # Per-qp rule: every (cell, q) active, weight = w_q |detJ(ξ_q)| — the same
+        # scaled quadrature weights the per-qp ECM build tabulates.
+        import basix
+        import basix.ufl
+
+        cell_name = self.mesh.topology.cell_type.name
+        deg_u = self.V.ufl_element().degree if self.V is not None else 1
+        deg_P = self.S.ufl_element().degree if self.S is not None else 1
+        qdeg = self.quad_degree if self.quad_degree is not None else (deg_u - 1) + deg_P
+        _, wts = basix.make_quadrature(getattr(basix.CellType, cell_name), qdeg)
+        n_q = wts.size
+
+        q_el = basix.ufl.quadrature_element(cell_name, value_shape=(),
+                                            scheme="default", degree=qdeg)
+        Q = fem.functionspace(self.mesh, q_el)
+        ind = fem.Function(Q)
+        cell_avg = ufl.TestFunction(self._Q0)
+        dxq = ufl.dx(domain=self.mesh,
+                     metadata={"quadrature_scheme": "default", "quadrature_degree": qdeg})
+        form_w = fem.form(ind * cell_avg * dxq)
+        W = np.empty((n_cells, n_q))
+        for q in range(n_q):
+            ind.x.array[:] = 0.0
+            ind.x.array[q::n_q] = 1.0
+            W[:, q] = petsc.assemble_vector(form_w).array
+        assert np.isclose(W.sum(), self._volume), "quadrature weight tabulation failed"
+
+        # Cell-major (m*n_q + q) to match the per-qp candidate/column ordering.
+        self.magic_points = np.arange(n_cells * n_q, dtype=np.int64)
+        self.magic_weights = W.ravel().astype(float)
+        self._qp_meta = {"n_q": int(n_q), "qdeg": int(qdeg),
+                         "cell_name": cell_name, "scheme": "default"}
+        self.true_residual = 0.0
+        print(f"[full-quad] exact quadrature weights "
+              f"(sum={self.magic_weights.sum():.6g}, volume={self._volume:.6g})")
+        self._report_coverage()
 
     def show_active_cells(self, filename="active.xdmf"):
         """Write the selected (active) cells as meshtags to an XDMF file for ParaView."""

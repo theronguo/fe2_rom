@@ -232,11 +232,14 @@ examples/
 │   ├── example_1/      # 2D perforated RVE — FOM and ROM
 │   ├── example_2/      # 3D periodic RVE — FOM and ROM
 │   └── example_3/      # FE² — single-element macro cube × 3D periodic RVE (reuses example_2's ECM)
-└── mm/                 # micromorphic homogenization
-    ├── example_1/      # standalone micromorphic RVE + snapshot sampling + ROM build
-    ├── example_2/      # FE² macro micromorphic with dummy constitutive law (3D)
-    ├── example_3/      # FE² macro micromorphic with nested RVE (FOM or ROM, 2D)
-    └── example_4/      # polygonal (hexagonal) RVE — buckling spectrum + micromorphic solve
+├── mm/                 # micromorphic homogenization
+│   ├── example_1/      # standalone micromorphic RVE + snapshot sampling + ROM build
+│   ├── example_2/      # FE² macro micromorphic with dummy constitutive law (3D)
+│   ├── example_3/      # FE² macro micromorphic with nested RVE (FOM or ROM, 2D)
+│   └── example_4/      # polygonal (hexagonal) RVE — buckling spectrum + micromorphic solve
+└── ch2/                # second-order (strain-gradient) homogenization
+    ├── example_1/      # 3D sphere-strut RVE — FOM and ROM
+    └── example_2/      # 2D square RVE — (F̄, Ḡ) sampling + POD/ECM ROM, buckling traversal
 ```
 
 ## Quick start
@@ -654,6 +657,34 @@ solver.solve(
     pert_amplitude_init=1e-2,    # eigenmode kick applied when macro buckling is detected
 )
 ```
+
+Run the full examples:
+
+```bash
+# 3D sphere-strut RVE — FOM and ROM
+cd examples/ch2/example_1
+python create_sphere_strut_mesh.py --nx 2 --ny 2 --nz 2 --center  # centred RVE
+mpirun -n 4 python run_homogenization.py   # full-order, writes snapshots to output/
+python build_rom.py                        # POD + ECM → ecm/
+python run_homogenization_rom.py           # reduced online stage
+
+# 2D square RVE — (F̄, Ḡ) sampling + couple-stress-aware POD/ECM ROM
+cd ../example_2
+python run_homogenization.py               # full-order test case (serial or mpirun)
+python generate_training_data.py           # LHS-sample (F̄, Ḡ); traverses RVE buckling
+python build_rom.py                        # POD + ECM (adds the Q̄ couple-stress block)
+python run_homogenization_rom.py           # reduced stage; prints FOM-vs-ROM error
+```
+
+`examples/ch2/example_2` is the CH2 analogue of the micromorphic `example_1`
+workflow: it samples both `F̄` and its gradient `Ḡ`, monitors stability and
+**traverses RVE buckling** during sampling (`pert_amplitude_init=1e-3`), adds the
+double-/couple-stress density `𝒴 = ½(X_K P_iJ + X_J P_iK)` as an extra ECM
+constraint block so the reduced quadrature integrates `Q̄` accurately, and exposes
+a `FULL_QUADRATURE` toggle in `build_rom.py` / `run_homogenization_rom.py` that
+uses the exact (full) quadrature instead of the ECM rule — isolating POD error
+from ECM (hyper-reduction) error. `build_rom.py` also reports the rule's coverage
+(magic points vs total quadrature points / active elements).
 
 ## Validation
 

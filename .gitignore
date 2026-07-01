@@ -9,6 +9,9 @@
 *.npy
 *.json
 *.npz
+*.pkl
+*.pdf
+*.png
 
 .vscode/
 .claude/

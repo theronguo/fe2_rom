@@ -70,8 +70,6 @@ class NewtonSolverFE2(NewtonSolver):
                 def mult(self_inner, mat, x, y):
                     Px = x.copy()
                     apply_P(Px)
-                    Px.ghostUpdate(addv=PETSc.InsertMode.INSERT,
-                                   mode=PETSc.ScatterMode.FORWARD)
                     K.mult(Px, y)
                     PETSc.Vec.destroy(Px)
                     apply_P(y)

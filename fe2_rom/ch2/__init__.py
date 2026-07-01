@@ -24,6 +24,7 @@ Submodules
     fe2_rom.ch2.microsolver  — full-order second-order RVE solver (MicroSolver).
     fe2_rom.ch2.material     — constitutive bridge (Ch2RVEMaterial, dummy law).
     fe2_rom.ch2.macrosolver  — mixed FE² macro driver (MacroSecondOrderSolver).
+    fe2_rom.ch2.training_data — generate (F̄, Ḡ) ROM training snapshots.
 """
 from .constraints import ZeroBoundaryAverage
 from .averages import (
@@ -36,6 +37,7 @@ from .averages import (
 from .microsolver import MicroSolver
 from .material import Ch2RVEMaterial, DummyCh2Material
 from .macrosolver import MacroSecondOrderSolver
+from .training_data import generate_training_data
 
 __all__ = [
     "ZeroBoundaryAverage",
@@ -48,4 +50,5 @@ __all__ = [
     "Ch2RVEMaterial",
     "DummyCh2Material",
     "MacroSecondOrderSolver",
+    "generate_training_data",
 ]
