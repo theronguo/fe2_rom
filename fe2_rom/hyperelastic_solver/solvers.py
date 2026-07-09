@@ -39,6 +39,7 @@ class NewtonSolver:
                  div_rel_tol=10.0,
                  petsc_options: dict | None = None,
                  switch_to_minres=False,
+                 line_search=False,
                  constraint_forms: "list | None" = None,
                  ):
         self._comm = comm
@@ -54,6 +55,7 @@ class NewtonSolver:
         self._div_rel_tol = div_rel_tol
         self._petsc_options = petsc_options
         self._switch_to_minres = switch_to_minres
+        self._line_search = line_search
         self.mpc = mpc
 
         if mpc is not None:
@@ -430,8 +432,29 @@ class NewtonSolver:
             )
             if self.mpc is not None:
                 self.mpc.backsubstitution(self._du.x.petsc_vec)
-            self._u.x.petsc_vec.axpy(1.0, self._du.x.petsc_vec)
-            self._u.x.scatter_forward()
+            if not self._line_search:
+                self._u.x.petsc_vec.axpy(1.0, self._du.x.petsc_vec)
+                self._u.x.scatter_forward()
+            else:
+                # Backtracking line search: accept u + α·du only if the
+                # residual norm decreases. A full Newton step from a state
+                # kicked off a bifurcation saddle overshoots on the shallow
+                # post-buckling landscape and diverges geometrically; damping
+                # to a descent step keeps the walk inside the basin of the
+                # buckled root. If even α_min gives no decrease, the α_min
+                # step is taken anyway — max_iter/div_rel_tol then govern.
+                alpha, applied, alpha_min = 1.0, 0.0, 1.0 / 256.0
+                while True:
+                    self._u.x.petsc_vec.axpy(alpha - applied,
+                                             self._du.x.petsc_vec)
+                    self._u.x.scatter_forward()
+                    applied = alpha
+                    trial_norm = self._residual_norm()
+                    if trial_norm < abs_b_norm or alpha <= alpha_min:
+                        logger.debug("  line search: alpha=%.4f  |R| %.3e -> %.3e",
+                                     alpha, abs_b_norm, trial_norm)
+                        break
+                    alpha *= 0.5
             iter_newton += 1
 
             PETSc.Vec.destroy(residual)
@@ -441,6 +464,28 @@ class NewtonSolver:
             logger.info("Newton converged in %d iteration(s) [%s]",
                         iter_newton, convergence_reason)
         return is_converged, iter_newton
+
+    def _residual_norm(self) -> float:
+        """Assemble the residual at the current state and return the norm used
+        for convergence (projected onto the constraint manifold when integral
+        constraints are present) — mirrors the assembly at the top of solve().
+        """
+        if self.mpc is not None:
+            r = dolfinx_mpc.assemble_vector(self._R_form, self.mpc)
+            dolfinx_mpc.apply_lifting(r, [self._J_form], [self._bcs], self.mpc,
+                                      x0=[self._u.x.petsc_vec], scale=-1.0)
+        else:
+            r = fem_petsc.assemble_vector(self._R_form)
+            fem_petsc.apply_lifting(r, [self._J_form], [self._bcs],
+                                    x0=[self._u.x.petsc_vec], alpha=-1.0)
+        r.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+        fem_petsc.set_bc(r, self._bcs, x0=self._u.x.petsc_vec, alpha=-1.0)
+        if self._constraint_vecs:
+            _, apply_P = self._make_projector()
+            apply_P(r)
+        norm = r.norm()
+        PETSc.Vec.destroy(r)
+        return norm
 
     def assemble_stiffness(self) -> PETSc.Mat:
         """Assemble and return tangent stiffness K. Caller is responsible for destroying it."""
