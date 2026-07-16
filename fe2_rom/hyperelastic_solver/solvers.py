@@ -227,30 +227,59 @@ class NewtonSolver:
         du_vec = self._du.x.petsc_vec
         n_global = sizes[0][1]  # global rows
         ksp_proj = PETSc.KSP().create(self._comm)
-        # Use K as the PC matrix so AMG-type preconditioners (e.g. GAMG) can
-        # build their hierarchy from the assembled operator even though the
-        # matvec operator K_proj is a shell matrix.
+        # Use K as the PC matrix so the preconditioner builds from the assembled
+        # operator even though the matvec operator K_proj is a shell matrix.
         ksp_proj.setOperators(K_proj, K)
-        if self._petsc_options is not None:
+        rtol = min(self._rel_tol * 1e-2, 1e-10)
+        atol = min(self._abs_tol * 1e-2, 1e-12)
+        po = self._petsc_options
+        inner_ksp = None
+        K_reg = None
+        if po is not None and po.get("pc_type") in ("lu", "cholesky"):
+            # Projected direct preconditioner  M⁻¹ = P (K+σI)⁻¹ P.
+            sigma = float(po.get("proj_pc_shift", 1e-8))
+            K_reg = K.copy()
+            K_reg.shift(sigma)
+            inner_ksp = PETSc.KSP().create(self._comm)
+            inner_ksp.setOperators(K_reg)
+            inner_ksp.setType(PETSc.KSP.Type.PREONLY)
+            ipc = inner_ksp.getPC()
+            ipc.setType(po["pc_type"])
+            ipc.setFactorSolverType(po.get("pc_factor_mat_solver_type", "mumps"))
+
+            class _ProjPC:
+                def apply(self_pc, pc, x, y):
+                    Px = x.copy()
+                    apply_P(Px)
+                    inner_ksp.solve(Px, y)
+                    apply_P(y)
+                    PETSc.Vec.destroy(Px)
+
+            ksp_proj.setType(po.get("ksp_type", "fgmres"))
+            pc = ksp_proj.getPC()
+            pc.setType(PETSc.PC.Type.PYTHON)
+            pc.setPythonContext(_ProjPC())
+        elif po is not None:
             opts = PETSc.Options()
-            for key, val in self._petsc_options.items():
+            for key, val in po.items():
                 opts[key] = val
+            ksp_proj.setFromOptions()
         else:
             ksp_proj.setType(PETSc.KSP.Type.MINRES)
             ksp_proj.getPC().setType(PETSc.PC.Type.GAMG)
-        ksp_proj.setTolerances(
-            rtol=min(self._rel_tol * 1e-2, 1e-10),
-            atol=min(self._abs_tol * 1e-2, 1e-12),
-            max_it=min(n_global, 50_000),
-        )
-        ksp_proj.setFromOptions()
+            ksp_proj.setFromOptions()
+        ksp_proj.setTolerances(rtol=rtol, atol=atol, max_it=min(n_global, 50_000))
         ksp_proj.solve(b, du_vec)
         reason = ksp_proj.getConvergedReason()
         n_iter = ksp_proj.getIterationNumber()
         ksp_proj.destroy()
         K_proj.destroy()
+        if inner_ksp is not None:
+            inner_ksp.destroy()
+        if K_reg is not None:
+            K_reg.destroy()
 
-        logger.debug("Projected MINRES: reason=%d  n_iter=%d  |du|=%.3e",
+        logger.debug("Projected solve: reason=%d  n_iter=%d  |du|=%.3e",
                      reason, n_iter, du_vec.norm())
 
         # Re-project for numerical precision

@@ -101,6 +101,7 @@ class _WorkerConfig:
     mesh_path: str
     gdim: int
     degree: int
+    quadrature_degree: object
     material: object
     n_modes: int
     phi_arrays: list
@@ -138,6 +139,7 @@ def _worker_task(task):
         solver = MicroSolver(
             mesh_path=cfg.mesh_path, comm=MPI.COMM_SELF, gdim=cfg.gdim,
             material=cfg.material, N=cfg.n_modes, degree=cfg.degree,
+            quadrature_degree=cfg.quadrature_degree,
             output_dir=work_dir, check_stability=cfg.check_stability,
             perturb_post_buckling=False,
             # Training-data solves are pure forward problems: an empty
@@ -409,6 +411,7 @@ def generate_training_data(
     mesh_path: str, comm, gdim: int, material, max_strain: "float | dict", *,
     lattice_vectors: "np.ndarray | None" = None,
     degree: int = 2,
+    quadrature_degree: "int | None" = None,
     modes_dir: "str | None" = None,
     n_modes: "int | None" = None,
     n_samples: int = 64,
@@ -445,6 +448,10 @@ def generate_training_data(
         F̄ box from the identity.
     lattice_vectors : ``None`` for an axis-aligned box, ``(gdim, gdim)`` for a
         periodic polygon (forwarded to the solver and to mode extraction).
+    quadrature_degree : integration degree of the FOM sample solves (``None`` →
+        DOLFINx automatic). Set it to the value the online ROM will use so the
+        snapshots are integrated on the same rule (e.g. ``2`` = 4 points/tet for
+        P2 tetrahedra).
     modes_dir : where φ are cached / written (default ``output_dir/modes``).
         Reused across runs — delete it to force re-extraction.
     n_modes : keep only the first ``n_modes`` φ (default: all available).
@@ -531,7 +538,8 @@ def generate_training_data(
         shutil.rmtree(worker_root)
     os.makedirs(worker_root, exist_ok=True)
     cfg = _WorkerConfig(
-        mesh_path=mesh_path, gdim=gdim, degree=degree, material=material,
+        mesh_path=mesh_path, gdim=gdim, degree=degree,
+        quadrature_degree=quadrature_degree, material=material,
         n_modes=n_modes, phi_arrays=phi_arrays, lattice_vectors=lattice_vectors,
         rve_volume=rve_volume, check_stability=check_stability,
         save_fields=tuple(save_fields),

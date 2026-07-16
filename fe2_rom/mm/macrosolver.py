@@ -88,9 +88,8 @@ class MacroMicromorphicSolver:
         self._n_qp_per_cell = int(n_qp)
         if enable_restart and not isinstance(material, MicromorphicRVEMaterial):
             raise ValueError(
-                "enable_restart=True requires material to be "
-                "MicromorphicRVEMaterial (FOM inner). Dummy / ROM-inner runs "
-                "are not checkpointed."
+                "enable_restart=True requires a MicromorphicRVEMaterial "
+                "(FOM or ROM inner); Dummy-law runs are not checkpointed."
             )
         self._full_two_scale = bool(enable_restart)
         mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)

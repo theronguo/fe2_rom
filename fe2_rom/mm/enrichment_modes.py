@@ -101,6 +101,7 @@ class _RunConfig:
     gdim: int
     material: object
     degree: int
+    quadrature_degree: "int | None"
     lattice_vectors: "np.ndarray | None"
     work_dir: str
     gap_ratio: float
@@ -119,7 +120,8 @@ def _build_solver(cfg: _RunConfig, output_dir: str, *, check_stability: bool,
     # "P" must be in visualize_fields for the P snapshot path to find P_func.
     return MicroSolver(
         mesh_path=cfg.mesh_path, comm=cfg.comm, gdim=cfg.gdim,
-        material=cfg.material, degree=cfg.degree, output_dir=output_dir,
+        material=cfg.material, degree=cfg.degree,
+        quadrature_degree=cfg.quadrature_degree, output_dir=output_dir,
         check_stability=check_stability,
         perturb_post_buckling=perturb_post_buckling,
         visualize_fields=["P"] if save_snapshots else [],
@@ -341,6 +343,7 @@ def _plot_singular_values(sv: np.ndarray, n_selected: int, out_path: str) -> Non
 def extract_buckling_modes(
     mesh_path: str, comm, gdim: int, material, *,
     degree: int = 2,
+    quadrature_degree: "int | None" = None,
     lattice_vectors: "np.ndarray | None" = None,
     end_deformations: "list[np.ndarray] | None" = None,
     max_strain: float = 0.15,
@@ -365,6 +368,8 @@ def extract_buckling_modes(
     ----------
     mesh_path, comm, gdim, material : the RVE (as for ``ch1.MicroSolver``).
     degree : Lagrange degree of the displacement space.
+    quadrature_degree : integration degree of the inner CH1 solves (``None`` →
+        DOLFINx automatic). Set it to match the training / online rule.
     lattice_vectors : ``None`` → axis-aligned box periodicity; ``(gdim, gdim)``
         array (2D) → arbitrary polygon periodicity.
     end_deformations : list of target ``F̄`` to drive (each ramped from ``I``).
@@ -407,6 +412,7 @@ def extract_buckling_modes(
     os.makedirs(work_dir, exist_ok=True)
     cfg = _RunConfig(
         mesh_path=mesh_path, comm=comm, gdim=gdim, material=material, degree=degree,
+        quadrature_degree=quadrature_degree,
         lattice_vectors=lattice_vectors, work_dir=work_dir,
         gap_ratio=gap_ratio, pert_amplitude=pert_amplitude,
         postbuckle_frac=postbuckle_frac, buckle_amp_ratio=buckle_amp_ratio,

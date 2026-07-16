@@ -980,6 +980,7 @@ class MicroSolver:
             self._write_fields(0.0 + plot_time_start)
 
         output_quantities: list[dict] = []
+        self.output_quantities = output_quantities
         if not self._averages_only_final:
             output_quantities.append(self._collect_averages())
 

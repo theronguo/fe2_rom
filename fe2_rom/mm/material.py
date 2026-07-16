@@ -475,7 +475,12 @@ class MicromorphicRVEMaterial(Material):
         from fe2_rom.ch1 import restart as _restart
         from fe2_rom.hyperelastic_solver.logging_utils import qp_context  # noqa: F401
 
-        if self._rves is None or not self._rves:
+        if (self._rves is None or not self._rves
+                or not hasattr(self._rves[0], "dump_state")):
+            # No RVEs instantiated yet, or a solver with no dump_state — write an
+            # empty marker so the checkpoint is macro-field-only. (Both the FOM
+            # and ROM micro solvers now implement dump_state, so this branch is
+            # only the "not yet built" case.)
             stacked: dict = {"n_qp": np.int64(0)}
         else:
             per_qp = [rve.dump_state() for rve in self._rves]
@@ -498,6 +503,10 @@ class MicromorphicRVEMaterial(Material):
                 "checkpoint was written with a different macro partitioning."
             )
         ckpt_n_qp = int(stacked.pop("n_qp"))
+        if ckpt_n_qp == 0:
+            # Macro-field-only checkpoint (ROM / no per-qp RVE state was saved).
+            # RVEs re-derive from the restored macro field — nothing to load.
+            return
         if ckpt_n_qp != n_qp:
             raise RuntimeError(
                 f"RVE count mismatch on rank {self._rank}: checkpoint has "

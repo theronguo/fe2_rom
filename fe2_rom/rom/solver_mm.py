@@ -387,6 +387,24 @@ class ReducedMicroSolver(ReducedMicroSolver):
         self._v_conv[:] = self.v_const.value
         self._g_conv[:] = self.g_const.value
 
+    # ---- checkpoint / restart ----
+
+    def dump_state(self) -> dict:
+        state = super().dump_state()
+        if self._N_modes > 0:
+            state["v_conv"] = np.asarray(self._v_conv, dtype=float).copy()
+            state["g_conv"] = np.asarray(self._g_conv, dtype=float).copy()
+        return state
+
+    def load_state(self, state: dict) -> None:
+        super().load_state(state)
+        if self._N_modes > 0:
+            self._v_conv[:] = state["v_conv"]
+            self._g_conv[:] = state["g_conv"]
+            # Seed the live constants so the next __call__ warm-starts here.
+            self.v_const.value[:] = self._v_conv
+            self.g_const.value[:] = self._g_conv
+
     # ---- driver override ----
 
     def __call__(
@@ -407,6 +425,8 @@ class ReducedMicroSolver(ReducedMicroSolver):
             )
             self._target_v = v_arr
             self._target_g = g_arr
-            self._prev_v = self._v_conv.copy()
-            self._prev_g = self._g_conv.copy()
+            # Warm-start v/g from the previous __call__ (live values), matching the
+            # base-class F̄ warm-start, so the ramp start is a consistent state.
+            self._prev_v = self.v_const.value.copy()
+            self._prev_g = self.g_const.value.copy()
         return super().__call__(Fbar, **kwargs)

@@ -97,8 +97,8 @@ class ReducedMicroSolver:
 
         # --- ROM data ---
         indices          = np.load(os.path.join(rom_dir, "indices.npy"))
-        self.basis_u_sub = np.load(os.path.join(rom_dir, "basis_u_sub.npy"))
-        self.basis_u     = np.load(os.path.join(rom_dir, "basis_u.npy"))
+        self.basis_u_sub = np.load(os.path.join(rom_dir, "basis_u_sub.npy"), mmap_mode="r")
+        self.basis_u     = np.load(os.path.join(rom_dir, "basis_u.npy"), mmap_mode="r")
         self.N = self.basis_u_sub.shape[1]
         # Per-qp ECM rule (quadrature_element weights at individual Gauss points)
         # vs. the classic per-cell DG-0 rule, detected by qp_meta.json.
@@ -557,7 +557,14 @@ class ReducedMicroSolver:
         abs_tol  = self._newton_options["abs_tol"]
         max_iter = self._newton_options["max_iter"]
 
-        Fbar_prev = self.F_bar_conv.copy()
+        # Warm-start from the previous __call__: the live coeffs / F̄ (and v/g in
+        # the micromorphic subclass) still hold the last solve's converged state,
+        # so ramp from there rather than the committed load step. Later macro
+        # Newton iterations then only cover the small F̄ increment (~1 reduced
+        # step). commit() (once per accepted macro step) still defines the
+        # checkpoint point; the material is path-independent, so the converged
+        # solution and the consistent tangent are unchanged.
+        Fbar_prev = self.F_bar.value.copy()
         Fbar_target = np.asarray(Fbar, dtype=PETSc.ScalarType)
 
         # Objectivity reduction: drive the ROM with the symmetric stretch U and
@@ -567,10 +574,6 @@ class ReducedMicroSolver:
             obj_R, obj_U, obj_dR, obj_dU = polar_derivatives(
                 np.asarray(Fbar, dtype=float))
             Fbar_target = np.asarray(obj_U, dtype=PETSc.ScalarType)
-
-        self.F_bar.value[:] = Fbar_prev
-        self._restore_state(self.coeffs_conv)
-        self._restore_trial_state()
 
         def load_schedule(t: float) -> None:
             self.F_bar.value[:] = Fbar_prev + t * (Fbar_target - Fbar_prev)
@@ -640,3 +643,27 @@ class ReducedMicroSolver:
         self.F_bar_conv[:] = self.F_bar.value
         self.coeffs_conv[:] = self.coeffs
         self._commit_extra_state()
+
+    # --- Checkpoint / restart -------------------------------------------------
+
+    def dump_state(self) -> dict:
+        """Warm-start state for checkpoint/restart.
+
+        The ROM is path-independent, so only the converged reduced coordinates
+        and F̄ are needed: seeding them on resume lets the first post-restart
+        ``__call__`` warm-start from the last accepted macro step (a tiny
+        increment) instead of cold-starting from the reference state and having
+        to re-walk the entire load path — which stalls near buckling.
+        """
+        return {
+            "F_bar_conv": np.asarray(self.F_bar_conv, dtype=float).copy(),
+            "coeffs_conv": np.asarray(self.coeffs_conv, dtype=float).copy(),
+        }
+
+    def load_state(self, state: dict) -> None:
+        self.F_bar_conv[:] = state["F_bar_conv"]
+        self.coeffs_conv[:] = state["coeffs_conv"]
+        # Seed the live state too, so the next __call__'s warm-start ramp
+        # begins at the restored converged point.
+        self.F_bar.value[:] = self.F_bar_conv
+        self._restore_state(self.coeffs_conv)
