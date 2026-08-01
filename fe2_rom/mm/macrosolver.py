@@ -175,7 +175,14 @@ class MacroMicromorphicSolver:
         self.Jac = self.qmap.derivative(self.Res, self.w, self._dw)
 
         # ---- SNES options --------------------------------------------------
-        self._snes_options = snes_options if snes_options is not None else {
+        # Caller options are MERGED onto these defaults, not substituted for
+        # them. Replacing was a trap: passing just {"snes_atol": 1e-6} silently
+        # dropped the direct LU/MUMPS linear solver too, leaving PETSc's default
+        # GMRES+ILU. That works while the macro tangent is well conditioned and
+        # then fails at a bifurcation (λ_min → 0) with SNES reason -3,
+        # DIVERGED_LINEAR_SOLVE, at iteration 0 — the step is rejected, dt is
+        # halved down to dt_min and the run stalls just short of the buckling.
+        self._snes_options = {
             "snes_type": "newtonls",
             "snes_linesearch_type": "none",
             "snes_rtol": 1e-6,
@@ -183,8 +190,9 @@ class MacroMicromorphicSolver:
             "snes_max_it": 25,
             "ksp_type": "preonly",
             "pc_type": "lu",
-            "pc_factor_mat_solver_type": "mumps"
+            "pc_factor_mat_solver_type": "mumps",
         }
+        self._snes_options.update(snes_options or {})
 
         self._check_stability = check_stability
         self._stability_options = stability_options if stability_options is not None else {

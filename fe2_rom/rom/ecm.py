@@ -26,7 +26,8 @@ def petsc_to_scipy(mat):
 
 def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
            backward_prune=True, checkpoint_dir=None, checkpoint_interval=50,
-           prune_interval=None, prune_weight_tol=1e-6, on_checkpoint=None):
+           prune_interval=None, prune_weight_tol=1e-6, on_checkpoint=None,
+           on_step=None):
     """Empirical cubature method via greedy non-negative pursuit.
 
     Greedy max-correlation selection with a Lawson-Hanson-style
@@ -81,6 +82,13 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
         If set, called after every checkpoint save with the current selected
         indices and weights. Useful for saving derived artefacts (e.g.
         ``ECM.save_variant2``) at checkpoint frequency.
+    on_step : callable(S, alpha, rel_residual) or None
+        If set, called after *every* greedy iteration with the current selected
+        indices, weights and relative residual — and writes no checkpoint file.
+        ``len(S)`` grows by at most one per iteration, so a caller can use this
+        to snapshot the rule at an exact number of selected points (which
+        ``on_checkpoint`` cannot: the greedy's Lawson-Hanson repair drops
+        points, so ``len(S)`` lags the iteration counter).
 
     Returns
     -------
@@ -336,7 +344,11 @@ def my_ecm(A, b, tol=1e-4, candidate_batch=None, seed=0, max_points=None,
         alpha = alpha_new
         r = b - AS[:, :k] @ alpha
         k_iter += 1
-        print((k_iter, len(alpha), n_repair), np.linalg.norm(r) / b_norm)
+        rel_res = float(np.linalg.norm(r) / b_norm)
+        print((k_iter, len(alpha), n_repair), rel_res)
+
+        if on_step is not None:
+            on_step(list(S), alpha.copy(), rel_res)
 
         # periodic checkpoint save
         if checkpoint_dir is not None and k_iter % checkpoint_interval == 0:
@@ -1346,9 +1358,9 @@ class ECM:
 
     def use_full_quadrature(self):
         """Set the 'magic' rule to the **full** quadrature instead of running the
-        greedy: every candidate point gets its exact quadrature weight, so a
-        subsequent :meth:`save_variant2` writes a reduced model whose cubature is
-        *exact* (no hyper-reduction).
+        greedy: every candidate point/cell is kept with a **unit** ECM weight, so
+        a subsequent :meth:`save_variant2` writes a reduced model whose cubature
+        is *exact* (no hyper-reduction).
 
         The only approximation left in the resulting online solve is then the POD
         (Galerkin projection) itself — so comparing a ``use_full_quadrature`` ROM
@@ -1357,20 +1369,33 @@ class ECM:
         :attr:`_qp_meta` in the per-qp case) directly; no greedy is run and
         :attr:`true_residual` is 0. Uses the same quadrature (``quad_degree``,
         scheme) the ECM build would, so the two rules are directly comparable.
+
+        The ECM weights are the multipliers ``α`` in ``A α = b``; the online form
+        (``integrand * ω * dx``) already supplies the geometric weight through the
+        integration measure — the cell volume for the DG-0 per-cell rule, or
+        ``w_q|detJ(ξ_q)|`` for the per-qp quadrature_element rule. Since
+        ``A @ 1 == b`` by construction, the exact full rule is ``α ≡ 1``.
+        Writing the geometric weight into ``ω`` here would apply it **twice**
+        (the volume/quadrature weight squared) and make the online result
+        completely wrong.
         """
         n_cells = self._Q0.dofmap.index_map.size_global * self._Q0.dofmap.index_map_bs
         if not self.per_qp:
-            # Per-cell (DG-0) rule: every cell active, weight = exact cell volume.
+            # Per-cell (DG-0) rule: every cell active. The online form integrates
+            # ``integrand * ω * dx``, so the measure already supplies ∫_cell(·);
+            # the ECM weight is the unit multiplier ω ≡ 1.
             self.magic_points = np.arange(n_cells, dtype=np.int64)
-            self.magic_weights = np.asarray(self._weights, dtype=float).copy()
+            self.magic_weights = np.ones(n_cells, dtype=float)
             self.true_residual = 0.0
-            print(f"[full-quad] exact cell volumes "
-                  f"(sum={self.magic_weights.sum():.6g}, volume={self._volume:.6g})")
+            print(f"[full-quad] unit per-cell weights "
+                  f"({n_cells} cells, volume={self._volume:.6g})")
             self._report_coverage()
             return
 
-        # Per-qp rule: every (cell, q) active, weight = w_q |detJ(ξ_q)| — the same
-        # scaled quadrature weights the per-qp ECM build tabulates.
+        # Per-qp rule: every (cell, q) active. The online form integrates with the
+        # matching quadrature (scheme + qdeg below), so the measure already
+        # supplies W[m,q] = w_q|detJ(ξ_q)|; the ECM weight is the unit multiplier.
+        # The W tabulation is kept only as a qdeg/volume sanity check.
         import basix
         import basix.ufl
 
@@ -1398,12 +1423,13 @@ class ECM:
 
         # Cell-major (m*n_q + q) to match the per-qp candidate/column ordering.
         self.magic_points = np.arange(n_cells * n_q, dtype=np.int64)
-        self.magic_weights = W.ravel().astype(float)
+        self.magic_weights = np.ones(n_cells * n_q, dtype=float)
         self._qp_meta = {"n_q": int(n_q), "qdeg": int(qdeg),
                          "cell_name": cell_name, "scheme": "default"}
         self.true_residual = 0.0
-        print(f"[full-quad] exact quadrature weights "
-              f"(sum={self.magic_weights.sum():.6g}, volume={self._volume:.6g})")
+        print(f"[full-quad] unit per-qp weights "
+              f"({n_cells}×{n_q} qps, quad-weight sum={W.sum():.6g}, "
+              f"volume={self._volume:.6g})")
         self._report_coverage()
 
     def show_active_cells(self, filename="active.xdmf"):
