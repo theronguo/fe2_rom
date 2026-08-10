@@ -686,40 +686,6 @@ uses the exact (full) quadrature instead of the ECM rule — isolating POD error
 from ECM (hyper-reduction) error. `build_rom.py` also reports the rule's coverage
 (magic points vs total quadrature points / active elements).
 
-## Validation
-
-The micromorphic two-scale solver is validated against the benchmark of
-van Bree et al. (2020) [\[2\]](#references) — the local-vs-global buckling of a
-pattern-transforming metamaterial column (their Section 4.1). The suite under
-`validation/mm_2d/example_1_local_global/` reproduces that example on a common
-microstructure (a 2ℓ × 2ℓ RVE with four circular holes) and macroscopic specimen
-(W = 4ℓ × H = 8ℓ) under compression, with three drivers:
-
-- `run_macro_dns.py` — a fully-resolved **direct numerical simulation** (DNS)
-  reference;
-- `run_macro_ch1.py` — **first-order** FE² (classical homogenization), the
-  baseline, which deviates from the DNS by up to ~40% in the post-buckling
-  regime;
-- `run_macro_mm.py` — the **micromorphic** FE², which captures the
-  local→global buckling transition to within ~6% of the DNS in applied strain.
-
-All three output the nominal stress `P₂₂` versus compressive strain `u/H`, so the
-curves are directly comparable.
-
-```bash
-cd validation/mm_2d/example_1_local_global
-python create_dns_mesh.py        # writes dns_6x30.msh (rve.msh ships with the repo)
-python run_macro_dns.py          # DNS reference
-python run_macro_ch1.py          # first-order FE² baseline
-python run_macro_mm.py           # micromorphic FE²
-python run_macro_mm.py --objective  # co-rotational (φ → R φ) objectivity reduction
-```
-
-The reference paper is bundled at
-[`validation/mm_2d/paper/reference.pdf`](validation/mm_2d/paper/reference.pdf)
-(open access, CC BY 4.0) — DOI
-[10.1016/j.cma.2020.113333](https://doi.org/10.1016/j.cma.2020.113333).
-
 ## References
 
 <a id="references"></a>
@@ -736,8 +702,7 @@ The reference paper is bundled at
    metamaterials.* Computer Methods in Applied Mechanics and Engineering,
    **372**, 113333.
    [doi:10.1016/j.cma.2020.113333](https://doi.org/10.1016/j.cma.2020.113333).
-   Open access (CC BY 4.0); a copy is bundled at
-   [`validation/mm_2d/paper/reference.pdf`](validation/mm_2d/paper/reference.pdf).
+   Open access (CC BY 4.0).
 
 3. Guo, T., Rokoš, O., & Veroy, K. (2024). *A reduced order model for
    geometrically parameterized two-scale simulations of elasto-plastic
